@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -n '60,80p' tests/unit/test_damage.py)",
+      "Bash(sed -n '60,80p' tests/test_damage.py)",
+      "Bash(sed -n '104,125p' tests/unit/test_data_generation.py)",
+      "Bash(sed -n '18,30p' tests/integration/test_pipeline.py)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(sed -n '81,125p' cocf/lcocf/damage.py)",
+      "Bash(sed -n '279,343p' cocf/common/config.py)",
+      "Bash(sed -n '56,90p' cocf/raec/module.py)",
+      "Bash(sed -n '41,110p' cocf/raec/anchor_store.py)",
+      "Bash(python3 -c \"import cocf.lcocf.data\")",
+      "Bash(python3 -m pytest tests/unit/test_data_generation.py -q)",
+      "Bash(python3 -c \"import cocf.training.pipeline, cocf.training.stage_a_data_gen, cocf.training.stage_b_joint; print\\('training imports OK'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -m pytest \"tests/integration/test_pipeline.py::TestTrainingPipeline::test_backbone_frozen_in_training\" -q)",
+      "Bash(python3 -m pyflakes cocf/engine/inference.py cocf/training/stage_a_data_gen.py cocf/lcocf/data.py)",
+      "Bash(python3 *)",
+      "Bash(sed -n '87,99p' cocf/raec/anchor_store.py)",
+      "Bash(sed -n '1,12p' cocf/training/stage_a_data_gen.py)",
+      "Bash(sed -n '/def _execute_transition/,/measure_residual=self/p' cocf/engine/inference.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('cocf/training/stage_a_data_gen.py'\\).read\\(\\)\\); ast.parse\\(open\\('cocf/training/stage_c_finetune.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"from cocf.common.memory import free_memory, teacher_forward; from cocf.data import VideoTextDataset, collate_video_samples; from cocf.common.config import DataConfig; print\\('imports OK'\\)\")",
+      "Bash(awk '{print $2}')",
+      "Bash(grep -vE '^\\(cocf|__future__\\)$')",
+      "Bash(sed -n '1,60p' cocf/engine/inference.py)",
+      "Bash(sed -n '60,140p' cocf/engine/state.py)"
+    ]
+  }
+}
