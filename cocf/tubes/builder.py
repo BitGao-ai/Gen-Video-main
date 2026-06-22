@@ -18,7 +18,7 @@ stays in the inner denoising loop.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +56,19 @@ class TubeBuilder:
         ``F`` should equal ``grid.t`` (one RGB frame per latent-temporal slot); the
         caller decodes the latent (or uses the GT video in training).
         """
+        return self.build_with_states(frames_rgb, grid, prompt)[0]
+
+    def build_with_states(
+        self, frames_rgb: Tensor, grid: TokenGrid, prompt: str = ""
+    ) -> Tuple[List[SemanticTube], Dict[int, TubeState], Dict[int, Tensor]]:
+        """Like :meth:`build` but also returns the per-tube states and latent flows.
+
+        Stage-A teacher generation (``cocf.training.stage_a_data_gen``) needs the
+        7-dim tube states — and the optical flow that makes ``motion_phase`` (hence
+        the action strength ``s_A``) non-trivial — *alongside* the tubes. Calling
+        :meth:`build` then a second :meth:`update` would recompute RAFT flow; this
+        returns both from a single pass so the teacher path pays for flow once.
+        """
         f = frames_rgb.shape[0]
         regions_by_frame: Dict[int, List[Region]] = {}
         for fi in range(f):
@@ -69,8 +82,8 @@ class TubeBuilder:
                 regions_by_frame[a], regions_by_frame[b], latent_flows.get(a)
             )
         tubes = self.matcher.build_tubes(regions_by_frame, affinity_by_pair, grid)
-        self.update(tubes, latent_flow_by_frame=latent_flows)
-        return tubes
+        states = self.update(tubes, latent_flow_by_frame=latent_flows)
+        return tubes, states, latent_flows
 
     # ------------------------------------------------------------------ #
     # Cheap per-step state update

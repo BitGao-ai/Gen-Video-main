@@ -87,6 +87,35 @@ def predictor_input_dim(cfg: PredictorConfig) -> int:
     return _SCALAR_DIM + cfg.context_dim
 
 
+def build_predictor_input_batch(
+    states: Tensor,          # [B, 7]   tube-state vectors
+    strength_feats: Tensor,  # [B, 3]   (s_E, s_A, s_T)
+    strength: Tensor,        # [B]      combined causal strength s
+    budget: Tensor,          # [B]      per-step budget B_t
+    step_frac: Tensor,       # [B]      t / T ∈ [0,1]
+    step_embed_dim: int,
+) -> Tensor:
+    """Batched, differentiable predictor input ``[B, in_dim]``.
+
+    Concatenates in the **exact same order** as the per-sample
+    :func:`build_predictor_input` — ``[state(7), s_E, s_A, s_T, strength, budget]``
+    then the sinusoidal step embedding — so the features the predictor is trained on
+    in Stage B are byte-for-byte the features it sees at inference (no train/serve
+    skew). Stays in the autograd graph (``strength`` flows from the strength field).
+    """
+    scalars = torch.cat(
+        [
+            states,                       # [B, 7]
+            strength_feats,               # [B, 3]
+            strength.reshape(-1, 1),      # [B, 1]
+            budget.reshape(-1, 1),        # [B, 1]
+        ],
+        dim=-1,
+    )  # [B, 12]
+    step_emb = sinusoidal_embedding(step_frac.reshape(-1), step_embed_dim).to(scalars.dtype)
+    return torch.cat([scalars, step_emb], dim=-1)  # [B, 12 + step_embed_dim]
+
+
 class DamagePredictor(nn.Module):
     """MLP head mapping a tube's features → per-action ``(μ, σ)`` (§3.3)."""
 

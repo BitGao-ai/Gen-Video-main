@@ -20,6 +20,11 @@ labels lives in :mod:`cocf.lcocf.data` (it is L-COCF-specific), and consumes a
 
 from __future__ import annotations
 
+from cocf.data.cocf_batch import (
+    StratifiedBatchSampler,
+    collate_cocf_samples,
+    timestep_stratum,
+)
 from cocf.data.latent_cache import (
     LatentCacheDataset,
     LatentCacheWriter,
@@ -27,6 +32,34 @@ from cocf.data.latent_cache import (
     cache_key,
 )
 from cocf.data.metrics import MockMetricExtractor, ModelMetricExtractor
+from cocf.data.openvid_manifest import (
+    DEFAULT_OPENVID_COLUMNS,
+    SCENE_TYPES,
+    OpenVidRecord,
+    infer_scene_type,
+    read_openvid_csv,
+    read_openvid_manifest,
+    scene_histogram,
+    write_raw_dataset_index,
+)
+from cocf.data.processed_layout import ProcessedLayout, video_id_str
+from cocf.data.quality_filter import (
+    FilterReport,
+    FilterResult,
+    QualityFilter,
+    base_video_id,
+)
+from cocf.data.raw_filtered import (
+    HARD_SCENE_TYPES,
+    HardSamplePrioritySampler,
+    RawFilteredDataset,
+    RawFilteredItem,
+    collate_raw_filtered,
+)
+from cocf.data.sample_store import (
+    CounterfactualLMDBDataset,
+    CounterfactualSampleWriter,
+)
 from cocf.data.video_dataset import (
     DecordVideoReader,
     SyntheticVideoReader,
@@ -54,4 +87,34 @@ __all__ = [
     "LatentCacheDataset",
     "LatentRecord",
     "cache_key",
+    # OpenVid manifest ingestion & scene stratification (§1.1/§1.2)
+    "OpenVidRecord",
+    "read_openvid_csv",
+    "read_openvid_manifest",
+    "write_raw_dataset_index",
+    "infer_scene_type",
+    "scene_histogram",
+    "SCENE_TYPES",
+    "DEFAULT_OPENVID_COLUMNS",
+    # four-level quality filter (§2)
+    "QualityFilter",
+    "FilterResult",
+    "FilterReport",
+    "base_video_id",
+    # Stage-C raw-clip source + hard-sample sampling (§4.2)
+    "RawFilteredDataset",
+    "RawFilteredItem",
+    "HardSamplePrioritySampler",
+    "collate_raw_filtered",
+    "HARD_SCENE_TYPES",
+    # six-level processed store (§3)
+    "ProcessedLayout",
+    "video_id_str",
+    # counterfactual LMDB store (§3 level-5)
+    "CounterfactualSampleWriter",
+    "CounterfactualLMDBDataset",
+    # Stage-B stratified batch assembly (§4.1)
+    "StratifiedBatchSampler",
+    "collate_cocf_samples",
+    "timestep_stratum",
 ]

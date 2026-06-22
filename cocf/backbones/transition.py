@@ -202,6 +202,22 @@ class TransitionExecutor:
             z_full=z_full,
         )
 
+    def coarsen_lowfreq(
+        self, z: Tensor, tube: SemanticTube, grid: TokenGrid
+    ) -> Tensor:
+        """Return a copy of ``z`` with ``tube``'s tokens coarsened to the LOWFREQ lattice.
+
+        Shared by Stage-A teacher generation (`cocf.lcocf.data`) so the offline
+        LOWFREQ damage label is produced by *exactly* the inference-time
+        reconstruction (no train/serve skew). With ``lowfreq_stride == 1`` LOWFREQ
+        computes every token, so coarsening is a no-op.
+        """
+        if self.lowfreq_stride <= 1:
+            return z
+        out = z.clone()
+        self._fill_lowfreq(out, z, tube, grid)
+        return out
+
     def _fill_lowfreq(
         self, z_next: Tensor, z_full: Tensor, tube: SemanticTube, grid: TokenGrid
     ) -> None:

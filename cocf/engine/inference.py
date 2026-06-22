@@ -20,7 +20,7 @@ error handling). All mutable state lives in :class:`EngineState`.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -109,6 +109,9 @@ class InferenceEngine(nn.Module):
         cond: TextConditioning,  # text embeddings
         backbone: BackboneAdapter,  # frozen model
         return_intermediates: bool = False,
+        *,
+        record_sink: Optional[Callable[..., None]] = None,
+        decode_grad: bool = False,
     ) -> GenerationResult:
         """Run accelerated denoising (the main entry point).
 
@@ -119,6 +122,13 @@ class InferenceEngine(nn.Module):
             cond: Text conditioning (embeddings, etc.).
             backbone: Frozen backbone model.
             return_intermediates: If True, return latents at all steps (memory-heavy).
+            record_sink: Optional per-step callback ``(step_idx, t, budget, step_frac,
+                tube_states, strength_feats, actions)`` used by Stage-C end-to-end
+                fine-tuning to collect the exact per-tube features the engine allocated
+                on (§4.2). ``None`` at inference (zero overhead).
+            decode_grad: If True, decode the final latent **on** the autograd graph so
+                ``result.video`` is differentiable (the §4.2 pixel-loss path to the
+                LoRA / repair params). Inference keeps the cheaper ``no_grad`` decode.
 
         Returns:
             GenerationResult with final video, traces, efficiency stats.
@@ -150,6 +160,7 @@ class InferenceEngine(nn.Module):
                 step_idx=step_idx,
                 t=t,
                 backbone=backbone,
+                record_sink=record_sink,
             )
             state.traces.append(trace)
 
@@ -157,9 +168,15 @@ class InferenceEngine(nn.Module):
         # (`to_grid`) and the VAE decode (`decode_latent`).
         z0_grid = self.accelerator.backbone.to_grid(state.z, state.grid)  # [B, C, T, H, W]
 
-        # The backbone's decoder is frozen, so we call it directly
-        with torch.no_grad():
-            video = backbone.decode_latent(z0_grid)  # [B, 3, F, H, W]
+        # The backbone's decoder is frozen, so we call it directly. Stage-C end-to-end
+        # fine-tuning needs the decode on the autograd graph (the §4.2 pixel-loss path to
+        # the LoRA / repair params), so it passes ``decode_grad=True``; inference keeps the
+        # cheaper no_grad decode.
+        if decode_grad:
+            video = backbone.decode_latent(z0_grid)  # [B, 3, F, H, W] (grad-enabled)
+        else:
+            with torch.no_grad():
+                video = backbone.decode_latent(z0_grid)  # [B, 3, F, H, W]
 
         return GenerationResult(
             video=video,
@@ -173,6 +190,7 @@ class InferenceEngine(nn.Module):
         step_idx: int,
         t: int,
         backbone: BackboneAdapter,
+        record_sink: Optional[Callable[..., None]] = None,
     ) -> StepTrace:
         """Execute one complete denoising step with full COCF pipeline (§7.2).
 
@@ -225,8 +243,23 @@ class InferenceEngine(nn.Module):
         priors = self.accelerator.lcocf.prior_actions(strengths, tube_states)
 
         # --- Step 5a: budget for this step (drives prediction & allocation) -----
+        # Dynamic per-step budget B_t (§7.3): the U-shaped time profile modulated by
+        # caption complexity and tube-interaction density. This is also exactly the
+        # §4.2 "按字幕复杂度动态分配单步算力预算" Stage C relies on, so inference and the
+        # end-to-end fine-tune size the budget identically (no train/serve skew). Gated
+        # by ``use_dynamic_budget``: off ⇒ spend the full-compute ceiling every step.
         step_frac = t / self.engine_cfg.num_inference_steps
-        budget_t = self.budget_scheduler.budget(step_frac)
+        if self.engine_cfg.use_dynamic_budget:
+            complexity = self.budget_scheduler.score_complexity(state.prompt, state.subgraph)
+            interaction = (
+                sum(s.interaction for s in tube_states.values()) / len(tube_states)
+                if tube_states else 0.0
+            )
+            budget_t = self.budget_scheduler.budget(
+                step_frac, complexity=complexity, interaction_density=interaction
+            )
+        else:
+            budget_t = self.accelerator.config.budget.b_max
         trace.budget = budget_t
 
         damage_preds = self.accelerator.lcocf.predict(
@@ -253,6 +286,21 @@ class InferenceEngine(nn.Module):
         )
         optimal_actions = decision.actions  # {tube_id: Action}
         trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
+
+        # Stage-C training hook: emit this step's per-tube (state, strength, action) so the
+        # end-to-end fine-tune can recompute the scheduling regularisers on the exact
+        # features the engine allocated on (§4.2, no train/serve skew). No-op at inference
+        # (record_sink is None) and for warm-up steps (no tubes → returned above).
+        if record_sink is not None:
+            record_sink(
+                step_idx=step_idx,
+                t=t,
+                budget=budget_t,
+                step_frac=step_frac,
+                tube_states=tube_states,
+                strength_feats=strength_feats,
+                actions=optimal_actions,
+            )
 
         # Consume one step of every active forced-FULL window now that this step's
         # allocation has honoured it; drop tubes whose window has elapsed.

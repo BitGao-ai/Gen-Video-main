@@ -1,32 +1,47 @@
-"""Counterfactual teacher data generation (§7.1.1).
+"""Counterfactual teacher data generation (§1.4–§1.6 / §7.1.1).
 
 Generates multi-dimensional training labels for L-COCF by applying tube-level
-counterfactual interventions. The core workflow (steps d-f of §7.1.1):
+**single-hop** counterfactual interventions. The core workflow (§1.5):
 
-    1. Run full-compute model on reference video → Y_full, {z_t}, attention cache
-    2. Detect semantic tubes G_t at representative timesteps
-    3. For sampled (g_k, t, a) triplets: apply action a to tube g_k, continue
-       denoising, decode → Y_cf
-    4. Compute multi-dimensional damage D(Y_full, Y_cf) as the training label
+    1. Run full-compute model on the reference clip → Y_full, {z_t}, tubes  (Stage A)
+    2. Build semantic tubes G_t once and their 7-dim states + (s_E,s_A,s_T) features
+    3. For sampled (g_k, t, a) triplets: apply action a to *only* tube g_k at step t,
+       continue all-FULL denoising to z_0, decode → Y_cf  (no multi-hop propagation)
+    4. Compute the multi-dimensional damage D(Y_full, Y_cf), the compute-cost label
+       and the multi-seed uncertainty as the training labels (§1.5)
 
 This module implements:
-    - :class:`COCFTrainingSample`: the label structure (§7.1.1)
-    - Stratified sampling: by scene / timestep / action type
-    - Label interpolation: linear interp between computed labels
-    - Damage caching: avoid recomputing features between generations
-    - Batch interventions: efficient tube-group counterfactuals
+    - :class:`COCFTrainingSample`: the §4.1 per-sample label record — every field
+      Stage B reads, serialised to exactly the key set
+      :func:`cocf.data.cocf_batch.collate_cocf_samples` consumes (round-trips through
+      the §3 LMDB store via ``to_dict``/``from_dict``).
+    - :class:`TeacherTrajectory`: the per-clip teacher-forward outputs the generator
+      runs counterfactuals against (assembled by Stage A).
+    - Stratified sampling: by timestep / tube causal level / action type (§1.5).
+    - :class:`COCFDataGenerator`: the single-hop intervention rollout that reuses the
+      backbone-agnostic :class:`~cocf.backbones.transition.TransitionExecutor`.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from cocf.common.types import Action, SemanticTube, StrengthLevel, TubeState
+from cocf.backbones.base import BackboneAdapter, TextConditioning
+from cocf.backbones.transition import TransitionExecutor
+from cocf.common.types import (
+    Action,
+    AllocationDecision,
+    SemanticTube,
+    StrengthLevel,
+    TokenGrid,
+    TubeState,
+)
 from cocf.lcocf.damage import (
     DAMAGE_DIMENSIONS,
     DEFAULT_DAMAGE_WEIGHTS,
@@ -40,6 +55,28 @@ from cocf.lcocf.strength import CausalStrengthFeatureBuilder, StrengthFeatures
 Tensor = torch.Tensor
 _log = logging.getLogger(__name__)
 
+# Per-action relative compute cost C(a) ∝ |g_k| (mirrors AllocatorConfig.action_cost
+# / TransitionExecutor's FULL/LOWFREQ/INTERP/ANCHOR tiers). FULL=1, ANCHOR=0.
+ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.45, 0.15, 0.0)
+
+
+def _to_np(x: Optional[Tensor]) -> Optional[np.ndarray]:
+    """Detach a tensor to a small CPU float32 numpy array for on-disk storage."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.detach().to("cpu").float().numpy()
+    return np.asarray(x, dtype="float32")
+
+
+def _to_tensor(x: object) -> Optional[Tensor]:
+    """Inverse of :func:`_to_np` — rebuild a float tensor from stored numpy/list."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.float()
+    return torch.as_tensor(np.asarray(x), dtype=torch.float32)
+
 
 # ============================================================================= #
 # Core data structures (§7.1.1)
@@ -48,32 +85,48 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class COCFTrainingSample:
-    """Atomic counterfactual training label (§7.1.1, document storage format).
+    """One counterfactual training label — the §4.1 per-sample read record.
 
-    Represents one (tube, timestep, action) triplet with its multi-dimensional
-    damage label and auxiliary metadata. Small enough to fit millions on disk when
-    tube features are compressed.
+    Carries every field Stage B reads for the joint loss (§4.1 "单样本读取字段"):
+    causal-strength features (s_E/s_A/s_T), the 7-dim tube state, timestep & action
+    encodings, tube token count, the multi-dimensional degradation label, the
+    compute-cost label, the multi-seed uncertainty, the tube visual embeddings of
+    the full & counterfactual renders, and the prompt text embedding.
+
+    :meth:`to_dict` serialises to exactly the key set
+    :func:`cocf.data.cocf_batch.collate_cocf_samples` consumes, so a sample
+    round-trips losslessly through the §3 LMDB store; :meth:`from_dict` rebuilds it.
+    Tensors are stored as small CPU numpy arrays (no autograd graph) to keep the
+    store compact.
     """
 
-    # Core features
-    tube_features: Tensor  # [7] or [d]: tube state + optional attention
-    timestep: int  # t (countdown from T to 1)
-    action: int  # ActionType (FULL=0, LOWFREQ=1, INTERP=2, ANCHOR=3)
+    # -- core predictor inputs ----------------------------------------------- #
+    tube_features: Tensor                 # [7]  the tube state vector s_{k,t} (§1.4)
+    timestep: int                         # t (countdown index over the schedule)
+    action: int                           # Action {FULL=0,LOWFREQ=1,INTERP=2,ANCHOR=3}
+    damage_label: Tensor                  # [NUM_DAMAGE_DIMS] ∈ [0,1] degradation (§1.5)
 
-    # Multi-dimensional damage label (§7.1.1, §9.4)
-    damage_label: Tensor  # [NUM_DAMAGE_DIMS=8] ∈ [0,1]
+    # -- the remaining §4.1 read fields (defaulted for partial/legacy samples) - #
+    strength_features: Optional[Tensor] = None   # [3]  (s_E, s_A, s_T)  (§1.4(2))
+    cost_label: Optional[Tensor] = None          # [2]  (FLOPs frac, active-token frac)
+    uncertainty: Optional[Tensor] = None         # [NUM_DAMAGE_DIMS] multi-seed variance
+    tube_visual_embed_full: Optional[Tensor] = None  # [d_v] full-render tube embed
+    tube_visual_embed_cf: Optional[Tensor] = None    # [d_v] cf-render tube embed
+    text_embed: Optional[Tensor] = None          # [L, d_c] prompt token sequence
+
     damage_per_axis: Dict[str, float] = field(default_factory=dict)
 
-    # Auxiliary metadata
+    # -- auxiliary metadata -------------------------------------------------- #
     prompt: str = ""
+    video_id: str = ""
     tube_id: int = -1
-    scene_type: str = "generic"  # static/dynamic/text/face/multi/occlusion
-    interaction_density: float = 0.0  # 0-1: how much this tube interacts with others
-    strength_level: int = 1  # StrengthLevel prior (HIGH/MID/LOW)
-
-    # Optional tube-specific metadata
-    tube_pixels: int = 0  # region size in pixels (for context)
-    tube_stability: float = 1.0  # identity stability ∈ [0,1]
+    scene_type: str = "dynamic"           # static/dynamic/multi/text/face/occlusion
+    interaction_density: float = 0.0      # 0-1: how much this tube interacts (§4.1)
+    strength_level: int = 1               # StrengthLevel prior (HIGH=0/MID=1/LOW=2)
+    step_frac: float = 0.0                # t / T ∈ [0,1] (denoising phase)
+    tube_token_count: int = 0             # |g_k| latent tokens (cost context, §2.2)
+    tube_pixels: int = 0                  # region size in pixels (diagnostic)
+    tube_stability: float = 1.0           # identity stability ∈ [0,1]
 
     def damage_scalar(self, weights: Optional[Dict[str, float]] = None) -> float:
         """Reduce multi-dim damage to a scalar for quick sorting/filtering."""
@@ -85,20 +138,62 @@ class COCFTrainingSample:
         return min(1.0, scalar)  # clamp to [0,1]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize to dict for disk storage (HDF5 / Parquet / etc.)."""
+        """Serialise to the §3 LMDB payload (keys ≡ collate_cocf_samples fields)."""
         return {
-            "tube_features": self.tube_features.cpu().numpy(),
-            "timestep": self.timestep,
-            "action": self.action,
-            "damage_label": self.damage_label.cpu().numpy(),
-            "prompt": self.prompt,
-            "tube_id": self.tube_id,
-            "scene_type": self.scene_type,
+            # vectors (numpy, float32)
+            "tube_features": _to_np(self.tube_features),
+            "strength_features": _to_np(self.strength_features),
+            "damage_label": _to_np(self.damage_label),
+            "cost_label": _to_np(self.cost_label),
+            "uncertainty": _to_np(self.uncertainty),
+            "tube_visual_embed_full": _to_np(self.tube_visual_embed_full),
+            "tube_visual_embed_cf": _to_np(self.tube_visual_embed_cf),
+            "text_embed": _to_np(self.text_embed),
+            # long scalars
+            "action": int(self.action),
+            "timestep": int(self.timestep),
+            "tube_token_count": int(self.tube_token_count),
+            "tube_id": int(self.tube_id),
+            "strength_level": int(self.strength_level),
+            # float scalars
+            "step_frac": float(self.step_frac),
             "interaction_density": float(self.interaction_density),
-            "strength_level": self.strength_level,
-            "tube_pixels": self.tube_pixels,
             "tube_stability": float(self.tube_stability),
+            # strings
+            "prompt": self.prompt,
+            "scene_type": self.scene_type,
+            "video_id": self.video_id,
+            # diagnostics (ignored by collate; kept for analysis/cleaning §1.6)
+            "damage_per_axis": dict(self.damage_per_axis),
+            "tube_pixels": int(self.tube_pixels),
         }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "COCFTrainingSample":
+        """Rebuild a typed sample from a stored payload dict (inverse of to_dict)."""
+        return cls(
+            tube_features=_to_tensor(d.get("tube_features")),
+            timestep=int(d.get("timestep", 0)),
+            action=int(d.get("action", 0)),
+            damage_label=_to_tensor(d.get("damage_label")),
+            strength_features=_to_tensor(d.get("strength_features")),
+            cost_label=_to_tensor(d.get("cost_label")),
+            uncertainty=_to_tensor(d.get("uncertainty")),
+            tube_visual_embed_full=_to_tensor(d.get("tube_visual_embed_full")),
+            tube_visual_embed_cf=_to_tensor(d.get("tube_visual_embed_cf")),
+            text_embed=_to_tensor(d.get("text_embed")),
+            damage_per_axis=dict(d.get("damage_per_axis", {})),
+            prompt=str(d.get("prompt", "")),
+            video_id=str(d.get("video_id", "")),
+            tube_id=int(d.get("tube_id", -1)),
+            scene_type=str(d.get("scene_type", "dynamic")),
+            interaction_density=float(d.get("interaction_density", 0.0)),
+            strength_level=int(d.get("strength_level", 1)),
+            step_frac=float(d.get("step_frac", 0.0)),
+            tube_token_count=int(d.get("tube_token_count", 0)),
+            tube_pixels=int(d.get("tube_pixels", 0)),
+            tube_stability=float(d.get("tube_stability", 1.0)),
+        )
 
 
 # ============================================================================= #
@@ -255,13 +350,17 @@ class StratifiedSampler:
         )
         return [idx for idx, _ in tubes_by_stability[:max_per_frame]]
 
-    def sample_actions(self, num_samples: int = 3) -> List[int]:
-        """Sample action types by cost/frequency distribution."""
-        actions = []
-        for action, weight in self.config.action_weights.items():
-            count = max(1, int(weight * num_samples))
-            actions.extend([action] * count)
-        return actions[:num_samples]
+    def sample_actions(self, num_samples: int = 4) -> List[int]:
+        """The four compute actions per tube (§1.5: 分别施加 FULL/LOWFREQ/INTERP/ANCHOR).
+
+        Each tube at each representative step is probed with **all four** actions.
+        Generating a FULL sample (≈zero damage, the reference) alongside the three
+        skip actions is what gives the §4.1 action-balanced (1:1:1:1) training
+        material the Stage-B :class:`~cocf.data.cocf_batch.StratifiedBatchSampler`
+        balances over. ``num_samples`` only truncates (kept for API/back-compat).
+        """
+        actions = [int(Action.FULL), int(Action.LOWFREQ), int(Action.INTERP), int(Action.ANCHOR)]
+        return actions if num_samples >= len(actions) else actions[:num_samples]
 
 
 # ============================================================================= #
@@ -320,21 +419,94 @@ class DamageLabelInterpolator:
 
 
 # ============================================================================= #
-# Full counterfactual data generation pipeline
+# Teacher-forward outputs the generator runs counterfactuals against (§1.3–§1.4)
+# ============================================================================= #
+
+
+@dataclass
+class TeacherTrajectory:
+    """Per-clip teacher full-compute outputs assembled by Stage A (§1.3–§1.4).
+
+    One reference full-denoise trajectory: the decoded reference video ``Y_full``,
+    the latents ``z_t`` cached at the representative steps, the semantic tubes built
+    once on the reference, their 7-dim states and ``(s_E, s_A, s_T)`` features, and
+    the per-tube visual embeddings of the full render. A single-hop intervention
+    (§1.5) replays one cached ``z_t`` with one tube's action changed and continues
+    all-FULL to ``z_0``.
+    """
+
+    video_id: str
+    prompt: str
+    scene_type: str
+    video_full: Tensor                              # [F, 3, H, W] reference, in [0,1]
+    grid: TokenGrid
+    cond: TextConditioning
+    z_by_step: Dict[int, Tensor]                    # step_idx -> z_t [B, N, d] (B==1)
+    tubes: List[SemanticTube]
+    tube_states: Dict[int, TubeState]               # tube_id -> state
+    strength_feats: Dict[int, StrengthFeatures]     # tube_id -> (s_E, s_A, s_T)
+    tube_visual_embed_full: Dict[int, Tensor]       # tube_id -> [d_v]
+    num_total_steps: int
+    text_embed: Optional[Tensor] = None             # [L, d_c] (cond.embeds[0])
+
+
+def _frames_fchw(video: Tensor) -> Tensor:
+    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]`` in [0,1]."""
+    v = video[0] if video.dim() == 5 else video
+    return v.permute(1, 0, 2, 3).contiguous().clamp(0.0, 1.0)
+
+
+def tube_clip_embed(
+    video_fchw: Tensor,
+    tube: SemanticTube,
+    grid: TokenGrid,
+    perception,
+    d_v: Optional[int] = None,
+) -> Tensor:
+    """Per-tube CLIP visual embed ``[d_v]`` from a representative frame (feeds CMSC).
+
+    Picks the tube's middle frame, upsamples its latent mask to pixel resolution and
+    calls ``perception.clip_feature`` — the same source
+    :class:`~cocf.tubes.regions.RegionExtractor` uses, so train/serve embeds match.
+    Returns zeros when no perception/mask is available (e.g. a pure-mock dry run).
+    """
+    if d_v is None:
+        d_v = int(getattr(perception, "d_clip", 64)) if perception is not None else 64
+    frames = tube.frames
+    if perception is None or not frames:
+        return torch.zeros(d_v)
+    mid = frames[len(frames) // 2]
+    mask_lat = tube.masks_by_frame.get(mid)
+    if mask_lat is None:
+        return torch.zeros(d_v)
+    fi = min(mid, video_fchw.shape[0] - 1)
+    frame = video_fchw[fi]                                   # [3, Hp, Wp]
+    mask_pix = F.interpolate(
+        mask_lat[None, None].float(), size=frame.shape[-2:], mode="nearest"
+    )[0, 0] > 0.5
+    return perception.clip_feature(frame, mask_pix).detach().float()
+
+
+# ============================================================================= #
+# Full counterfactual data generation pipeline (§1.5)
 # ============================================================================= #
 
 
 class COCFDataGenerator:
-    """End-to-end counterfactual training data generation (§7.1.1, steps d-f).
+    """Single-hop counterfactual training-data generation (§1.5).
 
-    High-level workflow:
-        1. Generate reference video via full-compute backbone
-        2. Extract tubes and causal sub-graphs
-        3. For each (tube, timestep, action) triplet:
-           - Apply action to that tube, continue denoising
-           - Decode → counterfactual video
-           - Compute damage via metric extractor
-           - Create COCFTrainingSample with damage label
+    For each representative (tube ``g_k``, step ``t``, action ``a``) it:
+        1. replays the cached ``z_t`` and takes one **dense** full-compute step;
+        2. applies action ``a`` to *only* ``g_k`` (FULL/LOWFREQ/INTERP/ANCHOR),
+           reusing the inference :class:`~cocf.backbones.transition.TransitionExecutor`
+           realisation for LOWFREQ so the label has no train/serve skew;
+        3. continues all-FULL to ``z_0`` (single-hop: no multi-hop propagation),
+           decodes → ``Y_cf``;
+        4. scores the multi-dim damage vs ``Y_full``, the compute-cost label and the
+           multi-seed uncertainty.
+
+    FULL is the zero-damage reference by construction (no local modification), which
+    is the clean anchor the §4.1 action-balanced sampler needs.
     """
 
     def __init__(
@@ -344,178 +516,261 @@ class COCFDataGenerator:
         damage_computer: CounterfactualDamageComputer,
         sampling_config: Optional[StratifiedSamplingConfig] = None,
         device: torch.device = torch.device("cpu"),
+        *,
+        perception=None,
+        action_cost: Tuple[float, ...] = ACTION_COST,
+        seeds_per_prompt: int = 1,
+        perturb_std: float = 0.02,
     ):
         self.metric_extractor = metric_extractor
         self.strength_builder = strength_feature_builder
         self.damage_computer = damage_computer
         self.sampling_config = sampling_config or StratifiedSamplingConfig()
         self.device = device
+        # perception backend supplies the per-tube CLIP visual embed feeding CMSC.
+        self.perception = perception
+        self.action_cost = tuple(action_cost)
+        self.seeds_per_prompt = max(1, int(seeds_per_prompt))
+        self.perturb_std = float(perturb_std)
 
         self.sampler = StratifiedSampler(self.sampling_config, device)
         self.interpolator = DamageLabelInterpolator(self.sampling_config.interpolation_interval)
 
-    def generate_batch(
+    def generate(
         self,
-        video_full: Tensor,  # [B, F, 3, H, W]
-        prompts: List[str],
-        tubes_by_step: Dict[int, List[SemanticTube]],  # timestep → tubes at that step
-        z_trajectory: Dict[int, Tensor],  # timestep → [B, N, d] latent
-        strength_features_by_step: Dict[int, StrengthFeatures],  # cached features
-        backbone_adapter,  # For counterfactual interventions
-        num_total_steps: int = 50,
-        max_samples_per_video: int = 30,
+        traj: TeacherTrajectory,
+        backbone: BackboneAdapter,
+        transition: TransitionExecutor,
+        *,
+        max_tubes: int = 5,
+        max_samples: int = 30,
     ) -> List[COCFTrainingSample]:
-        """Generate counterfactual training samples from a batch of full-compute videos.
+        """Generate the §1.5 counterfactual samples for one teacher trajectory.
 
-        This is the main entry point for Stage A data generation.
-
-        Args:
-            video_full: Full-compute reference videos.
-            prompts: Text prompts (batch).
-            tubes_by_step: Pre-extracted semantic tubes at representative steps.
-            z_trajectory: Cached latent trajectory from full-compute.
-            strength_features_by_step: Pre-computed strength features.
-            backbone_adapter: Model for running counterfactual denoising.
-            num_total_steps: Total denoising steps (T).
-            max_samples_per_video: Cap on samples to generate.
-
-        Returns:
-            List of COCFTrainingSample training labels.
+        Covers high/mid/low causal tubes (``max_tubes``) × all four actions at every
+        cached representative step, capped at ``max_samples`` labels per clip (§1.5).
         """
-        samples = []
-        batch_size = video_full.shape[0]
+        steps = sorted(traj.z_by_step)
+        if not traj.tubes or not steps:
+            return []
+        tube_idx_sel = self._select_tubes(traj, max_tubes)
+        actions = self.sampler.sample_actions()
+        samples: List[COCFTrainingSample] = []
 
-        # Per-video loop (stratified sampling applied independently)
-        for b in range(batch_size):
-            prompt = prompts[b] if b < len(prompts) else ""
-            video_b = video_full[b]  # [F, 3, H, W]
-
-            _log.info(f"Generating counterfactual data for batch {b}/{batch_size}")
-
-            # Sample representative (timestep, tube_id, action) triplets
-            sampled_steps = self.sampler.sample_timesteps(num_total_steps)
-            samples_this_video = []
-
-            for step, stratum in sampled_steps:
-                if len(samples_this_video) >= max_samples_per_video:
+        for step_idx in steps:
+            t = traj.num_total_steps - step_idx          # countdown timestep
+            step_frac = t / max(1, traj.num_total_steps)
+            for ti in tube_idx_sel:
+                if len(samples) >= max_samples:
                     break
-
-                tubes = tubes_by_step.get(step, [])
-                if not tubes:
-                    continue
-
-                tube_indices = self.sampler.sample_tubes(tubes)
-                actions = self.sampler.sample_actions(num_samples=3)
-
-                for tube_idx in tube_indices:
-                    for action in actions:
-                        if len(samples_this_video) >= max_samples_per_video:
-                            break
-
-                        # Run counterfactual intervention
-                        damage_label, per_axis = self._run_counterfactual_intervention(
-                            video_full=video_b,
-                            prompt=prompt,
-                            z_init=z_trajectory.get(step, None),
-                            tube=tubes[tube_idx],
-                            action=Action(action),
-                            backbone_adapter=backbone_adapter,
-                        )
-
-                        if damage_label is None:
-                            continue
-
-                        # Build training sample
-                        strength_feats = strength_features_by_step.get(step, None)
-                        tube_state = self._extract_tube_state(tubes[tube_idx], step)
-
-                        sample = COCFTrainingSample(
-                            tube_features=tube_state,
-                            timestep=step,
-                            action=action,
-                            damage_label=damage_label,
+                tube = traj.tubes[ti]
+                tid = tube.tube_id
+                state = traj.tube_states[tid]
+                feats = traj.strength_feats[tid]
+                for a in actions:
+                    if len(samples) >= max_samples:
+                        break
+                    action = Action(a)
+                    damage, unc, cost, y_cf, per_axis = self._counterfactual_labels(
+                        traj, step_idx, tube, action, backbone, transition
+                    )
+                    samples.append(
+                        COCFTrainingSample(
+                            tube_features=state.as_tensor(),
+                            timestep=int(t),
+                            action=int(action),
+                            damage_label=damage,
                             damage_per_axis=per_axis,
-                            prompt=prompt,
-                            tube_id=tube_idx,
-                            scene_type="generic",  # TODO: infer from prompt/content
-                            interaction_density=self._compute_interaction_density(
-                                tubes, tube_idx
-                            ),
-                            strength_level=int(self._estimate_strength_level(
-                                tubes[tube_idx], strength_feats
-                            )),
-                            tube_pixels=self._count_tube_pixels(tubes[tube_idx]),
+                            strength_features=feats.as_tensor(),
+                            cost_label=cost,
+                            uncertainty=unc,
+                            tube_visual_embed_full=traj.tube_visual_embed_full.get(tid),
+                            tube_visual_embed_cf=self._tube_visual_embed(y_cf, tube, traj.grid),
+                            text_embed=traj.text_embed,
+                            prompt=traj.prompt,
+                            video_id=traj.video_id,
+                            tube_id=tid,
+                            scene_type=traj.scene_type,
+                            interaction_density=float(min(max(state.interaction, 0.0), 1.0)),
+                            strength_level=int(self._strength_level(feats)),
+                            step_frac=float(step_frac),
+                            tube_token_count=int(tube.size),
+                            tube_pixels=self._count_tube_pixels(tube),
+                            tube_stability=float(state.identity_confidence),
                         )
-
-                        samples_this_video.append(sample)
-                        samples.append(sample)
-
-            _log.info(f"  Generated {len(samples_this_video)} samples from batch {b}")
-
+                    )
+        _log.debug("Generated %d counterfactual samples for %s", len(samples), traj.video_id)
         return samples
 
-    def _run_counterfactual_intervention(
+    # ------------------------------------------------------------------ #
+    # single-hop counterfactual rollout (§1.5)
+    # ------------------------------------------------------------------ #
+
+    def _counterfactual_labels(
         self,
-        video_full: Tensor,  # [F, 3, H, W]
-        prompt: str,
-        z_init: Optional[Tensor],  # [N, d] initial latent
+        traj: TeacherTrajectory,
+        step_idx: int,
         tube: SemanticTube,
         action: Action,
-        backbone_adapter,
-        num_cf_steps: int = 10,  # run CF for 10 steps
-    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
-        """Execute a counterfactual intervention: apply action to tube, continue denoising.
+        backbone: BackboneAdapter,
+        transition: TransitionExecutor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float]]:
+        """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis)``.
 
-        Real implementation must:
-            1. Load z_init
-            2. Apply action to tube (skip/lowfreq/interp/anchor)
-            3. Continue for num_cf_steps
-            4. Decode & return video_cf
-            5. Compute damage vs video_full
-
-        Until that rollout exists, this MUST NOT fabricate a label: returning a
-        zero/placeholder damage vector here would silently write millions of
-        invalid samples to the Stage-A dataset and poison all downstream training
-        with no error. Fail loudly instead.
+        FULL is the reference: zero damage by construction (no local modification),
+        so its label is exact and needs no rollout. Skip actions roll out
+        ``seeds_per_prompt`` times (small seeded perturbations of ``z_t``) so the
+        per-axis variance is the §1.5 multi-seed uncertainty label.
         """
-        raise NotImplementedError(
-            "Counterfactual intervention rollout is not implemented yet. "
-            "Implement the z_init replay + action application + decode + damage "
-            "computation before running Stage-A data generation; do not return a "
-            "placeholder label (it silently corrupts the training set)."
+        cost = self._cost_label(action, transition)
+        if action == Action.FULL:
+            zero = torch.zeros(NUM_DAMAGE_DIMS)
+            return zero, zero.clone(), cost, traj.video_full, {ax: 0.0 for ax in DAMAGE_DIMENSIONS}
+
+        z_t = traj.z_by_step[step_idx]
+        dmgs: List[Tensor] = []
+        y_cf0: Optional[Tensor] = None
+        per_axis0: Dict[str, float] = {}
+        for k in range(self.seeds_per_prompt):
+            z0 = z_t if k == 0 else z_t + self.perturb_std * self._seeded_noise(
+                z_t, traj.video_id, step_idx, tube.tube_id, int(action), k
+            )
+            y_cf = self._rollout(z0, step_idx, tube, action, traj, backbone, transition)
+            dmg, per_axis = self.damage_computer.compute_damage(traj.video_full, y_cf, traj.prompt)
+            dmgs.append(dmg)
+            if k == 0:
+                y_cf0, per_axis0 = y_cf, per_axis
+        D = torch.stack(dmgs)                                  # [seeds, 8]
+        damage = D.mean(0).clamp(0, 1)
+        uncertainty = D.var(0, unbiased=False) if self.seeds_per_prompt > 1 else torch.zeros_like(damage)
+        return damage, uncertainty, cost, y_cf0, per_axis0
+
+    def _rollout(
+        self,
+        z_t: Tensor,
+        step_idx: int,
+        tube: SemanticTube,
+        action: Action,
+        traj: TeacherTrajectory,
+        backbone: BackboneAdapter,
+        transition: TransitionExecutor,
+    ) -> Tensor:
+        """Apply the action at step ``t`` then continue all-FULL to ``z_0`` → ``Y_cf``."""
+        grid, cond, T = traj.grid, traj.cond, traj.num_total_steps
+        device = z_t.device
+        t = T - step_idx
+        t_now = torch.full((z_t.shape[0],), float(t), device=device)
+        t_next = torch.full((z_t.shape[0],), float(t - 1), device=device)
+        # dense full-compute step at the intervention timestep (the FULL reference advance)
+        out = backbone.denoise(z_t, t_now, cond, grid=grid, active_mask=None, cache=None)
+        z_full = backbone.scheduler_step(out.cache.model_output, t_now, t_next, z_t)
+        z = self._apply_action_to_tube(z_full, z_t, tube, action, grid, transition)
+        # continue all-FULL (dense) to z_0 — single-hop: only step t was intervened
+        for s in range(step_idx + 1, T):
+            ts = T - s
+            tn = torch.full((z.shape[0],), float(ts), device=device)
+            tnn = torch.full((z.shape[0],), float(ts - 1), device=device)
+            z = backbone.full_transition(z, tn, tnn, cond, grid=grid).model_output
+        return _frames_fchw(backbone.decode_latent(backbone.to_grid(z, grid)))
+
+    def _apply_action_to_tube(
+        self,
+        z_full: Tensor,
+        z_prev: Tensor,
+        tube: SemanticTube,
+        action: Action,
+        grid: TokenGrid,
+        transition: TransitionExecutor,
+    ) -> Tensor:
+        """Produce ``z_t^{cf}`` by applying ``action`` to *only* this tube's tokens."""
+        if action == Action.FULL:
+            return z_full
+        idx = tube.all_token_indices().to(z_full.device)
+        if idx.numel() == 0:
+            return z_full
+        z_cf = z_full.clone()
+        if action == Action.ANCHOR:
+            # freeze: the tube does not advance this step (reuse the pre-step latent)
+            z_cf.index_copy_(1, idx, z_prev.index_select(1, idx).to(z_cf.dtype))
+        elif action == Action.INTERP:
+            self._interp_tube(z_cf, tube)
+        elif action == Action.LOWFREQ:
+            # strided subsample + nearest upsample via the shared inference realisation
+            z_cf = transition.coarsen_lowfreq(z_cf, tube, grid)
+        return z_cf
+
+    @staticmethod
+    def _interp_tube(z_cf: Tensor, tube: SemanticTube) -> None:
+        """INTERP model: replace each frame's tube tokens with the temporally
+        interpolated mean of its neighbouring frames (loses within-frame detail and
+        motion — the temporal-interpolation lag the action induces)."""
+        frames = tube.frames
+        if len(frames) < 2:
+            return
+        means = {
+            f: z_cf[:, tube.tokens_by_frame[f].to(z_cf.device)].mean(1)  # [B, d]
+            for f in frames
+        }
+        for i, f in enumerate(frames):
+            lo = frames[max(0, i - 1)]
+            hi = frames[min(len(frames) - 1, i + 1)]
+            interp = 0.5 * (means[lo] + means[hi])
+            idx = tube.tokens_by_frame[f].to(z_cf.device)
+            z_cf[:, idx] = interp.unsqueeze(1).expand(-1, idx.numel(), -1).to(z_cf.dtype)
+
+    def _cost_label(self, action: Action, transition: TransitionExecutor) -> Tensor:
+        """``[FLOPs frac, active-token frac]`` of the action (§1.5 计算成本标签)."""
+        stride = max(1, transition.lowfreq_stride)
+        active = (1.0, 1.0 / (stride * stride), 0.0, 0.0)[int(action)]
+        return torch.tensor([self.action_cost[int(action)], active], dtype=torch.float32)
+
+    # ------------------------------------------------------------------ #
+    # feature extraction (real, no placeholders)
+    # ------------------------------------------------------------------ #
+
+    def _tube_visual_embed(self, video_fchw: Tensor, tube: SemanticTube, grid: TokenGrid) -> Tensor:
+        """Per-tube CLIP visual embed ``[d_v]`` from a representative frame (CMSC)."""
+        return tube_clip_embed(video_fchw, tube, grid, self.perception)
+
+    def _select_tubes(self, traj: TeacherTrajectory, max_tubes: int) -> List[int]:
+        """Pick ≤``max_tubes`` tube indices spanning high/mid/low causal levels (§1.5)."""
+        tubes = traj.tubes
+        if len(tubes) <= max_tubes:
+            return list(range(len(tubes)))
+        order = sorted(
+            range(len(tubes)),
+            key=lambda i: self._strength_scalar(traj.strength_feats[tubes[i].tube_id]),
+            reverse=True,
         )
+        picks = sorted({int(round(j * (len(order) - 1) / (max_tubes - 1))) for j in range(max_tubes)})
+        return [order[p] for p in picks]
 
-    def _extract_tube_state(self, tube: SemanticTube, timestep: int) -> Tensor:
-        """Extract the 7-dim tube state for the predictor input.
+    @staticmethod
+    def _strength_scalar(feats: StrengthFeatures) -> float:
+        return (feats.s_E + feats.s_A + feats.s_T) / 3.0
 
-        Real impl: geometry (centroid, size), motion, identity score, etc. A random
-        placeholder here would be written as a real feature vector and corrupt the
-        dataset silently, so this fails loudly until implemented.
-        """
-        raise NotImplementedError(
-            "Tube-state feature extraction is not implemented yet. Returning random "
-            "features here would silently corrupt the Stage-A dataset."
-        )
+    def _strength_level(self, feats: StrengthFeatures) -> StrengthLevel:
+        """Map ``(s_E,s_A,s_T)`` to a HIGH/MID/LOW causal level (§3.3.3 thresholds)."""
+        s = self._strength_scalar(feats)
+        if s > 0.66:
+            return StrengthLevel.HIGH
+        if s > 0.33:
+            return StrengthLevel.MID
+        return StrengthLevel.LOW
 
-    def _compute_interaction_density(self, tubes: List[SemanticTube], tube_idx: int) -> float:
-        """Compute how much this tube interacts with others (0-1)."""
-        if not tubes or tube_idx >= len(tubes):
-            return 0.0
-        # Stub: return count of overlapping tubes
-        return min(1.0, len(tubes) / 10.0)
+    @staticmethod
+    def _seeded_noise(like: Tensor, *keys) -> Tensor:
+        """Deterministic Gaussian like ``like`` — reproducible per (clip,step,tube,...)."""
+        seed = abs(hash(keys)) % (2 ** 31)
+        g = torch.Generator().manual_seed(seed)
+        return torch.randn(like.shape, generator=g).to(like.device, like.dtype)
 
-    def _estimate_strength_level(
-        self, tube: SemanticTube, strength_feats: Optional[StrengthFeatures]
-    ) -> StrengthLevel:
-        """Estimate causal strength level (HIGH/MID/LOW) for the tube."""
-        # Stub: use strength features if available, else return MID
-        return StrengthLevel.MID
-
-    def _count_tube_pixels(self, tube: SemanticTube) -> int:
-        """Count total pixels spanned by the tube across its lifespan."""
-        if not tube or not tube.frames:
+    @staticmethod
+    def _count_tube_pixels(tube: SemanticTube) -> int:
+        """Total latent-mask area spanned by the tube across its frames."""
+        if not tube.masks_by_frame:
             return 0
-        return sum(len(mask.nonzero()) for mask in tube.frames)
+        return int(sum(int(m.sum()) for m in tube.masks_by_frame.values()))
 
 
 # ============================================================================= #

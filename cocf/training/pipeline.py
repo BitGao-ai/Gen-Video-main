@@ -13,7 +13,7 @@ Typical usage:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -33,14 +33,26 @@ _log = get_logger(__name__)
 
 @dataclass
 class PipelineConfig:
-    """Top-level configuration for the three-stage training pipeline."""
+    """Top-level configuration for the three-stage training pipeline.
+
+    Stage A reads the OpenVid CSV(s) and writes the six-level processed store; Stages
+    B and C read that same store. One ``processed_root`` is therefore threaded through
+    all three stages (defaulting to ``experiment_dir / 'LCOCF_OpenVid1M_Processed'``)
+    so the data written by A is exactly what B/C consume.
+    """
 
     # Shared
     experiment_dir: Path
     checkpoint_load_path: Optional[Path] = None  # Resume from checkpoint
     seed: int = 42
 
-    # Individual stage configs
+    # Stage-A data inputs (§1.1): OpenVid metadata CSV(s) and where the clips live.
+    openvid_csvs: List[Path] = field(default_factory=list)
+    data_root: str = ""
+    # Shared processed-store root (§3); defaults under experiment_dir when unset.
+    processed_root: Optional[Path] = None
+
+    # Individual stage configs (optional pre-built overrides; built lazily otherwise)
     stage_a: Optional[StageAConfig] = None
     stage_b: Optional[StageBConfig] = None
     stage_c: Optional[StageCConfig] = None
@@ -50,6 +62,9 @@ class PipelineConfig:
             "experiment_dir": str(self.experiment_dir),
             "checkpoint_load_path": str(self.checkpoint_load_path) if self.checkpoint_load_path else None,
             "seed": self.seed,
+            "openvid_csvs": [str(p) for p in self.openvid_csvs],
+            "data_root": self.data_root,
+            "processed_root": str(self.processed_root) if self.processed_root else None,
         }
 
     @classmethod
@@ -57,11 +72,13 @@ class PipelineConfig:
         """Load config from YAML file."""
         with open(path) as f:
             data = yaml.safe_load(f)
-        # Parse into individual stage configs
         return cls(
             experiment_dir=Path(data.get("experiment_dir", "./experiments")),
             checkpoint_load_path=Path(data.get("checkpoint_load_path")) if data.get("checkpoint_load_path") else None,
             seed=data.get("seed", 42),
+            openvid_csvs=[Path(p) for p in data.get("openvid_csvs", [])],
+            data_root=data.get("data_root", ""),
+            processed_root=Path(data["processed_root"]) if data.get("processed_root") else None,
         )
 
 
@@ -138,39 +155,53 @@ class TrainingPipeline:
         _log.info("=== Training Pipeline Complete ===")
         return self.accelerator
 
+    def _processed_root(self) -> Path:
+        """The shared six-level store root (§3): A writes it, B/C read it."""
+        return (
+            self.pipeline_cfg.processed_root
+            or self.pipeline_cfg.experiment_dir / "LCOCF_OpenVid1M_Processed"
+        )
+
     def _run_stage_a(self) -> None:
-        """Run Stage A: Data generation."""
+        """Run Stage A: counterfactual teacher data generation (§1)."""
         _log.info("\n--- Stage A: Data Generation ---")
 
-        # Create stage config if not present
         if self.pipeline_cfg.stage_a is None:
+            if not self.pipeline_cfg.openvid_csvs:
+                raise RuntimeError(
+                    "Stage A needs OpenVid CSV(s): set PipelineConfig.openvid_csvs "
+                    "(or pass a pre-built PipelineConfig.stage_a)."
+                )
             self.pipeline_cfg.stage_a = StageAConfig(
-                manifest_path=self.pipeline_cfg.experiment_dir / "data" / "manifest.csv",
-                output_dir=self.pipeline_cfg.experiment_dir / "stage_a_data",
+                openvid_csvs=list(self.pipeline_cfg.openvid_csvs),
+                processed_root=self._processed_root(),
+                data_root=self.pipeline_cfg.data_root,
+                config=self.config,
+                device=self.device,
+                seed=self.pipeline_cfg.seed,
             )
 
-        # Run stage. The metric extractor is owned by the accelerator (defaulted to
-        # a mock by Accelerator.from_config); Config carries no such runtime object.
+        # The metric extractor is owned by the accelerator (mock by default); Config
+        # carries no such runtime object.
         self._stage_a = DataGenerationStage(
             config=self.pipeline_cfg.stage_a,
             backbone=self.accelerator.backbone,
-            metric_extractor=self.accelerator.metric_extractor,  # Injected
+            metric_extractor=self.accelerator.metric_extractor,  # injected
             accelerator=self.accelerator,
         )
         self._stage_a.run()
 
     def _run_stage_b(self) -> None:
-        """Run Stage B: Joint training."""
+        """Run Stage B: joint module training (§4.1)."""
         _log.info("\n--- Stage B: Joint Training ---")
 
-        # Create stage config if not present
         if self.pipeline_cfg.stage_b is None:
             self.pipeline_cfg.stage_b = StageBConfig(
-                cache_dir=self.pipeline_cfg.experiment_dir / "stage_a_data" / "cache",
+                processed_root=self._processed_root(),
+                config=self.config,
                 device=self.device,
             )
 
-        # Run stage
         self._stage_b = JointTrainingStage(
             accelerator=self.accelerator,
             config=self.pipeline_cfg.stage_b,
@@ -178,17 +209,16 @@ class TrainingPipeline:
         self.accelerator = self._stage_b.run()
 
     def _run_stage_c(self) -> None:
-        """Run Stage C: Fine-tuning."""
+        """Run Stage C: end-to-end lightweight fine-tuning (§4.2)."""
         _log.info("\n--- Stage C: Fine-tuning ---")
 
-        # Create stage config if not present
         if self.pipeline_cfg.stage_c is None:
             self.pipeline_cfg.stage_c = StageCConfig(
-                manifest_path=self.pipeline_cfg.experiment_dir / "data" / "manifest.csv",
+                processed_root=self._processed_root(),
+                config=self.config,
                 device=self.device,
             )
 
-        # Run stage
         self._stage_c = FinettuneStage(
             accelerator=self.accelerator,
             engine=self.engine,

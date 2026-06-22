@@ -102,6 +102,42 @@ class CMSCLoss(nn.Module):
         return total, components
 
     # ------------------------------------------------------------------ #
+    # batched offline conservation (Stage-B counterfactual samples, §4.1)
+    # ------------------------------------------------------------------ #
+
+    def alignment_conservation(
+        self,
+        text_embeds: Tensor,                 # [B, L, d_c] padded prompt tokens
+        tube_full: Tensor,                   # [B, d_v] full-render tube visual embed
+        tube_cf: Tensor,                     # [B, d_v] cf-render tube visual embed
+        text_mask: Optional[Tensor] = None,  # [B, L] 1=keep
+    ) -> Tensor:
+        """Per-sample text-tube alignment conservation ``mean_b (a_full − a_cf)²``.
+
+        The Stage-B counterfactual store holds one tube's visual embed under the full
+        and the counterfactual render plus the prompt tokens — not two full
+        :class:`CMSCObservation`s — so this is the batched, differentiable CMSC term
+        for that offline schema (§4.1 CMSC 模块). It mirrors
+        :meth:`TextTubeAlignment.tube_scores` (max alignment over text tokens, →[0,1])
+        and penalises the change in that alignment under acceleration; gradient flows
+        through the learnable text/visual projections only.
+        """
+        al = self.alignment
+        t = F.normalize(al.text_proj(text_embeds.float()), dim=-1)   # [B, L, a]
+        vf = F.normalize(al.vis_proj(tube_full.float()), dim=-1)     # [B, a]
+        vc = F.normalize(al.vis_proj(tube_cf.float()), dim=-1)       # [B, a]
+        sim_f = torch.einsum("bla,ba->bl", t, vf)                    # [B, L] cosine
+        sim_c = torch.einsum("bla,ba->bl", t, vc)
+        if text_mask is not None:
+            fill = torch.finfo(sim_f.dtype).min
+            keep = text_mask > 0.5
+            sim_f = sim_f.masked_fill(~keep, fill)
+            sim_c = sim_c.masked_fill(~keep, fill)
+        score_f = sim_f.max(dim=-1).values.clamp(-1, 1) * 0.5 + 0.5  # [B] ∈ [0,1]
+        score_c = sim_c.max(dim=-1).values.clamp(-1, 1) * 0.5 + 0.5
+        return (score_f - score_c).pow(2).mean()
+
+    # ------------------------------------------------------------------ #
     # per-tube local term for the RAEC certificate (§5.3.1)
     # ------------------------------------------------------------------ #
 

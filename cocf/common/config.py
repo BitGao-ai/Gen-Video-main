@@ -256,6 +256,11 @@ class DataConfig:
 
     data_root: str = ""
     meta_file: str = ""  # jsonl/csv manifest with {video, caption[, scene]}
+    # OpenVid-1M layout: clips resolve to ``{data_root}/{video_subdir}/{video}``
+    # and all 202 zip parts extract into a single flat folder (§1.1).
+    video_subdir: str = "video"
+    # Root of the processed six-level store ``LCOCF_OpenVid1M_Processed`` (§3).
+    processed_root: str = "LCOCF_OpenVid1M_Processed"
     # --- frame sampling (HunyuanVideo/Wan2.1 convention) ---
     num_frames: int = 49  # 4k+1 for the 4× causal-temporal VAE (k=12)
     frame_interval: int = 1  # temporal stride when sampling source frames
@@ -273,6 +278,41 @@ class DataConfig:
     num_workers: int = 4
     pin_memory: bool = True
     seed: int = 1234
+
+
+@dataclass
+class FilterConfig:
+    """Four-level quality-filter thresholds (§2).
+
+    The filter runs primarily on the OpenVid metadata columns (resolution, seconds,
+    aesthetic / motion scores, caption) so it is cheap and decode-free; the optional
+    blur/watermark gates are applied only when a perception hook supplies the signal
+    (§2.1 Table 0). Defaults mirror the document's stated cut-offs verbatim.
+    """
+
+    # L1 — basic hard filter (§2.1, Table 0)
+    min_resolution: int = 512  # drop < 512×512; HD (1080p) force-kept
+    min_duration_s: float = 2.0
+    max_duration_s: float = 15.0
+    preferred_min_duration_s: float = 3.0  # 3–10s is the mainstream window
+    preferred_max_duration_s: float = 10.0
+    black_frame_max_frac: float = 0.30  # > 30% black/garbled ⇒ drop
+    watermark_max_frac: float = 0.20  # > 20% watermark/logo/mosaic ⇒ drop
+    blur_laplacian_min: float = 0.0  # Laplacian-variance floor (0 ⇒ gate disabled)
+    # L2 — semantic filter (§2.2)
+    min_caption_words: int = 5
+    min_clip_align: float = 0.25
+    aesthetic_drop_frac: float = 0.20  # drop the bottom 20% aesthetic
+    dedup_sim_threshold: float = 0.95  # caption/fingerprint near-duplicate cut
+    # L3 — task-fitness filter (§2.3)
+    drop_static: bool = True  # drop pure-static / no-motion / no-semantic-change
+    static_motion_max: float = 0.02  # motion score below ⇒ treated as static
+    complex_min_frac: float = 0.30  # complex scenes ≥ 30% of the kept set
+    # L4 — final sampling (§2.4)
+    target_samples: int = 180_000  # 15–20万 high-quality clips
+    hd_min_frac: float = 0.60  # OpenVidHD ≥ 60% of the final set
+    val_frac: float = 0.10  # 10% validation, split by video_id (no leakage)
+    test_hard_frac: float = 0.05  # hard-sample test list (multi/occlusion/text/fast)
 
 
 @dataclass
@@ -296,6 +336,7 @@ class TeacherConfig:
     # skip actions probed per (tube, step) — FULL (=0) is the zero-damage reference.
     probe_actions: Tuple[int, ...] = (1, 2, 3)  # LOW FREQ, INTERP, ANCHOR
     max_tubes_per_prompt: int = 8  # cap tube-group interventions per prompt
+    samples_per_video: int = 30  # cap on (tube,step,action) labels per video (§1.5)
     scene_balanced: bool = True  # balance static/dynamic/text/face/multi/occlusion
     use_preview_decode_for_tubes: bool = True  # segment a preview decode of z_t
     shard_size: int = 256  # records per on-disk shard
@@ -332,6 +373,10 @@ class TrainingConfig:
     lora_target_last_n_blocks: int = 4
     log_every: int = 20
     ckpt_every: int = 1000
+    # Stage-B validation & early stopping (§4.1): evaluate degradation-prediction
+    # MAE, certificate-violation rate, budget-hit rate and action smoothness.
+    val_every_epochs: int = 1
+    early_stop_patience: int = 3  # epochs without val improvement before stopping
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +399,7 @@ class Config:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     allocator: AllocatorConfig = field(default_factory=AllocatorConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    filter: FilterConfig = field(default_factory=FilterConfig)
     teacher: TeacherConfig = field(default_factory=TeacherConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     seed: int = 1234

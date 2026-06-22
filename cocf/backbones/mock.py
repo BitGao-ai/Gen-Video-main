@@ -209,3 +209,14 @@ class MockBackbone(BackboneAdapter):
     @property
     def module(self) -> nn.Module:
         return self._net
+
+    def dit_blocks(self):
+        """Expose the FFN / time-embed sub-blocks for Stage-C LoRA (§4.2).
+
+        A real backbone returns its transformer blocks here; the mock has no block
+        list, so it returns the ``nn.Linear``-bearing sub-modules that lie on the
+        denoiser's gradient path (``mlp`` is used in both the block and the ε head,
+        ``t_embed`` in every step). Wrapping these lets the LoRA path be exercised
+        end-to-end on CPU (the base linears stay frozen; only the LoRA A/B train).
+        """
+        return [self.mlp, self.t_embed]
