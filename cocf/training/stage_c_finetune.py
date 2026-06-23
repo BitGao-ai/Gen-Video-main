@@ -17,7 +17,7 @@ This stage is optional but recommended for production quality. It converges quic
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 from cocf.common.config import Config, DataConfig
 from cocf.common.logging import get_logger
 from cocf.core.accelerator import Accelerator
-from cocf.data import VideoTextDataset, collate_video_samples
+from cocf.data import ProcessedLayout, VideoTextDataset, collate_video_samples
 from cocf.engine import InferenceEngine
 
 Tensor = torch.Tensor
@@ -38,10 +38,20 @@ _log = get_logger(__name__)
 
 @dataclass
 class StageCConfig:
-    """Hyperparameters for Stage C fine-tuning."""
+    """Hyperparameters for Stage C fine-tuning.
 
-    # Data
-    manifest_path: Path  # Full video dataset manifest
+    The §4.2 data source is the processed store's ``raw_filtered/`` (preferred,
+    ``processed_root``) or a plain video/caption ``manifest_path`` fallback — both
+    optional so the pipeline (which threads ``processed_root``) and the standalone
+    script (which may pass ``--manifest``) construct this identically. ``config`` is
+    the full :class:`~cocf.common.config.Config` so the stage can size budgets / read
+    data knobs consistently with the rest of the run.
+    """
+
+    # Data — at least one of these resolves the §4.2 source (see :meth:`run`).
+    manifest_path: Optional[Path] = None  # fallback video/caption manifest
+    processed_root: Optional[Path] = None  # preferred: §3 store (raw_filtered/)
+    config: Config = field(default_factory=Config)  # full run config
     batch_size: int = 4  # Smaller batches due to full-pipeline overhead
     num_workers: int = 2
     num_epochs: int = 3
@@ -122,15 +132,24 @@ class FinettuneStage:
         """Execute Stage C fine-tuning."""
         _log.info("=== Stage C: Lightweight Fine-tuning ===")
 
-        # Load dataset. VideoTextDataset takes a DataConfig (its ``meta_file`` is the
-        # manifest path); ``manifest_path`` / ``num_workers`` were never valid
-        # constructor kwargs, so the old call raised TypeError on entry.
+        # Resolve the §4.2 data source: an explicit ``manifest_path`` wins, else the
+        # processed store's ``raw_filtered/captions.jsonl`` (written by Stage A).
+        # VideoTextDataset reads either as a {path/caption} manifest (its ``meta_file``).
         #
         # NOTE (ambiguous, intentionally not auto-resolved): the frame-sampling /
         # bucketing params fall back to DataConfig defaults; thread the full
         # ``Config.data`` into StageCConfig if Stage C must match the main run.
+        meta_file = ""
+        if self.config.manifest_path is not None:
+            meta_file = str(self.config.manifest_path)
+        elif self.config.processed_root is not None:
+            captions = ProcessedLayout(self.config.processed_root).raw_filtered_dir / "captions.jsonl"
+            meta_file = str(captions)
+        else:
+            _log.warning("Stage C: no --manifest or --processed-root given; nothing to train on.")
+            return self.accelerator
         data_cfg = DataConfig(
-            meta_file=str(self.config.manifest_path),
+            meta_file=meta_file,
             num_workers=self.config.num_workers,
         )
         dataset = VideoTextDataset(data_cfg)
@@ -148,6 +167,11 @@ class FinettuneStage:
         )
 
         _log.info(f"Stage C: {len(dataset)} videos, {len(dataloader)} batches")
+        if len(dataloader) == 0:
+            # No clips resolved (empty/missing manifest). Bail out cleanly instead of
+            # dividing by a zero batch count in the epoch-average below.
+            _log.warning("Stage C: data source '%s' yielded no batches; skipping fine-tune.", meta_file)
+            return self.accelerator
 
         best_loss = float("inf")
 

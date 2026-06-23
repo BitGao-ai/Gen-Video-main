@@ -63,8 +63,10 @@ class TestTrainingPipeline:
         bb_params_grad = [p for p in accelerator.backbone.module.parameters() if p.requires_grad]
         assert len(bb_params_grad) > 0  # Backbone has (now) trainable params
 
-        # Freeze and create training stage
-        stage_config = StageBConfig(cache_dir=Path("./dummy"), device=torch.device("cpu"))
+        # Freeze and create training stage. StageBConfig's data root is
+        # ``processed_root`` (the §3 store); its ctor does no IO, so a dummy path is
+        # enough to exercise the freezing the stage performs at construction.
+        stage_config = StageBConfig(processed_root=Path("./dummy"), device=torch.device("cpu"))
         stage = JointTrainingStage(accelerator, stage_config)
 
         # Check frozen
