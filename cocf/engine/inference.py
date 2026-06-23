@@ -375,9 +375,15 @@ class InferenceEngine(nn.Module):
                     # FULL for the next q steps so it is recomputed forward.
                     _log.debug(f"  Tube {tube.tube_id}: HIGH RISK ({cert_k:.3f}), rolling back")
                     if result.z_full is not None:
-                        state.z = self.accelerator.raec.repair.rollback(
+                        rr = self.accelerator.raec.repair.rollback(
                             state.z, result.z_full, tube, state.grid, state.anchor_store
-                        ).z
+                        )
+                        state.z = rr.z
+                        # Refresh the now-stale ε/KV cache for the repaired tokens
+                        # (§5.3.2 缓存刷新; a no-op for backbones without a KV cache).
+                        state.cache = backbone.recompute_kv(
+                            state.z, state.cond, rr.refreshed, state.cache
+                        )
                     else:
                         state.z = state.anchor_store.rollback(state.z, tube)
                     state.force_full_countdown[tube.tube_id] = self.trigger_cfg.force_full_steps
@@ -390,9 +396,13 @@ class InferenceEngine(nn.Module):
                     # left to skip again.
                     _log.debug(f"  Tube {tube.tube_id}: MEDIUM RISK ({cert_k:.3f}), repairing")
                     if result.z_full is not None:
-                        state.z = self.accelerator.raec.repair.repair(
+                        rr = self.accelerator.raec.repair.repair(
                             state.z, result.z_full, tube, state.grid
-                        ).z
+                        )
+                        state.z = rr.z
+                        state.cache = backbone.recompute_kv(
+                            state.z, state.cond, rr.refreshed, state.cache
+                        )
                     state.force_full_countdown[tube.tube_id] = max(
                         state.force_full_countdown.get(tube.tube_id, 0), 1
                     )
