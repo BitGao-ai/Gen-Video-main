@@ -58,6 +58,11 @@ class EngineState:
     force_full_countdown: Dict[int, int] = field(default_factory=dict)
     tube_visual_embed: Dict[int, Tensor] = field(default_factory=dict)
     prev_z: Optional[Tensor] = None
+    # mean damage uncertainty (mean σ over tubes) of the *previous* step, fed into the
+    # next step's dynamic budget (§7.3 平均损害不确定度 term). Carried on the state
+    # because the budget is sized before this step's σ is known (it conditions the
+    # predictor), so the causal, no-future-info signal is the previous step's σ.
+    prev_mean_uncertainty: float = 0.0
     # accumulated metrics
     traces: List[StepTrace] = field(default_factory=list)
 

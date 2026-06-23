@@ -256,7 +256,9 @@ class InferenceEngine(nn.Module):
                 if tube_states else 0.0
             )
             budget_t = self.budget_scheduler.budget(
-                step_frac, complexity=complexity, interaction_density=interaction
+                step_frac, complexity=complexity,
+                mean_uncertainty=state.prev_mean_uncertainty,
+                interaction_density=interaction,
             )
         else:
             budget_t = self.accelerator.config.budget.b_max
@@ -269,6 +271,14 @@ class InferenceEngine(nn.Module):
         trace.predicted_cost = float(
             sum(float(p.mu.detach().mean()) for p in damage_preds.values())
         )
+        # Carry this step's mean damage uncertainty (mean σ over tubes) into the next
+        # step's budget demand (§7.3): the more unsure the predictor, the more compute
+        # the following step is allowed to spend.
+        if damage_preds:
+            state.prev_mean_uncertainty = float(
+                sum(float(p.sigma.detach().mean()) for p in damage_preds.values())
+                / len(damage_preds)
+            )
 
         # --- Step 5b: Solve optimal action allocation -----
         # Tubes still inside a post-rollback/repair forced-FULL window (§5.3.2) are
@@ -321,6 +331,17 @@ class InferenceEngine(nn.Module):
         state.cache = result.cache
         trace.active_ratio = result.active_ratio
 
+        # --- Step 6b: §3.3.4 single-hop counterfactual check on skipped tubes -----
+        # Fire only at temporal mutation points (s_T > θ_sT) for tubes that actually
+        # skipped, capped per step (verifier.triggered_tubes). Compare the executed
+        # (skip) latent against the transition's compute-everywhere reference z_full;
+        # a residual above η means the skip omitted a causal effect (causal omission),
+        # repaired locally by the L-COCF residual-repair net. Gated by cf_check_enabled.
+        if self.engine_cfg.cf_check_enabled and result.z_full is not None:
+            trace.cf_checks, trace.cf_repairs = self._counterfactual_check(
+                state, result.z_full, optimal_actions, strength_feats
+            )
+
         # --- Step 4 (post-transition): error certificates (RAEC), keyed by tube_id
         # Certify the action that was *actually executed* and feed it the real skip
         # residual δ_k = ‖z_full − z_action‖ measured by the transition (§5.3.1).
@@ -348,19 +369,40 @@ class InferenceEngine(nn.Module):
                 cert_k = certificates.get(tube.tube_id, 0.0)
 
                 if cert_k > self.trigger_cfg.tau_high:
-                    # High risk: roll the tube's tokens back to its safe anchor and
-                    # pin it to FULL for the next q steps so it is recomputed forward.
+                    # High risk: revoke the tube to its safe anchor, fuse the boundary
+                    # against the compute-everywhere latent so the rolled-back interior
+                    # joins its surroundings seam-free (§5.3.2 边界修复), and pin it to
+                    # FULL for the next q steps so it is recomputed forward.
                     _log.debug(f"  Tube {tube.tube_id}: HIGH RISK ({cert_k:.3f}), rolling back")
-                    state.z = state.anchor_store.rollback(state.z, tube)
+                    if result.z_full is not None:
+                        rr = self.accelerator.raec.repair.rollback(
+                            state.z, result.z_full, tube, state.grid, state.anchor_store
+                        )
+                        state.z = rr.z
+                        # Refresh the now-stale ε/KV cache for the repaired tokens
+                        # (§5.3.2 缓存刷新; a no-op for backbones without a KV cache).
+                        state.cache = backbone.recompute_kv(
+                            state.z, state.cond, rr.refreshed, state.cache
+                        )
+                    else:
+                        state.z = state.anchor_store.rollback(state.z, tube)
                     state.force_full_countdown[tube.tube_id] = self.trigger_cfg.force_full_steps
                     rollbacks_this_step += 1
 
                 elif self.trigger_cfg.tau_low < cert_k <= self.trigger_cfg.tau_high:
-                    # Medium risk: pin the tube to FULL for one refresh step so the
-                    # drifting region is recomputed rather than left to skip again.
-                    # (Soft-mask boundary blend over sigma_bnd is a future refinement
-                    # layered on top of this forced recompute.)
+                    # Medium risk: boundary-fuse the tube's drifting rim toward the
+                    # freshly computed latent (§5.3.2 边界修复/缓存刷新) and pin it to
+                    # FULL for one refresh step so the region is recomputed rather than
+                    # left to skip again.
                     _log.debug(f"  Tube {tube.tube_id}: MEDIUM RISK ({cert_k:.3f}), repairing")
+                    if result.z_full is not None:
+                        rr = self.accelerator.raec.repair.repair(
+                            state.z, result.z_full, tube, state.grid
+                        )
+                        state.z = rr.z
+                        state.cache = backbone.recompute_kv(
+                            state.z, state.cond, rr.refreshed, state.cache
+                        )
                     state.force_full_countdown[tube.tube_id] = max(
                         state.force_full_countdown.get(tube.tube_id, 0), 1
                     )
@@ -468,3 +510,57 @@ class InferenceEngine(nn.Module):
             anchor_latent=self._assemble_anchor_latent(state),
             measure_residual=self.engine_cfg.measure_residual,
         )
+
+    def _counterfactual_check(
+        self,
+        state: EngineState,
+        z_full: Tensor,
+        actions: Dict[int, Action],
+        strength_feats,
+    ) -> Tuple[int, int]:
+        """Run the §3.3.4 single-hop counterfactual verification + local repair.
+
+        For each tube the L-COCF verifier flags — temporal-mutation point ``s_T > θ_sT``
+        *and* the tube skipped this step, capped at ``max_checks_per_step`` — the
+        executed (skip) tube latent is compared against the compute-everywhere
+        reference ``z_full``. When the residual exceeds ``η`` the residual-repair net
+        corrects that tube's tokens (do(¬skip) causal-omission repair, §3.3.4), spliced
+        back out-of-place so the autograd graph (Stage-C repair-net training) is intact.
+        Returns ``(num_checks, num_repairs)``.
+        """
+        verifier = self.accelerator.lcocf.verifier
+        skipped = {
+            tube.tube_id: actions.get(tube.tube_id, Action.FULL).is_skip
+            for tube in state.tubes
+        }
+        triggered = verifier.triggered_tubes(strength_feats, skipped)
+        if not triggered:
+            return 0, 0
+        tubes_by_id = {t.tube_id: t for t in state.tubes}
+        checks = repairs = 0
+        for tid in triggered:
+            tube = tubes_by_id.get(tid)
+            if tube is None:
+                continue
+            idx = tube.all_token_indices().to(state.z.device)
+            if idx.numel() == 0:
+                continue
+            checks += 1
+            rows: List[Tensor] = []
+            changed = False
+            for b in range(state.z.shape[0]):
+                z_skip = state.z[b].index_select(0, idx)       # [n_tok, d]
+                z_ref = z_full[b].index_select(0, idx)         # [n_tok, d]
+                vr = verifier.verify_and_repair(tube, z_skip, z_ref)
+                if vr.repaired and vr.z_corrected is not None:
+                    rows.append(vr.z_corrected)
+                    changed = True
+                else:
+                    rows.append(z_skip)
+            if changed:
+                corrected = torch.stack(rows, dim=0).to(state.z.dtype)   # [B, n_tok, d]
+                z_new = state.z.clone()
+                z_new[:, idx] = corrected
+                state.z = z_new
+                repairs += 1
+        return checks, repairs

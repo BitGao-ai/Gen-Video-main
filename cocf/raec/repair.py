@@ -52,6 +52,7 @@ class BoundaryRepair:
 
     def rollback(
         self,
+        z_current: Tensor,
         z_full: Tensor,
         tube: SemanticTube,
         grid: TokenGrid,
@@ -59,16 +60,19 @@ class BoundaryRepair:
     ) -> RepairResult:
         """Restore ``tube`` to its safe anchor and fuse the boundary against ``z_full``.
 
-        ``z_full`` is the *advanced* (compute-everywhere) latent for this step,
-        used as the exterior-consistent reference at the tube boundary. If the tube
-        has no anchor yet, returns ``z_full`` unchanged but still flags the tube's
-        tokens as refreshed (the engine will force FULL on it).
+        ``z_current`` is the post-transition latent whose *non-tube* tokens (background
+        and other tubes' executed actions) are preserved — only this tube's tokens are
+        revoked to its safe anchor. ``z_full`` is the step's compute-everywhere latent,
+        used as the exterior-consistent reference so the seam between the rolled-back
+        interior and its surroundings is blended away over ``σ_bnd`` (the boundary
+        operator B(·) of §5.3.2). If the tube has no anchor yet, returns ``z_current``
+        unchanged but still flags its tokens as refreshed (the engine forces FULL on it).
         """
-        idx = tube.all_token_indices().to(z_full.device)
+        idx = tube.all_token_indices().to(z_current.device)
         if not anchor_store.has(tube.tube_id):
-            return RepairResult(z=z_full, refreshed=idx, rolled_back=False)
-        z = anchor_store.rollback(z_full, tube)            # interior = safe anchor
-        z = self._fuse_boundary(z, z_full, tube, grid)     # smooth the seam
+            return RepairResult(z=z_current, refreshed=idx, rolled_back=False)
+        z = anchor_store.rollback(z_current, tube)         # interior = safe anchor
+        z = self._fuse_boundary(z, z_full, tube, grid)     # smooth the seam toward z_full
         return RepairResult(z=z, refreshed=idx, rolled_back=True)
 
     # ------------------------------------------------------------------ #
