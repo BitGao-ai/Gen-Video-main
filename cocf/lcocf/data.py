@@ -24,6 +24,7 @@ This module implements:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -760,8 +761,15 @@ class COCFDataGenerator:
 
     @staticmethod
     def _seeded_noise(like: Tensor, *keys) -> Tensor:
-        """Deterministic Gaussian like ``like`` — reproducible per (clip,step,tube,...)."""
-        seed = abs(hash(keys)) % (2 ** 31)
+        """Deterministic Gaussian like ``like`` — reproducible per (clip,step,tube,...).
+
+        Seeds from a *stable* hash of the keys, not Python's ``hash()`` (which is
+        salted per process via ``PYTHONHASHSEED`` for string keys like ``video_id``),
+        so the multi-seed perturbations — hence the §1.5 uncertainty labels — are
+        byte-identical across runs, processes and shards.
+        """
+        digest = hashlib.sha1("|".join(map(str, keys)).encode("utf-8")).hexdigest()
+        seed = int(digest[:8], 16)
         g = torch.Generator().manual_seed(seed)
         return torch.randn(like.shape, generator=g).to(like.device, like.dtype)
 

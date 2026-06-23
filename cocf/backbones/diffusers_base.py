@@ -186,8 +186,12 @@ class DiffusersVideoBackbone(BackboneAdapter):
         eps = self.to_tokens(eps_grid).to(tokens.dtype)
 
         if active_mask is not None and cache is not None and cache.model_output is not None:
-            active = active_mask.reshape(-1).to(tokens.device)
-            inactive = ~active if active.dim() == 1 else ~active[0]
+            # Decide the [N] mask before flattening so a [B, N] mask keeps its rank
+            # (the per-token splice below indexes axis 1, so ``inactive`` must be [N];
+            # a blind ``reshape(-1)`` on a [B, N] mask yields [B*N] and mis-indexes).
+            am = active_mask.to(tokens.device)
+            active = am.reshape(-1) if am.dim() == 1 else am[0]
+            inactive = ~active
             eps[:, inactive] = cache.model_output[:, inactive]
 
         step = (cache.step + 1) if cache is not None else 0
