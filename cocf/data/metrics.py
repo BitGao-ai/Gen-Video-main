@@ -92,13 +92,20 @@ class MockMetricExtractor(MetricExtractor):
         self._w_clip = torch.randn(feat_dim, d_clip, generator=g) / (feat_dim ** 0.5)
         self._text_basis = torch.randn(d_clip, generator=g)
 
-    def extract(self, video: Tensor, prompt: str) -> VideoFeatures:
-        desc = _pool_frames(video, self.grid)            # [F, feat_dim]
-        dino = desc @ self._w_dino                        # [F, d_dino]
-        clip = desc @ self._w_clip                        # [F, d_clip]
+    def extract(
+        self, video: Tensor, prompt: str, *, differentiable: bool = False
+    ) -> VideoFeatures:
+        # The fixed projection matrices live on CPU; follow the video's device so a
+        # GPU render (Stage C runs the full pipeline on GPU) does not hit a CPU×GPU
+        # matmul. The mock is already grad-transparent, so ``differentiable`` only needs
+        # to govern device here (no ``no_grad`` to lift).
+        device = video.device
+        desc = _pool_frames(video, self.grid)             # [F, feat_dim]
+        dino = desc @ self._w_dino.to(device)             # [F, d_dino]
+        clip = desc @ self._w_clip.to(device)             # [F, d_clip]
 
         # CLIPScore: cosine of the mean appearance to a prompt-conditioned direction.
-        prompt_dir = self._prompt_direction(prompt)       # [d_clip]
+        prompt_dir = self._prompt_direction(prompt).to(device)   # [d_clip]
         clip_mean = F.normalize(clip.mean(0), dim=-1)
         clip_text_score = float((clip_mean @ prompt_dir).clamp(-1, 1) * 0.5 + 0.5)
 
@@ -164,15 +171,27 @@ class ModelMetricExtractor(MetricExtractor):
         self.flow_fn = flow_fn
         self.ocr_fn = ocr_fn
 
-    @torch.no_grad()
-    def extract(self, video: Tensor, prompt: str) -> VideoFeatures:
-        return VideoFeatures(
-            dino_per_frame=self.dino_fn(video).float().cpu(),
-            clip_per_frame=self.clip_fn(video).float().cpu(),
-            clip_text_score=float(self.clip_text_fn(video, prompt)),
-            flow_mag_per_pair=self.flow_fn(video).float().cpu(),
-            ocr_accuracy=float(self.ocr_fn(video, prompt)) if self.ocr_fn else 1.0,
-        )
+    def extract(
+        self, video: Tensor, prompt: str, *, differentiable: bool = False
+    ) -> VideoFeatures:
+        # Label/metric path: no grad + offload to CPU (cheap, features are detached
+        # references). Stage-C accelerated branch (differentiable=True): keep the graph
+        # so the §6.3.2 quality loss reaches the render, and keep the input device so it
+        # composes with the on-device pixel loss without a CPU×GPU mismatch.
+        grad_ctx = torch.enable_grad() if differentiable else torch.no_grad()
+        with grad_ctx:
+            dino = self.dino_fn(video).float()
+            clip = self.clip_fn(video).float()
+            flow = self.flow_fn(video).float()
+            if not differentiable:
+                dino, clip, flow = dino.cpu(), clip.cpu(), flow.cpu()
+            return VideoFeatures(
+                dino_per_frame=dino,
+                clip_per_frame=clip,
+                clip_text_score=float(self.clip_text_fn(video, prompt)),
+                flow_mag_per_pair=flow,
+                ocr_accuracy=float(self.ocr_fn(video, prompt)) if self.ocr_fn else 1.0,
+            )
 
     # ------------------------------------------------------------------ #
     # optional: build the standard stack lazily (requires the deps installed)

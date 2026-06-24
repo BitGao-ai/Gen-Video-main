@@ -311,20 +311,26 @@ class FinettuneStage:
         me = self.accelerator.metric_extractor
         if me is None:
             return y_accel.new_zeros(())
-        fa = me.extract(self._to_fchw(y_accel), prompt)
-        with torch.no_grad():
-            ff = me.extract(self._to_fchw(y_full), prompt)
+        # Accelerated branch keeps the autograd graph + the render's device
+        # (``differentiable=True``); the baseline is a detached, no-grad reference.
+        dev = y_accel.device
+        fa = me.extract(self._to_fchw(y_accel), prompt, differentiable=True)
+        ff = me.extract(self._to_fchw(y_full), prompt)
         c = self.accelerator.config.cmsc
 
         def cos_dev(a: Tensor, b: Tensor) -> Tensor:
+            # ``b`` (baseline) may sit on CPU; align it to the accelerated device so the
+            # term composes with the on-device pixel/schedule losses.
             return (1.0 - F.cosine_similarity(
-                a.float().mean(0), b.float().mean(0), dim=0)).clamp_min(0.0)
+                a.float().mean(0).to(dev),
+                b.float().mean(0).to(dev), dim=0)).clamp_min(0.0)
 
         l_id = cos_dev(fa.dino_per_frame, ff.dino_per_frame)      # identity conservation
         l_app = cos_dev(fa.clip_per_frame, ff.clip_per_frame)     # appearance / text-tube
         n = min(fa.flow_mag_per_pair.numel(), ff.flow_mag_per_pair.numel())
         l_mot = (
-            (fa.flow_mag_per_pair[:n] - ff.flow_mag_per_pair[:n]).abs().mean()
+            (fa.flow_mag_per_pair[:n].to(dev) - ff.flow_mag_per_pair[:n].to(dev))
+            .abs().mean()
             if n else y_accel.new_zeros(())
         )                                                          # motion conservation
         return c.lambda_id * l_id + c.lambda_align * l_app + c.lambda_motion * l_mot
