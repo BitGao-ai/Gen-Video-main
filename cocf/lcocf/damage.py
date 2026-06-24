@@ -86,8 +86,17 @@ class MetricExtractor(abc.ABC):
     """
 
     @abc.abstractmethod
-    def extract(self, video: Tensor, prompt: str) -> VideoFeatures:
-        """``video`` is ``[F, 3, H, W]`` in [0,1]; returns its quality features."""
+    def extract(
+        self, video: Tensor, prompt: str, *, differentiable: bool = False
+    ) -> VideoFeatures:
+        """``video`` is ``[F, 3, H, W]`` in [0,1]; returns its quality features.
+
+        ``differentiable=False`` (default) extracts under ``no_grad`` and may offload
+        the features to CPU — the cheap path for label generation / metric reporting,
+        where the features are detached references. ``differentiable=True`` keeps the
+        autograd graph **and** the input device, so the accelerated branch of the §6.3.2
+        Stage-C semantic loss can back-propagate into the render (repair net / LoRA).
+        """
 
 
 class MultiDimDamageComputer:
