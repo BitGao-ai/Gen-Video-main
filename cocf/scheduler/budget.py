@@ -89,16 +89,23 @@ class BudgetScheduler:
         mean_uncertainty: float = 0.0,
         interaction_density: float = 0.0,
     ) -> float:
-        """Fraction of full compute allowed this step, in ``[b_min, b_max]`` (§7.3)."""
+        """Fraction of full compute allowed this step, in ``[b_min, b_max]`` (§7.3).
+
+        Verbatim §7.3 form: the U-shaped time weight ``q(t)`` is scaled into the
+        ``[b_min, b_max]`` band, and the three demand signals (scene complexity,
+        mean damage uncertainty, tube-interaction density) are added on top in
+        absolute compute-fraction units. The doc formula is unbounded above, so the
+        result is clamped back to ``[b_min, b_max]`` to stay a valid compute fraction.
+        """
         c = self.cfg
-        demand = (
-            self.time_weight(step_frac)
+        b_t = (
+            c.b_min
+            + (c.b_max - c.b_min) * self.time_weight(step_frac)
             + c.eta_scene * complexity
             + c.eta_uncertainty * mean_uncertainty
             + c.eta_interaction * interaction_density
         )
-        demand = min(max(demand, 0.0), 1.0)
-        return c.b_min + (c.b_max - c.b_min) * demand
+        return min(max(b_t, c.b_min), c.b_max)
 
     def score_complexity(self, prompt: str, subgraph: Optional[CausalSubgraph] = None) -> float:
         return self.complexity.score(prompt, subgraph)

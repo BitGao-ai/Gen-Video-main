@@ -5,7 +5,7 @@ z_0, with dynamic per-tube compute allocation using the full COCF-SS-DCA pipelin
 
     Iteration (t=T to t=1):
         1. Build/update semantic tubes G_t (STA)
-        2. Extract 8D tube states s_{k,t} (STA)
+        2. Extract 7-dim tube states s_{k,t} (STA)
         3. Compute causal strengths & damage predictions (L-COCF)
         4. Compute error certificates (RAEC)
         5. Solve action allocation under budget & risk constraints (scheduler)
@@ -343,10 +343,14 @@ class InferenceEngine(nn.Module):
             )
 
         # --- Step 4 (post-transition): error certificates (RAEC), keyed by tube_id
-        # Certify the action that was *actually executed* and feed it the real skip
-        # residual δ_k = ‖z_full − z_action‖ measured by the transition (§5.3.1).
-        # This must run after the transition: a pre-transition guess (prior action,
-        # zero residual) decouples the risk trigger from the error it exists to catch.
+        # Certify the action that was *actually executed* and feed it the §5.3.1 terms
+        # available in the loop: the real skip residual δ_k = ‖z_full − z_action‖
+        # measured by the transition, the tube's boundary uncertainty (from the tube
+        # state) and its anchor age. The local-CMSC term needs a per-tube CLIP visual
+        # embed that is not extracted in the accelerated loop, so it stays 0 here (it is
+        # trained on the Stage-B/CMSC path). This must run after the transition: a
+        # pre-transition guess (prior action, zero residual) decouples the risk trigger
+        # from the error it exists to catch.
         certificates: Dict[int, float] = {}
         for tube in state.tubes:
             tid = tube.tube_id
@@ -356,6 +360,8 @@ class InferenceEngine(nn.Module):
                 optimal_actions.get(tid, Action.FULL),
                 damage_preds[tid],
                 residual=float(result.tube_residual.get(tid, 0.0)),
+                boundary=float(tube_states[tid].boundary_uncertainty)
+                if tid in tube_states else 0.0,
                 anchor_age=float(state.anchor_store.age(tid, step_idx)),
             )
             certificates[tid] = cert.value

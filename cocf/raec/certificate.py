@@ -127,19 +127,21 @@ class ErrorCertificateModule(nn.Module):
     # -- certificate calibration loss (§5.3.1) -------------------------- #
 
     def loss(self, e_cert: Tensor, damage_true: Tensor) -> Tensor:
-        """Calibrate ``E_cert`` against realised damage with an asymmetric safety term.
+        """Certificate calibration loss, exactly as §5.3.1::
 
-        ``L_cert = SmoothL1(E_cert, d_true)``                      (calibration)
-        ``       + α_cert · relu(d_true − τ_safe) · relu(d_true − E_cert)``
-                                                                   (under-certification
-        of a genuinely unsafe skip is penalised hardest — a false "safe" is the
-        costly error, §5.2). Both ``e_cert`` and ``damage_true`` are ``[K]``.
+            L_cert = mean( max(0, y − E_cert)² )                 upper-bound hinge
+                   + α_cert · mean( max(0, E_cert − τ_safe) )    safe-threshold penalty
+
+        The first (squared) term penalises **under-certification** only — a certificate
+        below the realised damage ``y`` is a false "safe", the costly error (§5.2) — so
+        it drives ``E_cert`` to be an *upper bound* on ``y``. The second term keeps a
+        calibrated certificate from growing needlessly far past the safe threshold
+        ``τ_safe`` (so risk stays tight and skips are not over-suppressed). Both
+        ``e_cert`` and ``damage_true`` are ``[K]``.
         """
-        calib = F.smooth_l1_loss(e_cert, damage_true)
-        unsafe = F.relu(damage_true - self.cfg.tau_safe)
-        under = F.relu(damage_true - e_cert)
-        safety = (unsafe * under).mean()
-        return calib + self.cfg.alpha_cert * safety
+        upper = F.relu(damage_true - e_cert).pow(2).mean()       # max(0, y − E_cert)²
+        safe = F.relu(e_cert - self.cfg.tau_safe).mean()         # max(0, E_cert − τ_safe)
+        return upper + self.cfg.alpha_cert * safe
 
 
 def _inv_softplus(y: float) -> Tensor:

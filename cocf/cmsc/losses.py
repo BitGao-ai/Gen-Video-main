@@ -11,7 +11,7 @@ semantic tubes to be **conserved** between the full-compute reference video
 
 Each term is a *deviation* (≥0) of one semantic relation under acceleration:
 
-    L_align    ‖A_align(full) − A_align(accel)‖²    text–tube alignment (§6.3.1)
+    L_align    ‖A_align(full) − A_align(accel)‖₁    text–tube alignment (§6.3.1)
     L_id       mean_k (1 − cos(id_full_k, id_accel_k))   subject identity
     L_motion   ‖m_full − m_accel‖₁ / |m_full|        RAFT motion field
     L_spatial  ‖D_full − D_accel‖_F / K²             pairwise tube-centroid layout
@@ -112,7 +112,7 @@ class CMSCLoss(nn.Module):
         tube_cf: Tensor,                     # [B, d_v] cf-render tube visual embed
         text_mask: Optional[Tensor] = None,  # [B, L] 1=keep
     ) -> Tensor:
-        """Per-sample text-tube alignment conservation ``mean_b (a_full − a_cf)²``.
+        """Per-sample text-tube alignment conservation ``mean_b |a_full − a_cf|``.
 
         The Stage-B counterfactual store holds one tube's visual embed under the full
         and the counterfactual render plus the prompt tokens — not two full
@@ -135,7 +135,7 @@ class CMSCLoss(nn.Module):
             sim_c = sim_c.masked_fill(~keep, fill)
         score_f = sim_f.max(dim=-1).values.clamp(-1, 1) * 0.5 + 0.5  # [B] ∈ [0,1]
         score_c = sim_c.max(dim=-1).values.clamp(-1, 1) * 0.5 + 0.5
-        return (score_f - score_c).pow(2).mean()
+        return (score_f - score_c).abs().mean()
 
     # ------------------------------------------------------------------ #
     # per-tube local term for the RAEC certificate (§5.3.1)
@@ -173,7 +173,7 @@ class CMSCLoss(nn.Module):
         va = TextTubeAlignment.stack_tube_embeds(accel.tube_embeds, ids, dim)
         a_full = self.alignment.matrix(full.text_embeds, vf)   # [L, K] (grad)
         a_accel = self.alignment.matrix(accel.text_embeds, va)  # [L, K] (grad)
-        return (a_full - a_accel).pow(2).mean()
+        return (a_full - a_accel).abs().mean()
 
     @staticmethod
     def _id_term(
