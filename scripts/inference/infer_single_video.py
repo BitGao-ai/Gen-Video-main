@@ -48,6 +48,12 @@ def main():
     if args.steps:
         config.engine.num_inference_steps = args.steps
 
+    # Place the frozen backbone on the run device. `engine.to(device)` below moves the
+    # plugins (a registered submodule) but NOT the backbone (a plain attribute), so
+    # without this a non-default --device leaves the backbone stranded on cuda while
+    # z_init lives on --device.
+    config.backbone.device = args.device
+
     # Build accelerator & engine
     log.info(f"Loading checkpoint from {args.checkpoint}")
     accelerator = Accelerator.from_config(config)

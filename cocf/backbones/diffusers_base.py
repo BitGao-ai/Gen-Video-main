@@ -21,7 +21,9 @@ file (and the unit tests, which use the mock) import with no heavy dependency.
 from __future__ import annotations
 
 import abc
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import contextlib
+import inspect
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,11 +37,21 @@ from cocf.backbones.base import (
 )
 from cocf.common.config import BackboneConfig
 from cocf.common.logging import get_logger
-from cocf.common.memory import resolve_dtype
+from cocf.common.memory import free_memory, resolve_dtype
 from cocf.common.types import TokenGrid
 
 Tensor = torch.Tensor
 _log = get_logger(__name__)
+
+
+def _diffusers_version() -> str:
+    """Installed diffusers version, for the tiling-unavailable error message."""
+    try:
+        import diffusers  # type: ignore
+
+        return str(getattr(diffusers, "__version__", "unknown"))
+    except ImportError:
+        return "not installed"
 
 
 class DiffusersVideoBackbone(BackboneAdapter):
@@ -81,10 +93,163 @@ class DiffusersVideoBackbone(BackboneAdapter):
             self._load()
             for m in (self.vae, self.text_encoder, self.transformer):
                 if m is not None:
-                    m.to(self.device, self.dtype).eval()
+                    m.to(self._home_device(m), self.dtype).eval()
                     for p in m.parameters():
                         p.requires_grad_(False)
+            self._place_auxiliary_modules()
+            self._configure_vae_memory()
             self._loaded = True
+            # After *every* component is placed, so the report reflects the real
+            # resident footprint (a subclass's extra experts included).
+            self._log_vram_report()
+
+    def _place_auxiliary_modules(self) -> None:
+        """Freeze/device-place components beyond vae/text_encoder/transformer.
+
+        Hook for subclasses that hold extra weights the base loop does not know
+        about — see :meth:`cocf.backbones.wan22.Wan22Backbone` and its MoE low-noise
+        expert. Called inside :meth:`_ensure_loaded` *before* the VRAM report, so
+        that report accounts for them. No-op by default.
+        """
+
+    # -- VRAM residency policy (BackboneConfig.offload_* / vae_tiling) --- #
+
+    #: Where an offloaded component parks while it is idle.
+    offload_device: str = "cpu"
+
+    def _home_device(self, module: Optional[nn.Module]) -> str:
+        """Resident device for ``module`` under the config's offload policy.
+
+        Only the text encoder is parked here: it runs once per prompt and is dead
+        weight for the whole denoise + counterfactual rollout that follows (on
+        Wan2.2 that is ~11 GB of umT5 idling through every rollout). Subclasses
+        extend this for components they know are intermittently used (see
+        :meth:`Wan22Backbone._home_device` for the idle MoE expert).
+        """
+        if module is None:
+            return self.device
+        if module is self.text_encoder and self.config.offload_text_encoder:
+            return self.offload_device
+        return self.device
+
+    @contextlib.contextmanager
+    def _module_active(self, module: Optional[nn.Module]) -> Iterator[None]:
+        """Bring an offloaded ``module`` onto the compute device for one call.
+
+        A no-op (and free) when the module already lives on the compute device, so
+        call sites stay policy-agnostic — they simply declare "I need this now" and
+        the configured policy decides whether a transfer actually happens.
+        """
+        if module is None or self._home_device(module) == self.device:
+            yield
+            return
+        module.to(self.device)
+        try:
+            yield
+        finally:
+            module.to(self.offload_device)
+            free_memory()
+
+    def _configure_vae_memory(self) -> None:
+        """Enable tiled/sliced VAE encode+decode when ``config.vae_tiling`` is set.
+
+        An un-tiled decode of a 49×480×832 clip materialises full-resolution
+        decoder feature maps in one allocation — on ``AutoencoderKLWan`` that is a
+        single ``192 × 54 × 480 × 832`` bf16 block (**7.71 GiB**), the largest
+        transient in Stage A by an order of magnitude. Tiling caps it at one tile's
+        worth (~1.4 GB at the default 256 px edge) regardless of resolution. Both
+        videos of a counterfactual pair go through the *same* decode path, so the
+        damage comparison stays apples-to-apples.
+
+        This is a hard requirement, not a nicety: Stage A calls ``decode_latent``
+        once per rollout seed — up to ~90 times per clip
+        (:meth:`cocf.lcocf.data.COCFDataGenerator._rollout`) — so an unbounded decode
+        does not merely risk OOM, it guarantees one on any card whose free VRAM after
+        the frozen weights is under ~8 GB. Hence we **raise** rather than warn when
+        the installed ``diffusers`` cannot bound it: failing at load with an
+        actionable message beats OOMing hours into a days-long run.
+        """
+        if not self.config.vae_tiling or self.vae is None:
+            return
+
+        enable_tiling = getattr(self.vae, "enable_tiling", None)
+        if not callable(enable_tiling):
+            raise RuntimeError(
+                f"{type(self).__name__}: VAE {type(self.vae).__name__} has no "
+                f"enable_tiling(), so decode memory cannot be bounded (diffusers "
+                f"{_diffusers_version()}). An untiled decode needs a single multi-GiB "
+                f"block and Stage A runs ~90 decodes per clip.\n"
+                f"  Fix:  pip install -U 'diffusers>=0.34'\n"
+                f"  Or:   re-run without VAE tiling (--no-vae-tiling) only if the card "
+                f"has >10 GB free after the frozen weights load."
+            )
+
+        # The tiling API is not uniform across the VAEs this base serves:
+        # AutoencoderKLWan takes tile_sample_min_/tile_sample_stride_{height,width};
+        # AutoencoderKLHunyuanVideo adds the *_num_frames pair; plain AutoencoderKL
+        # takes a single ``use_tiling`` bool. Pass only what this one accepts.
+        edge = max(64, int(self.config.vae_tile_size))
+        stride = max(32, (edge * 3) // 4)
+        wanted = {
+            "tile_sample_min_height": edge,
+            "tile_sample_min_width": edge,
+            "tile_sample_min_num_frames": 16,
+            "tile_sample_stride_height": stride,
+            "tile_sample_stride_width": stride,
+            "tile_sample_stride_num_frames": 12,
+        }
+        try:
+            accepted = set(inspect.signature(enable_tiling).parameters)
+        except (TypeError, ValueError):  # C-implemented / unintrospectable
+            accepted = set()
+        kwargs = {k: v for k, v in wanted.items() if k in accepted}
+        enable_tiling(**kwargs)
+
+        # ``enable_tiling`` is a plain setter on every diffusers VAE, so a silent
+        # no-op here means the class shape changed under us — surface it now rather
+        # than at the first decode.
+        if not getattr(self.vae, "use_tiling", True):
+            raise RuntimeError(
+                f"{type(self).__name__}: {type(self.vae).__name__}.enable_tiling() "
+                f"left use_tiling False — decode memory is still unbounded."
+            )
+        _log.info(
+            "%s: VAE tiling enabled on %s (%s)", type(self).__name__,
+            type(self.vae).__name__,
+            ", ".join(f"{k}={v}" for k, v in kwargs.items()) or "no tile kwargs accepted",
+        )
+
+        # Batch slicing is orthogonal and harmless — Stage A runs batch 1, so it is
+        # a no-op there, but it bounds any batched Stage-C encode. Best-effort.
+        enable_slicing = getattr(self.vae, "enable_slicing", None)
+        if callable(enable_slicing):
+            enable_slicing()
+            _log.info("%s: VAE slicing enabled", type(self).__name__)
+
+    def _log_vram_report(self) -> None:
+        """One-shot report of what the frozen stack actually costs on the device.
+
+        The residency switches are easy to *think* are on while a flag path leaves
+        them off — and the symptom (an OOM tens of minutes into the run) says nothing
+        about which. Logging resident bytes against device capacity right after
+        placement makes the policy verifiable from the first lines of the log: on
+        Wan2.2-A14B, ~56 GB means the text encoder is parked, ~67 GB means it is not.
+        """
+        if not str(self.device).startswith("cuda") or not torch.cuda.is_available():
+            return
+        idx = torch.device(self.device).index or 0
+        total = torch.cuda.get_device_properties(idx).total_memory / 1024 ** 3
+        resident = torch.cuda.memory_allocated(idx) / 1024 ** 3
+        policy = [
+            f"text_encoder={'cpu' if self.config.offload_text_encoder else 'resident'}",
+            f"idle_expert={'cpu' if self.config.offload_idle_expert else 'resident'}",
+            f"vae_tiling={'on' if self.config.vae_tiling else 'OFF'}",
+        ]
+        _log.info(
+            "%s: frozen stack resident %.1f GiB / %.1f GiB (%.1f GiB free for "
+            "activations); policy: %s",
+            type(self).__name__, resident, total, total - resident, ", ".join(policy),
+        )
 
     # -- static description --------------------------------------------- #
 
@@ -132,6 +297,7 @@ class DiffusersVideoBackbone(BackboneAdapter):
 
     def encode_video(self, video: Tensor) -> Tensor:
         self._ensure_loaded()
+        self._reclaim_before_vae()
         with torch.inference_mode():
             x = video.to(self.device, self.dtype)
             lat = self.vae.encode(x).latent_dist.sample()  # type: ignore[union-attr]
@@ -140,10 +306,24 @@ class DiffusersVideoBackbone(BackboneAdapter):
 
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
         self._ensure_loaded()
+        self._reclaim_before_vae()
         with torch.inference_mode():
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             x = latent_grid.to(self.device, self.dtype) / scale
             return self.vae.decode(x).sample  # type: ignore[union-attr]
+
+    def _reclaim_before_vae(self) -> None:
+        """Return cached-but-free allocator blocks to the driver before a VAE call.
+
+        Even tiled, the VAE's tile buffers are the largest *contiguous* requests in
+        the pass, and they land on a heap the DiT rollout just churned through — the
+        OOM that motivated this had 8.10 GiB sitting in reserved-but-unallocated
+        blocks against 3.33 GiB actually free. ``empty_cache`` synchronises, so this
+        is gated on ``vae_tiling``: it costs nothing on the mock/CPU paths and is
+        amortised on the real path, where a single decode dwarfs it.
+        """
+        if self.config.vae_tiling and torch.cuda.is_available():
+            free_memory()
 
     # -- the denoiser ε_θ ------------------------------------------------ #
 
@@ -221,10 +401,19 @@ class DiffusersVideoBackbone(BackboneAdapter):
 
     def dit_blocks(self) -> List[nn.Module]:
         """Transformer blocks for Stage-C LoRA (§7.1.3)."""
-        if self.transformer is None:
+        return self._blocks_of(self.transformer)
+
+    @staticmethod
+    def _blocks_of(module: Optional[nn.Module]) -> List[nn.Module]:
+        """The transformer-block stack of a diffusers ``*Transformer3DModel``.
+
+        Shared by :meth:`dit_blocks` and MoE subclasses that expose more than one
+        denoiser; returns ``[]`` for a ``None`` module (weights not loaded yet).
+        """
+        if module is None:
             return []
         for attr in ("transformer_blocks", "blocks", "single_transformer_blocks"):
-            blocks = getattr(self.transformer, attr, None)
+            blocks = getattr(module, attr, None)
             if blocks is not None:
                 return list(blocks)
         return []

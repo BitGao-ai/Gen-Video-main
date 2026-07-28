@@ -215,10 +215,25 @@ class EngineConfig:
 class BackboneConfig:
     """Which backbone to wrap and where its weights live (§9.1)."""
 
-    name: str = "mock"  # registry key: "hunyuanvideo" | "wan21" | "mock"
+    name: str = "mock"  # registry key: "wan22" (primary) | "wan21" | "hunyuanvideo" | "mock"
     model_path: Optional[str] = None
     dtype: str = "bfloat16"  # compute dtype for the frozen backbone
     device: str = "cuda"
+    # -- VRAM residency policy for the frozen stack (user requirement #1) ----- #
+    # A real backbone keeps every component resident for the whole run, which on
+    # Wan2.2-A14B is ~67 GB (2×14B experts + a 5.5B umT5) — the entire budget of an
+    # 80 GB card, leaving nothing for the VAE decode / metric activations Stage A
+    # needs. These switches park the components that are idle most of the time.
+    # All default to False so Stages B/C keep their historical placement; Stage A
+    # (the only pass that holds the whole stack resident *and* decodes video) turns
+    # them on from the CLI.
+    offload_text_encoder: bool = False  # park the text encoder on CPU between prompts
+    offload_idle_expert: bool = False   # keep only the active MoE expert resident
+    vae_tiling: bool = False            # tiled/sliced VAE encode+decode (bounded peak)
+    # Tile edge (output pixels) when vae_tiling is on. The decoder's peak transient
+    # scales with tile_size², so 256 bounds a 480×832 decode at ~1.4 GB where the
+    # untiled call needs a single ~7.7 GiB block. Lower it if the decode still OOMs.
+    vae_tile_size: int = 256
     # backbone-specific knobs passed straight through to the adapter
     extra: Dict[str, Any] = field(default_factory=dict)
 

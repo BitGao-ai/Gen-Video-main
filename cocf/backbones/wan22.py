@@ -1,0 +1,270 @@
+"""Wan2.2 backbone adapter (§9.1 — primary backbone; MoE dual-expert DiT).
+
+Wraps Alibaba's Wan2.2 text-to-video family (T2V-A14B, I2V-A14B, TI2V-5B). Wan2.2
+keeps Wan2.1's cross-attention-to-umT5 topology, so this adapter reuses the whole
+:class:`~cocf.backbones.wan21.Wan21Backbone` code path (text encode, VAE wrap,
+layout maths, flow-matching step) and changes only the *two* things Wan2.2 actually
+introduces — both hidden behind the same :class:`DiffusersVideoBackbone` contract so
+L-COCF / STA / RAEC / CMSC stay backbone-agnostic:
+
+1.  **MoE dual-expert denoiser.** The A14B models ship *two*
+    ``WanTransformer3DModel`` experts — a high-noise expert (``transformer``) and a
+    low-noise expert (``transformer_2``) — switched at a noise boundary
+    ``boundary_timestep = boundary_ratio · num_train_timesteps``: the high-noise
+    expert runs while ``timestep ≥ boundary``, the low-noise expert below it (exactly
+    🤗 ``WanPipeline`` semantics). A single-expert checkpoint (e.g. TI2V-5B) has no
+    ``transformer_2`` / ``boundary_ratio``, and the adapter degrades to the Wan2.1
+    single-denoiser path with zero special-casing at the call sites.
+
+2.  **High-compression VAE (TI2V-5B).** The 5B variant uses the new Wan2.2 VAE
+    (4×16×16 compression, 48 latent channels) in place of the A14B/2.1 VAE
+    (4×8×8, 16 channels). Both are ``AutoencoderKLWan``; the geometry is read from
+    ``config.extra`` so one adapter serves every Wan2.2 checkpoint.
+
+Configuring a variant (all via ``BackboneConfig.extra``)::
+
+    # Wan2.2-T2V-A14B (default): MoE, Wan2.1 VAE — nothing to set
+    extra = {}
+    # Wan2.2-I2V-A14B: MoE with the I2V boundary
+    extra = {"boundary_ratio": 0.900}
+    # Wan2.2-TI2V-5B: single expert + high-compression VAE
+    extra = {"boundary_ratio": None, "vae_compress": [4, 16, 16], "latent_channels": 48}
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+
+from cocf.backbones.base import TextConditioning
+from cocf.backbones.wan21 import Wan21Backbone
+from cocf.common.config import BackboneConfig
+from cocf.common.logging import get_logger
+from cocf.common.memory import free_memory
+from cocf.common.registry import register_backbone
+
+Tensor = torch.Tensor
+_log = get_logger(__name__)
+
+# Emit the offload-thrash warning once, after this many expert swaps. Chosen so a
+# well-behaved run (one crossing per trajectory) never trips it, while Stage A's
+# per-rollout re-entry above the boundary does so within the first clip.
+_SWAP_WARN_AFTER = 32
+
+
+@register_backbone("wan22")
+@register_backbone("wan2.2")
+class Wan22Backbone(Wan21Backbone):
+    """Alibaba Wan2.2 adapter — cross-attention DiT with a Mixture-of-Experts denoiser."""
+
+    # A14B defaults (reuse the Wan2.1 VAE geometry). TI2V-5B overrides via extra.
+    patch = (1, 2, 2)
+    vae_compress = (4, 8, 8)
+    _latent_channels = 16
+    # A14B T2V ships boundary_ratio 0.875 (I2V 0.900). Set extra["boundary_ratio"]
+    # to ``None`` for a single-expert checkpoint (TI2V-5B).
+    _default_boundary_ratio = 0.875
+
+    def __init__(self, config: BackboneConfig) -> None:
+        extra = config.extra or {}
+        # Variant geometry (TI2V-5B): let extra override the class defaults *before*
+        # the base ctor derives the patch-token width from ``_latent_channels``/``patch``.
+        if "patch" in extra:
+            self.patch = tuple(extra["patch"])                     # e.g. (1, 2, 2)
+        if "vae_compress" in extra:
+            self.vae_compress = tuple(extra["vae_compress"])       # e.g. (4, 16, 16)
+        if "latent_channels" in extra:
+            self._latent_channels = int(extra["latent_channels"])  # e.g. 48
+        super().__init__(config)
+        self.transformer_2: Optional[nn.Module] = None
+        # Under ``offload_idle_expert`` exactly one expert is resident at a time;
+        # this tracks which, so :meth:`_expert_for` only pays a transfer on a real
+        # switch. ``None`` until the first routed call.
+        self._resident_expert: Optional[nn.Module] = None
+        self._expert_swaps = 0
+        self._swap_warned = False
+        # ``None`` ⇒ single-expert (no switching). ``extra["boundary_ratio"]`` may be
+        # explicitly ``None`` to force the TI2V-5B single-denoiser path; any other value
+        # is coerced to ``float`` so a stray string fails here, not deep in ``_expert_for``.
+        br = extra.get("boundary_ratio", self._default_boundary_ratio)
+        self.boundary_ratio: Optional[float] = None if br is None else float(br)
+        self.num_train_timesteps = int(extra.get("num_train_timesteps", 1000))
+
+    # -- component construction (adds the low-noise expert) ------------- #
+
+    def _load(self) -> None:
+        from diffusers import AutoencoderKLWan, WanTransformer3DModel
+        from transformers import AutoTokenizer, UMT5EncoderModel
+
+        path = self.config.model_path
+        extra = self.config.extra or {}
+        self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae")
+        # High-noise expert (always present).
+        self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer")
+        # Low-noise expert (A14B MoE). Absent on single-expert checkpoints ⇒ fall back
+        # to single-denoiser denoising rather than failing the load.
+        if self.boundary_ratio is not None:
+            sub = extra.get("transformer_2_subfolder", "transformer_2")
+            try:
+                self.transformer_2 = WanTransformer3DModel.from_pretrained(path, subfolder=sub)
+            except (OSError, ValueError) as e:  # subfolder absent ⇒ single-expert ckpt
+                # Only a genuine "not found" (HF raises OSError / a ValueError subclass)
+                # degrades to single-expert; OOM / CUDA / other RuntimeErrors propagate
+                # rather than being silently misread as "no second expert".
+                _log.warning(
+                    "Wan2.2: could not load '%s' expert (%s: %s); falling back to "
+                    "single-expert denoising. Pass extra['boundary_ratio']=None to "
+                    "silence this on a known single-expert checkpoint.",
+                    sub, type(e).__name__, e,
+                )
+                self.transformer_2 = None
+                self.boundary_ratio = None
+        self.text_encoder = UMT5EncoderModel.from_pretrained(path, subfolder="text_encoder")
+        self.tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
+        self._max_len = int(extra.get("max_text_len", 512))
+
+    def _place_auxiliary_modules(self) -> None:
+        """Freeze/device-place the *second* expert (:class:`DiffusersVideoBackbone` hook).
+
+        The base placement loop only knows about ``vae``/``text_encoder``/
+        ``transformer``; the MoE low-noise expert is frozen and device-placed here so
+        it never leaks trainable params into the optimiser. Running as a hook (rather
+        than by overriding ``_ensure_loaded``) keeps it *inside* the base's load
+        sequence, so the VRAM report that follows counts this expert's ~28 GB.
+        """
+        if self.transformer_2 is None:
+            return
+        self.transformer_2.to(self._home_device(self.transformer_2), self.dtype).eval()
+        for p in self.transformer_2.parameters():
+            p.requires_grad_(False)
+        if self.config.offload_idle_expert:
+            # The high-noise expert is the one resident at load; the schedule
+            # starts at the noisiest step, so this is the cheaper initial guess.
+            self._resident_expert = self.transformer
+
+    # -- VRAM residency: keep at most one expert on the compute device --- #
+
+    def _home_device(self, module: Optional[nn.Module]) -> str:
+        """Park the *idle* expert on CPU when ``offload_idle_expert`` is set.
+
+        Each A14B expert is ~28 GB in bf16, so holding both resident costs 56 GB
+        before a single activation is allocated. Only one ever runs at a given
+        noise level, so the idle one is pure ballast — but see the thrash warning
+        in :meth:`_expert_for`: this pays off only when the workload does not
+        alternate across the boundary.
+        """
+        if module is not None and self.config.offload_idle_expert:
+            for expert in (self.transformer, self.transformer_2):
+                if module is expert:
+                    # ``_resident_expert`` is still None during the initial load
+                    # (``_load`` only just populated the attributes), so fall back
+                    # to the primary transformer — the expert the noisiest first
+                    # step routes to, and the one
+                    # :meth:`_place_auxiliary_modules` records afterwards.
+                    resident = self._resident_expert or self.transformer
+                    return self.device if module is resident else self.offload_device
+        return super()._home_device(module)
+
+    def _make_resident(self, want: nn.Module) -> None:
+        """Swap ``want`` onto the compute device, evicting the other expert.
+
+        Transfers ~28 GB each way, so it is only worth doing when switches are
+        rare. They are rare along a *single* trajectory (σ decreases monotonically,
+        so the boundary is crossed at most once) but Stage A restarts a trajectory
+        per counterfactual rollout, and a representative step just above the
+        boundary makes every rollout cross it. The warning below surfaces that
+        rather than letting the run silently become transfer-bound.
+        """
+        other = self.transformer_2 if want is self.transformer else self.transformer
+        if isinstance(other, nn.Module):
+            other.to(self.offload_device)
+        want.to(self.device)
+        self._resident_expert = want
+        self._expert_swaps += 1
+        free_memory()
+        if self._expert_swaps == _SWAP_WARN_AFTER and not self._swap_warned:
+            self._swap_warned = True
+            _log.warning(
+                "Wan2.2: %d MoE expert swaps so far — the workload keeps crossing the "
+                "noise boundary (%.3f), so each rollout pays two ~28 GB transfers. "
+                "offload_idle_expert is saving VRAM at a large throughput cost; "
+                "prefer offload_text_encoder + a single-expert variant (ti2v-5b) if "
+                "this run is time-bound.",
+                _SWAP_WARN_AFTER, self.boundary_ratio or 0.0,
+            )
+
+    # -- MoE expert selection ------------------------------------------- #
+
+    def _expert_for(self, timestep: Tensor) -> nn.Module:
+        """Pick the denoiser for this step's noise level (🤗 ``WanPipeline`` rule).
+
+        ``timestep`` is the model-space timestep (``t·1000``). The high-noise expert
+        (``transformer``) runs while ``timestep ≥ boundary_timestep``, the low-noise
+        expert (``transformer_2``) below it. Single-expert models always use the
+        primary ``transformer``. The engine broadcasts one scalar ``t`` across the
+        batch, so the mean gives a single unambiguous choice per step.
+
+        Under ``offload_idle_expert`` the chosen expert is also *made resident*
+        here, which is why routing owns the placement: it is the only point that
+        knows which expert the next forward will touch.
+        """
+        if self.transformer_2 is None or self.boundary_ratio is None:
+            return self.transformer  # type: ignore[return-value]
+        boundary = self.boundary_ratio * self.num_train_timesteps
+        high = float(timestep.float().mean()) >= boundary
+        want = self.transformer if high else self.transformer_2
+        if (
+            self.config.offload_idle_expert
+            and want is not self._resident_expert
+            and isinstance(want, nn.Module)
+        ):
+            self._make_resident(want)
+        return want  # type: ignore[return-value]
+
+    # -- the cross-attention DiT call (expert-routed) ------------------- #
+
+    def _run_transformer(
+        self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        timestep = (t.to(self.device) * 1000.0).flatten()
+        expert = self._expert_for(timestep)
+        out = expert(  # type: ignore[misc]
+            hidden_states=latent_grid,
+            timestep=timestep,
+            encoder_hidden_states=cond.embeds.to(self.device, self.dtype),
+            return_dict=True,
+        )
+        eps = out.sample if hasattr(out, "sample") else out[0]
+        return eps, {}
+
+    # -- Stage-C LoRA: expose *both* experts' blocks -------------------- #
+
+    def dit_blocks(self) -> List[nn.Module]:
+        """Transformer blocks for Stage-C LoRA (§7.1.3) — from *both* experts.
+
+        By default diffusers loads Wan2.2 LoRAs only into the first denoiser; the
+        design's Stage-C fine-tune targets "the last few DiT blocks", so we expose
+        the low-noise expert's blocks too. Consumers that want the *last-n* tail must
+        go through :meth:`lora_target_blocks` — a blind ``dit_blocks()[-n:]`` here
+        would land entirely on the second expert (see that method).
+        """
+        blocks = list(self._blocks_of(self.transformer))
+        blocks.extend(self._blocks_of(self.transformer_2))
+        return blocks
+
+    def lora_target_blocks(self, last_n: int) -> List[nn.Module]:
+        """Last ``last_n`` blocks of *each* expert (§7.1.3).
+
+        A flat ``dit_blocks()[-last_n:]`` would wrap only the low-noise expert (its
+        blocks are appended last), starving the high-noise expert — the very one that
+        runs at the noisiest, most structure-defining steps. Stage-C must fine-tune
+        the tail of *both* denoisers, so we take each expert's own tail.
+        """
+        high = self._blocks_of(self.transformer)
+        targets: List[nn.Module] = list(high[-last_n:] if last_n > 0 else high)
+        if self.transformer_2 is not None:
+            low = self._blocks_of(self.transformer_2)
+            targets.extend(low[-last_n:] if last_n > 0 else low)
+        return targets

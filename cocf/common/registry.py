@@ -60,3 +60,13 @@ BACKBONES: "Registry" = Registry("backbone")
 
 def register_backbone(key: str):
     return BACKBONES.register(key)
+
+
+def get_backbone(key: str):
+    """Look up a registered backbone adapter class by name (case-insensitive)."""
+    return BACKBONES.get(key)
+
+
+def list_backbones() -> list:
+    """Return the sorted list of registered backbone names."""
+    return sorted(BACKBONES.keys())

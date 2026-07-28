@@ -33,8 +33,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from cocf.backbones.base import BackboneAdapter, TextConditioning
+from cocf.backbones.base import BackboneAdapter, TextConditioning, sigma_from_step
 from cocf.backbones.transition import TransitionExecutor
+from cocf.common.memory import free_memory
 from cocf.common.types import (
     Action,
     AllocationDecision,
@@ -221,12 +222,25 @@ class CounterfactualDamageComputer:
         self.damage_computer = MultiDimDamageComputer(eps=axis_eps)
         self.damage_weights = damage_weights or DEFAULT_DAMAGE_WEIGHTS
 
+    def reference_features(self, video_full: Tensor, prompt: str) -> VideoFeatures:
+        """Extract the reference-side features once, for reuse across rollouts.
+
+        ``video_full`` is fixed for a whole :class:`TeacherTrajectory` while dozens
+        of counterfactual rollouts are scored against it, so re-extracting it per
+        sample burns a full DINOv2+CLIP+RAFT pass (and its peak VRAM) every time
+        for a bit-identical result. Callers hoist this out of their loop and hand
+        it to :meth:`compute_damage`.
+        """
+        return self.metric_extractor.extract(video_full, prompt)
+
     def compute_damage(
         self,
         video_full: Tensor,  # [F, 3, H, W] in [0,1]
         video_cf: Tensor,  # [F, 3, H, W] counterfactual video
         prompt: str,
         tube_mask: Optional[Tensor] = None,  # [F, H, W] binary: 1 inside tube
+        *,
+        feats_full: Optional[VideoFeatures] = None,
     ) -> Tuple[Tensor, Dict[str, float]]:
         """Compute multi-dim damage vector for a counterfactual pair.
 
@@ -235,13 +249,16 @@ class CounterfactualDamageComputer:
             video_cf: Counterfactual video (with action applied).
             prompt: Text prompt (for CLIP scoring).
             tube_mask: Optional per-frame mask for localized damage.
+            feats_full: Pre-extracted reference features from
+                :meth:`reference_features`. Extracted on demand when omitted.
 
         Returns:
             damage_vector: [NUM_DAMAGE_DIMS] ∈ [0,1]
             per_axis_dict: {axis_name: scalar_value} for diagnostics
         """
         # Extract features from both videos (once each)
-        feats_full = self.metric_extractor.extract(video_full, prompt)
+        if feats_full is None:
+            feats_full = self.metric_extractor.extract(video_full, prompt)
         feats_cf = self.metric_extractor.extract(video_cf, prompt)
 
         # Compute multi-dimensional damage. ``compute`` returns the per-axis dict
@@ -522,6 +539,7 @@ class COCFDataGenerator:
         action_cost: Tuple[float, ...] = ACTION_COST,
         seeds_per_prompt: int = 1,
         perturb_std: float = 0.02,
+        free_memory_every: int = 8,
     ):
         self.metric_extractor = metric_extractor
         self.strength_builder = strength_feature_builder
@@ -533,6 +551,11 @@ class COCFDataGenerator:
         self.action_cost = tuple(action_cost)
         self.seeds_per_prompt = max(1, int(seeds_per_prompt))
         self.perturb_std = float(perturb_std)
+        # Return freed allocator blocks to the driver (0 disables entirely). Acts at
+        # two granularities: after every non-zeroth rollout seed in
+        # :meth:`_counterfactual_labels` — the unit that ends in a full VAE decode —
+        # and every N completed samples in :meth:`generate`.
+        self.free_memory_every = max(0, int(free_memory_every))
 
         self.sampler = StratifiedSampler(self.sampling_config, device)
         self.interpolator = DamageLabelInterpolator(self.sampling_config.interpolation_interval)
@@ -557,6 +580,10 @@ class COCFDataGenerator:
         tube_idx_sel = self._select_tubes(traj, max_tubes)
         actions = self.sampler.sample_actions()
         samples: List[COCFTrainingSample] = []
+        # The reference side of every damage comparison below is the same
+        # ``traj.video_full``; extract its features once instead of once per
+        # (tube, step, action, seed).
+        feats_full = self.damage_computer.reference_features(traj.video_full, traj.prompt)
 
         for step_idx in steps:
             t = traj.num_total_steps - step_idx          # countdown timestep
@@ -573,7 +600,8 @@ class COCFDataGenerator:
                         break
                     action = Action(a)
                     damage, unc, cost, y_cf, per_axis = self._counterfactual_labels(
-                        traj, step_idx, tube, action, backbone, transition
+                        traj, step_idx, tube, action, backbone, transition,
+                        feats_full=feats_full,
                     )
                     samples.append(
                         COCFTrainingSample(
@@ -600,6 +628,13 @@ class COCFDataGenerator:
                             tube_stability=float(state.identity_confidence),
                         )
                     )
+                    # Coarse backstop to the per-rollout reclaim in
+                    # :meth:`_counterfactual_labels`: catches the zeroth seed's clip
+                    # (held until the sample is built) and the metric backbones'
+                    # residue. ``empty_cache`` is a synchronising call, hence the
+                    # cadence rather than per-sample.
+                    if self.free_memory_every and len(samples) % self.free_memory_every == 0:
+                        free_memory()
         _log.debug("Generated %d counterfactual samples for %s", len(samples), traj.video_id)
         return samples
 
@@ -615,6 +650,8 @@ class COCFDataGenerator:
         action: Action,
         backbone: BackboneAdapter,
         transition: TransitionExecutor,
+        *,
+        feats_full: Optional[VideoFeatures] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float]]:
         """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis)``.
 
@@ -622,6 +659,9 @@ class COCFDataGenerator:
         so its label is exact and needs no rollout. Skip actions roll out
         ``seeds_per_prompt`` times (small seeded perturbations of ``z_t``) so the
         per-axis variance is the §1.5 multi-seed uncertainty label.
+
+        ``feats_full`` is the caller's hoisted reference-feature extraction (all
+        rollouts of a trajectory compare against the same ``traj.video_full``).
         """
         cost = self._cost_label(action, transition)
         if action == Action.FULL:
@@ -637,10 +677,23 @@ class COCFDataGenerator:
                 z_t, traj.video_id, step_idx, tube.tube_id, int(action), k
             )
             y_cf = self._rollout(z0, step_idx, tube, action, traj, backbone, transition)
-            dmg, per_axis = self.damage_computer.compute_damage(traj.video_full, y_cf, traj.prompt)
+            dmg, per_axis = self.damage_computer.compute_damage(
+                traj.video_full, y_cf, traj.prompt, feats_full=feats_full
+            )
             dmgs.append(dmg)
             if k == 0:
                 y_cf0, per_axis0 = y_cf, per_axis
+            else:
+                # Every seed but the zeroth produces a decoded clip that dies here,
+                # alongside the VAE tile buffers and metric-backbone activations the
+                # rollout just churned through. Reclaiming per *rollout* rather than
+                # per sample matters because the rollout — not the sample — is the
+                # unit that ends in a full VAE decode: at seeds_per_prompt=3 the
+                # sample-level cadence below would let three decodes' worth of freed
+                # blocks fragment before any of them is returned to the driver.
+                del y_cf
+                if self.free_memory_every:
+                    free_memory()
         D = torch.stack(dmgs)                                  # [seeds, 8]
         damage = D.mean(0).clamp(0, 1)
         uncertainty = D.var(0, unbiased=False) if self.seeds_per_prompt > 1 else torch.zeros_like(damage)
@@ -660,8 +713,8 @@ class COCFDataGenerator:
         grid, cond, T = traj.grid, traj.cond, traj.num_total_steps
         device = z_t.device
         t = T - step_idx
-        t_now = torch.full((z_t.shape[0],), float(t), device=device)
-        t_next = torch.full((z_t.shape[0],), float(t - 1), device=device)
+        t_now = torch.full((z_t.shape[0],), sigma_from_step(t, T), device=device)
+        t_next = torch.full((z_t.shape[0],), sigma_from_step(t - 1, T), device=device)
         # dense full-compute step at the intervention timestep (the FULL reference advance)
         out = backbone.denoise(z_t, t_now, cond, grid=grid, active_mask=None, cache=None)
         z_full = backbone.scheduler_step(out.cache.model_output, t_now, t_next, z_t)
@@ -669,8 +722,8 @@ class COCFDataGenerator:
         # continue all-FULL (dense) to z_0 — single-hop: only step t was intervened
         for s in range(step_idx + 1, T):
             ts = T - s
-            tn = torch.full((z.shape[0],), float(ts), device=device)
-            tnn = torch.full((z.shape[0],), float(ts - 1), device=device)
+            tn = torch.full((z.shape[0],), sigma_from_step(ts, T), device=device)
+            tnn = torch.full((z.shape[0],), sigma_from_step(ts - 1, T), device=device)
             z = backbone.full_transition(z, tn, tnn, cond, grid=grid).model_output
         return _frames_fchw(backbone.decode_latent(backbone.to_grid(z, grid)))
 

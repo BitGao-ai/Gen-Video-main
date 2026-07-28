@@ -11,18 +11,20 @@ operations the accelerator needs and nothing else:
     * the **scheduler step**        (cheap latent update)
     * a composed full transition Φ_t and a *partial* transition Φ̃_t
 
-Concrete adapters (``hunyuan.py``, ``wan21.py``) implement these by delegating to
-the upstream model code; a :class:`cocf.backbones.mock.MockBackbone` implements
-them with a tiny network and *real* token gather/scatter so the whole pipeline is
-testable without multi-billion-parameter weights.
+Concrete adapters (``wan22.py``, ``wan21.py``, ``hunyuan.py``) implement these by
+delegating to the upstream model code; a :class:`cocf.backbones.mock.MockBackbone`
+implements them with a tiny network and *real* token gather/scatter so the whole
+pipeline is testable without multi-billion-parameter weights.
 
 Why this is the compatibility seam
 -----------------------------------
 HunyuanVideo uses MMDiT joint text+image attention; Wan2.1 uses cross-attention to
-a (um)T5 text encoder. Both, however, reduce to "predict ε_θ(z_t, t, c) over a
-grid of latent tokens, then take a scheduler step". By contracting on *that*, every
-upstream architectural difference is hidden behind the adapter and the four
-innovations (L-COCF / STA / RAEC / CMSC) are written once, backbone-agnostically.
+a (um)T5 text encoder; Wan2.2 adds a Mixture-of-Experts denoiser (a high- and a
+low-noise expert switched at a noise boundary). All, however, reduce to "predict
+ε_θ(z_t, t, c) over a grid of latent tokens, then take a scheduler step". By
+contracting on *that*, every upstream architectural difference is hidden behind the
+adapter and the four innovations (L-COCF / STA / RAEC / CMSC) are written once,
+backbone-agnostically.
 """
 
 from __future__ import annotations
@@ -38,6 +40,32 @@ from cocf.common.config import BackboneConfig
 from cocf.common.types import TokenGrid
 
 Tensor = torch.Tensor
+
+
+# --------------------------------------------------------------------------- #
+# Timestep contract (the single conversion every model-facing call site shares)
+# --------------------------------------------------------------------------- #
+
+
+def sigma_from_step(t: int, num_steps: int) -> float:
+    """Map a reverse step index ``t = T - step_idx`` to a flow-matching σ ∈ [0, 1].
+
+    The engine and the Stage-A / L-COCF data generators all count timesteps *down*
+    as ``t = T - step_idx`` — ``t = T`` at the first (noisiest) step, ``t = 1`` at
+    the last, and ``t_next = t - 1`` reaching ``0`` at the final step. The backbones,
+    however, denoise in the rectified-flow σ space σ ∈ (0, 1] (see
+    :meth:`DiffusersVideoBackbone.timesteps`): the real DiT adapters map σ → model
+    timestep via ``σ·1000`` and Wan2.2 additionally *routes its MoE experts* on that
+    scale (``σ·1000 ≥ boundary_ratio·1000``).
+
+    Feeding the raw integer index instead of σ would put the model-space timestep at
+    e.g. ``30·1000`` — out of range for every real backbone, and (for Wan2.2) high
+    enough that the low-noise expert is *never* selected. Centralising the
+    step-index → σ conversion here keeps every call site on one contract.
+    """
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+    return t / num_steps
 
 
 # --------------------------------------------------------------------------- #
@@ -257,6 +285,18 @@ class BackboneAdapter(abc.ABC):
     def dit_blocks(self) -> List[nn.Module]:
         """Transformer blocks exposed for Stage-C LoRA (§7.1.3). Empty if N/A."""
         return []
+
+    def lora_target_blocks(self, last_n: int) -> List[nn.Module]:
+        """The exact DiT blocks Stage-C LoRA should wrap (§7.1.3).
+
+        Default: the last ``last_n`` blocks of :meth:`dit_blocks` (``last_n <= 0``
+        selects all). Backbones whose ``dit_blocks`` concatenate *several* stacks —
+        e.g. a Mixture-of-Experts denoiser — override this so ``last_n`` is applied
+        to each stack's own tail rather than to the flattened list (a blind
+        ``[-last_n:]`` on the concatenation would starve every stack but the last).
+        """
+        blocks = list(self.dit_blocks())
+        return blocks[-last_n:] if last_n > 0 else blocks
 
     def recompute_kv(
         self, tokens: Tensor, cond: TextConditioning, token_indices: Tensor, cache: BackboneCache

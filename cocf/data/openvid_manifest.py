@@ -145,12 +145,20 @@ def read_openvid_csv(
     is_hd: Optional[bool] = None,
     static_motion_max: float = 0.02,
     limit: Optional[int] = None,
+    require_file: bool = False,
 ) -> List[OpenVidRecord]:
     """Parse one OpenVid CSV into :class:`OpenVidRecord`s.
 
     ``is_hd`` defaults to detecting ``OpenVidHD`` in the filename; pass it explicitly
     to override. Missing optional columns degrade gracefully to defaults so a
     trimmed/sample CSV still reads.
+
+    ``require_file`` scopes the manifest to clips whose resolved ``path`` actually
+    exists on disk — the metadata CSV lists ~1.45M clips but a working copy usually
+    holds only the extracted subset. When set, rows whose mp4 is absent are skipped
+    and ``limit`` caps the number of *kept* rows (so a small ``limit`` still finds
+    on-disk clips no matter how deep they sit in the CSV), rather than the number of
+    rows scanned.
     """
     path = Path(csv_path)
     if not path.exists():
@@ -158,13 +166,20 @@ def read_openvid_csv(
     hd = ("openvidhd" in path.name.lower()) if is_hd is None else bool(is_hd)
     col = dict(columns)
     records: List[OpenVidRecord] = []
+    n_missing = 0
     with open(path, "r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         for i, row in enumerate(reader):
-            if limit is not None and i >= limit:
+            # Without an existence filter, ``limit`` caps rows scanned; with one it
+            # caps rows *kept* (checked after the skip below) so scanning continues.
+            if limit is not None and not require_file and i >= limit:
                 break
             video = (row.get(col["video"]) or "").strip()
             if not video:
+                continue
+            resolved = os.path.join(data_root, video_subdir, video)
+            if require_file and not os.path.exists(resolved):
+                n_missing += 1
                 continue
             caption = (row.get(col["caption"]) or "").strip()
             motion = _to_float(row.get(col.get("motion", "")))
@@ -173,7 +188,7 @@ def read_openvid_csv(
                 OpenVidRecord(
                     video_id=Path(video).stem,
                     video=video,
-                    path=os.path.join(data_root, video_subdir, video),
+                    path=resolved,
                     caption=caption,
                     is_hd=hd,
                     aesthetic=_to_float(row.get(col.get("aesthetic", ""))),
@@ -186,7 +201,15 @@ def read_openvid_csv(
                     scene_type=infer_scene_type(caption, motion, camera, static_motion_max),
                 )
             )
-    _log.info("Parsed %d OpenVid records from %s (hd=%s)", len(records), path.name, hd)
+            if limit is not None and require_file and len(records) >= limit:
+                break
+    if require_file:
+        _log.info(
+            "Parsed %d on-disk OpenVid records from %s (hd=%s; skipped %d rows with no mp4 under %s)",
+            len(records), path.name, hd, n_missing, os.path.join(data_root, video_subdir),
+        )
+    else:
+        _log.info("Parsed %d OpenVid records from %s (hd=%s)", len(records), path.name, hd)
     return records
 
 
@@ -198,13 +221,19 @@ def read_openvid_manifest(
     columns: Mapping[str, str] = DEFAULT_OPENVID_COLUMNS,
     static_motion_max: float = 0.02,
     limit_per_csv: Optional[int] = None,
+    require_file: bool = False,
 ) -> List[OpenVidRecord]:
-    """Read & concatenate several OpenVid CSVs (e.g. the 1M subset + the HD subset)."""
+    """Read & concatenate several OpenVid CSVs (e.g. the 1M subset + the HD subset).
+
+    ``require_file`` scopes each CSV to clips whose mp4 exists under
+    ``{data_root}/{video_subdir}/`` — see :func:`read_openvid_csv`.
+    """
     out: List[OpenVidRecord] = []
     for p in csv_paths:
         out.extend(read_openvid_csv(
             p, data_root, video_subdir=video_subdir, columns=columns,
             static_motion_max=static_motion_max, limit=limit_per_csv,
+            require_file=require_file,
         ))
     return out
 

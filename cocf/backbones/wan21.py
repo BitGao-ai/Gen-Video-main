@@ -52,7 +52,10 @@ class Wan21Backbone(DiffusersVideoBackbone):
 
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
         self._ensure_loaded()
-        with torch.inference_mode():
+        # umT5-XXL is ~11 GB in bf16 and runs once per prompt, so under
+        # ``offload_text_encoder`` it only occupies VRAM for this one forward
+        # (:meth:`DiffusersVideoBackbone._module_active` is a no-op otherwise).
+        with torch.inference_mode(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
                 list(prompts), return_tensors="pt", padding="max_length",
                 truncation=True, max_length=self._max_len,

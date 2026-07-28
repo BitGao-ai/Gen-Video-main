@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cocf"
+version = "0.1.0"
+description = "COCF-SS-DCA: counterfactual, self-supervised video-diffusion acceleration framework"
+readme = "README.md"
+requires-python = ">=3.9"
+
+# Hard runtime dependencies. Everything else the code touches (lmdb, decord,
+# torchvision) is imported lazily inside the functions that need it, so those are
+# optional extras below rather than mandatory installs.
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+# Writing the §3 counterfactual LMDB store.
+lmdb = ["lmdb"]
+# Decoding real mp4 pixels for --use-real-video (decord is primary; torchvision is
+# the fallback reader). Install whichever builds on your platform.
+video = ["decord", "torchvision"]
+# Perception metric backends (optical flow etc.).
+perception = ["torchvision"]
+# The real diffusers-backed backbones (Wan2.1/2.2, HunyuanVideo). The floor is not
+# cosmetic: AutoencoderKLWan only gained enable_tiling() in 0.34, and without it a
+# 480x832x49 decode is a single ~7.7 GiB allocation that Stage A repeats ~90x per
+# clip. cocf.backbones.diffusers_base raises at load rather than run unbounded.
+backbones = ["diffusers>=0.34", "transformers", "accelerate"]
+# Everything, for a full local run.
+all = ["lmdb", "decord", "torchvision", "diffusers>=0.34", "transformers", "accelerate"]
+
+[tool.setuptools.packages.find]
+# Install only the library package; scripts/ and tests/ stay out of the wheel.
+include = ["cocf*"]

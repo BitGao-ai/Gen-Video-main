@@ -117,6 +117,15 @@ class FinettuneStage:
         # first, then add LoRA so the freshly-inserted LoRA params stay trainable.
         self.accelerator.freeze_backbone()
 
+        # Place the learnable plugins on the run device (mirrors JointTrainingStage,
+        # stage_b_joint.py). The engine follows ``z.device`` throughout but never
+        # *moves* the accelerator, and the frozen backbone is a plain attribute placed
+        # via ``config.backbone.device`` — so without this the plugins (strength field,
+        # damage predictor, repair net, CMSC alignment, certificate) stay on CPU while
+        # ``z_init``/backbone are on GPU, and the first plugin call inside
+        # ``engine.generate()`` (and ``_schedule_reg``) hits a CPU×CUDA mismatch.
+        self.accelerator.to(self.device)
+
         # Optionally add LoRA adapters to backbone (§4.2 "最后若干层 DiT 的 LoRA 适配器")
         self._lora_params: list = []
         if config.use_lora:

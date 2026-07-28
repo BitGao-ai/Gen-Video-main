@@ -63,7 +63,10 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
 
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
         self._ensure_loaded()
-        with torch.inference_mode():
+        # The Llama encoder is the bulky one and runs once per prompt; under
+        # ``offload_text_encoder`` it is resident only for this forward. The small
+        # CLIP encoder stays put (it is ~0.1 GB — not worth a transfer).
+        with torch.inference_mode(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
                 list(prompts), return_tensors="pt", padding="max_length",
                 truncation=True, max_length=self._max_len,

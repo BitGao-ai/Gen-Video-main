@@ -67,6 +67,12 @@ class MockBackbone(BackboneAdapter):
         )
         for p in self._net.parameters():
             p.requires_grad_(False)  # frozen, like a real pretrained backbone
+        # Reside on the configured device, exactly like a real backbone loaded onto
+        # the GPU. initial_latent()/denoise() build their tensors on ``self.device``
+        # (e.g. cuda:0), so these frozen weights must live there too — otherwise a
+        # CUDA run mixes cuda inputs with cpu params in patch_embed/denoise and
+        # torch raises "Expected all tensors to be on the same device".
+        self._net.to(self.device)
 
     # -- static description --------------------------------------------- #
 

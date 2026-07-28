@@ -63,6 +63,7 @@ from cocf.data.sample_store import (
 from cocf.data.video_dataset import (
     DecordVideoReader,
     SyntheticVideoReader,
+    TorchvisionVideoReader,
     VideoMeta,
     VideoReader,
     VideoSample,
@@ -81,6 +82,7 @@ __all__ = [
     "VideoReader",
     "DecordVideoReader",
     "SyntheticVideoReader",
+    "TorchvisionVideoReader",
     "collate_video_samples",
     # latent/text cache (training memory saving)
     "LatentCacheWriter",

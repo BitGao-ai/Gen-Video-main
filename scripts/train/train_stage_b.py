@@ -24,13 +24,48 @@ import torch
 from cocf.common.config import Config
 from cocf.common.logging import setup_logging
 from cocf.core.accelerator import Accelerator
+from cocf.data import CounterfactualLMDBDataset, ProcessedLayout
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
+
+# Repo root (…/pro_011). Anchors the default processed-store path so the script runs
+# with no flags — mirroring scripts/data/generate_counterfactual_data.py.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PROCESSED_ROOT = REPO_ROOT / "LCOCF_OpenVid1M_Processed"
+
+
+def _preflight(layout: ProcessedLayout, log: logging.Logger) -> None:
+    """Fail fast with an actionable message when the store can't feed Stage B.
+
+    Stage A writes the sample index, the ``splits/`` lists and the committed sample
+    store only in its final §1.6 step, so a run interrupted earlier leaves the heavy
+    per-video buckets on disk but none of the three things Stage B actually reads.
+    Detect that here and say exactly what is missing — instead of the late, generic
+    "no training samples" error (or a silent no-op that trains on nothing).
+    """
+    missing = []
+    if not layout.read_split("train"):
+        missing.append(f"a non-empty splits/train_list.txt (at {layout.splits_dir})")
+    if not layout.sample_index.exists():
+        missing.append(f"metadata/sample_index.csv (at {layout.sample_index})")
+    if len(CounterfactualLMDBDataset(layout.lmdb_dir)) == 0:
+        missing.append(
+            f"a committed sample store (at {layout.lmdb_dir}; its LMDB/shard manifest "
+            "is empty — Stage A was likely interrupted before §1.6)"
+        )
+    if missing:
+        raise SystemExit(
+            f"Processed store '{layout.root}' is not ready for Stage B. Missing:\n  - "
+            + "\n  - ".join(missing)
+            + "\nRe-run scripts/data/generate_counterfactual_data.py to completion "
+            "(its §1.6 step writes the index / splits / norm_stats), or repair the store."
+        )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Stage B: joint module training (§4.1)")
-    parser.add_argument("--processed-root", type=Path, required=True,
-                        help="Root of the six-level processed store (§3), written by Stage A")
+    parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT,
+                        help="Root of the six-level processed store (§3), written by Stage A. "
+                             f"Defaults to {DEFAULT_PROCESSED_ROOT}.")
     parser.add_argument("--checkpoint_load", type=Path, help="Resume from accelerator checkpoint")
     parser.add_argument("--checkpoint_save", type=Path, default=Path("./checkpoints/stage_b_final.pt"))
     parser.add_argument("--batch_size", type=int, default=32)
@@ -40,13 +75,28 @@ def main():
     parser.add_argument("--lr", type=float, default=None,
                         help="Override config.training.optim.lr")
     parser.add_argument("--mixed-precision", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Compute device; auto-detects cuda when available, else cpu")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
     setup_logging(level=logging.INFO)
     log = logging.getLogger(__name__)
     torch.manual_seed(args.seed)
+
+    # Fail fast (with a precise message) if Stage A never finished writing the store.
+    layout = ProcessedLayout(args.processed_root)
+    _preflight(layout, log)
+
+    # The action-balanced sampler drops the last partial batch (drop_last=True), so a
+    # batch larger than the whole train split yields zero batches and trains nothing.
+    n_train = len(layout.read_split("train"))
+    batch_size = args.batch_size
+    if batch_size > n_train:
+        log.warning("batch_size %d > %d train samples; clamping to %d.",
+                    batch_size, n_train, n_train)
+        batch_size = max(1, n_train)
 
     config = Config()
     config.seed = args.seed
@@ -64,7 +114,7 @@ def main():
     stage_b_config = StageBConfig(
         processed_root=args.processed_root,
         config=config,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         num_epochs=args.num_epochs,
         num_workers=args.num_workers,
         device=torch.device(args.device),

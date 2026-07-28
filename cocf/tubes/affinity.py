@@ -53,15 +53,19 @@ class AffinityComputer:
             return torch.zeros(ra, rb)
 
         c = self.cfg
+        # Region masks always carry the working device (CPU for the mock provider, CUDA
+        # for a real SAM/DINO provider). Anchor every fresh allocation below to it so
+        # the centroid/IoU terms never mix a hardcoded-CPU tensor with GPU masks.
+        device = regions_a[0].mask.device
         id_a = self._stack_feats(regions_a, "identity_feat")
         id_b = self._stack_feats(regions_b, "identity_feat")
         txt_a = self._stack_feats(regions_a, "text_feat")
         txt_b = self._stack_feats(regions_b, "text_feat")
-        cen_a = torch.tensor([r.center for r in regions_a])  # [R_a, 2]
-        cen_b = torch.tensor([r.center for r in regions_b])  # [R_b, 2]
+        cen_a = torch.tensor([r.center for r in regions_a], device=device)  # [R_a, 2]
+        cen_b = torch.tensor([r.center for r in regions_b], device=device)  # [R_b, 2]
 
-        id_sim = self._cosine_matrix(id_a, id_b)  # [R_a, R_b]
-        txt_sim = self._cosine_matrix(txt_a, txt_b)
+        id_sim = self._cosine_matrix(id_a, id_b, device)  # [R_a, R_b]
+        txt_sim = self._cosine_matrix(txt_a, txt_b, device)
 
         # flow-warped centroids of A, then distance to each centroid of B
         warped = self._warp_centroids(cen_a, latent_flow)  # [R_a, 2]
@@ -91,10 +95,11 @@ class AffinityComputer:
         return torch.stack(feats)
 
     @staticmethod
-    def _cosine_matrix(a: Optional[Tensor], b: Optional[Tensor]) -> Tensor:
+    def _cosine_matrix(a: Optional[Tensor], b: Optional[Tensor], device=None) -> Tensor:
         if a is None or b is None:
-            # neutral 0.5 when a feature is unavailable (keeps the term unbiased)
-            return torch.full((1, 1), 0.5)
+            # neutral 0.5 when a feature is unavailable (keeps the term unbiased),
+            # placed on the working device so it broadcasts into the on-device sum.
+            return torch.full((1, 1), 0.5, device=device)
         a = F.normalize(a.float(), dim=-1)
         b = F.normalize(b.float(), dim=-1)
         return ((a @ b.T) + 1.0) * 0.5  # map cos∈[-1,1] → [0,1]
@@ -115,7 +120,9 @@ class AffinityComputer:
     def _warped_iou(
         self, regions_a: List[Region], regions_b: List[Region], latent_flow: Optional[Tensor]
     ) -> Tensor:
-        iou = torch.zeros(len(regions_a), len(regions_b))
+        # Follow the region masks' device (regions_a is non-empty here) so the IoU
+        # matrix accepts the on-device `inter/union` scalars written into it below.
+        iou = torch.zeros(len(regions_a), len(regions_b), device=regions_a[0].mask.device)
         warped_masks = [self._warp_mask(r.mask, latent_flow) for r in regions_a]
         for i, wma in enumerate(warped_masks):
             for j, rb in enumerate(regions_b):

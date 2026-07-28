@@ -9,7 +9,13 @@ Public surface:
     TubeBuilder        orchestrates region→affinity→matching→state (entry point)
     SemanticTube       the tube object (re-exported from common.types)
     PerceptionProvider the injected SAM/CLIP/DINOv2/RAFT backend contract
+    MockPerception     deterministic stand-in (tests / CPU demos)
+    ModelPerception    the real SAM+DINOv2+CLIP+RAFT provider (production Stage A)
     TubeSmoothingLoss  the §4.3.2 action-consistency regulariser
+
+``ModelPerception`` keeps its heavy deps behind a lazy ``from_pretrained``, so
+importing this package still only needs ``torch`` (the mock stack stays usable on a
+box without ``transformers``/``torchvision``).
 """
 
 from __future__ import annotations
@@ -18,6 +24,8 @@ from cocf.common.types import SemanticTube, TubeState
 from cocf.tubes.affinity import AffinityComputer
 from cocf.tubes.builder import TubeBuilder
 from cocf.tubes.matching import TubeMatcher, solve_assignment
+from cocf.tubes.mock_perception import MockPerception
+from cocf.tubes.model_perception import ModelPerception
 from cocf.tubes.regions import PerceptionProvider, RegionExtractor
 from cocf.tubes.smoothing import TubeSmoothingLoss
 from cocf.tubes.state import TubeStateEncoder
@@ -27,6 +35,8 @@ __all__ = [
     "SemanticTube",
     "TubeState",
     "PerceptionProvider",
+    "MockPerception",
+    "ModelPerception",
     "RegionExtractor",
     "AffinityComputer",
     "TubeMatcher",

@@ -41,6 +41,19 @@ Tensor = torch.Tensor
 _TEXT_CUES = ("text", "word", "letter", "sign", "logo", "caption", "number",
               "title", "subtitle", "字", "文字", "标题")
 
+# Frames (or frame pairs) pushed through a metric backbone in one forward. Sized
+# for RAFT, whose per-pair correlation volume is ``(H/8 · W/8)²`` floats — ~156 MB
+# at 480×832 — so 8 pairs peak around 1.2 GB instead of the ~7 GB a whole 49-frame
+# clip would need in a single batch.
+DEFAULT_FRAME_CHUNK = 8
+
+
+def _chunks(total: int, size: int):
+    """Yield ``[lo, hi)`` windows of at most ``size`` items covering ``range(total)``."""
+    step = max(1, int(size))
+    for lo in range(0, total, step):
+        yield lo, min(lo + step, total)
+
 
 def _seed_from_str(s: str, salt: int = 0) -> int:
     """Deterministic 31-bit seed from a string (stable across processes/runs)."""
@@ -64,8 +77,11 @@ def _high_freq_energy(video: Tensor) -> Tensor:
     the signal behind the mock's OCR-fidelity degradation.
     """
     v = video.float().mean(1, keepdim=True)  # [F,1,H,W] luminance
-    k = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]])
-    k = k.view(1, 1, 3, 3).to(v.dtype)
+    # Build the Laplacian kernel on the video's device (not just its dtype) so a GPU
+    # render does not hit a CPU-weight × CUDA-input conv2d mismatch.
+    k = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+                     device=v.device, dtype=v.dtype)
+    k = k.view(1, 1, 3, 3)
     lap = F.conv2d(v, k, padding=1)
     return lap.abs().flatten(1).mean(1)  # [F]
 
@@ -113,7 +129,7 @@ class MockMetricExtractor(MetricExtractor):
         if desc.shape[0] >= 2:
             flow_mag = (desc[1:] - desc[:-1]).abs().mean(-1)  # [F-1]
         else:
-            flow_mag = torch.zeros(0)
+            flow_mag = torch.zeros(0, device=video.device)
 
         ocr = self._ocr_fidelity(video, prompt)
         return VideoFeatures(
@@ -205,12 +221,21 @@ class ModelMetricExtractor(MetricExtractor):
         dino_name: str = "facebook/dinov2-base",
         clip_name: str = "openai/clip-vit-base-patch32",
         enable_ocr: bool = False,
+        frame_chunk: int = DEFAULT_FRAME_CHUNK,
     ) -> "ModelMetricExtractor":  # pragma: no cover - needs model downloads
         """Wire DINOv2 + CLIP + torchvision-RAFT (+ optional OCR) into callables.
 
         Imported lazily so this module stays import-clean without the heavy deps.
         Wrap-up only — the projections/normalisation that matter for *comparison*
         are the model defaults, applied identically to both videos being compared.
+
+        ``frame_chunk`` bounds how many frames (or frame *pairs*, for flow) go
+        through a backbone in one forward. It exists for VRAM, not throughput: RAFT
+        materialises an all-pairs correlation volume of
+        ``B × (H/8 · W/8)²`` floats, which for a whole 49-frame 480×832 clip is a
+        single ~7 GiB tensor — larger than anything else Stage A allocates. All the
+        models run in ``eval`` (so BatchNorm uses running stats) and every reduction
+        here is per-frame, so chunking is numerically transparent.
         """
         import torch as _t
         from transformers import (  # type: ignore
@@ -227,12 +252,21 @@ class ModelMetricExtractor(MetricExtractor):
             imgs = [f for f in (video.clamp(0, 1))]
             return proc(images=imgs, return_tensors="pt")["pixel_values"].to(device)
 
+        def _per_frame(video: Tensor, fn) -> Tensor:
+            """Apply a per-frame encoder over ``video`` in ``frame_chunk`` slices."""
+            f = video.shape[0]
+            if f == 0:
+                return _t.zeros(0, device=device)
+            return _t.cat([fn(video[lo:hi]) for lo, hi in _chunks(f, frame_chunk)], 0)
+
         def dino_fn(video: Tensor) -> Tensor:
-            out = dino(_prep(video, dino_proc)).last_hidden_state  # [F,T,d]
-            return out.mean(1)  # CLS-pooled identity per frame
+            def _run(chunk: Tensor) -> Tensor:
+                out = dino(_prep(chunk, dino_proc)).last_hidden_state  # [f,T,d]
+                return out.mean(1)  # CLS-pooled identity per frame
+            return _per_frame(video, _run)
 
         def clip_fn(video: Tensor) -> Tensor:
-            return clip.get_image_features(_prep(video, clip_proc))
+            return _per_frame(video, lambda c: clip.get_image_features(_prep(c, clip_proc)))
 
         def clip_text_fn(video: Tensor, prompt: str) -> float:
             img = F.normalize(clip_fn(video).mean(0, keepdim=True), dim=-1)
@@ -249,13 +283,19 @@ class ModelMetricExtractor(MetricExtractor):
                 v = (video.clamp(0, 1) * 2 - 1).to(device)
                 a, b = v[:-1], v[1:]
                 if a.shape[0] == 0:
-                    return _t.zeros(0)
-                flow = raft(a, b)[-1]  # [F-1,2,H,W]
-                return flow.flatten(1).norm(dim=1) / flow.shape[-1]
+                    return _t.zeros(0, device=device)
+                # Chunked over frame *pairs*: the correlation volume is the single
+                # largest allocation in the whole Stage-A pass (see the docstring).
+                mags = []
+                for lo, hi in _chunks(a.shape[0], frame_chunk):
+                    flow = raft(a[lo:hi], b[lo:hi])[-1]  # [n,2,H,W]
+                    mags.append(flow.flatten(1).norm(dim=1) / flow.shape[-1])
+                    del flow
+                return _t.cat(mags, 0)
         except Exception:
             def flow_fn(video: Tensor) -> Tensor:
                 d = _pool_frames(video.to(device))
-                return (d[1:] - d[:-1]).abs().mean(-1) if d.shape[0] >= 2 else _t.zeros(0)
+                return (d[1:] - d[:-1]).abs().mean(-1) if d.shape[0] >= 2 else _t.zeros(0, device=device)
 
         ocr_fn = None
         if enable_ocr:

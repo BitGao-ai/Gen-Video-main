@@ -140,7 +140,11 @@ class LCOCFModule(nn.Module):
         if not feats:
             return {}
         ids = list(feats)
-        stacked = torch.stack([feats[i].as_tensor() for i in ids])  # [K, 3]
+        # The strength weights (α, β, γ) live on the module's device once the
+        # accelerator is moved to GPU; build the feature stack on that same device so
+        # the field's ``(features * w)`` never mixes a CPU input with GPU parameters.
+        dev = self.strength_field.alpha.device
+        stacked = torch.stack([feats[i].as_tensor(device=dev) for i in ids])  # [K, 3]
         # detach: the float strengths drive non-differentiable tier/action control
         # flow; the differentiable training path calls ``strength_field`` directly.
         s = self.strength_field(stacked).detach()  # [K]
@@ -179,6 +183,11 @@ class LCOCFModule(nn.Module):
         """
         if not tubes:
             return {}
+        # Assemble each tube's input on the predictor's device by default, so a caller
+        # that omits ``device`` (the engine passes ``state.z.device`` explicitly) still
+        # feeds the GPU head a GPU batch rather than a CPU one.
+        if device is None:
+            device = self.predictor.mu_head.weight.device
         ids = [t.tube_id for t in tubes]
         rows = [
             build_predictor_input(

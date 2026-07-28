@@ -4,7 +4,7 @@ Importing this package registers every adapter, after which a backbone is built
 purely from a config string::
 
     from cocf.backbones import build_backbone
-    adapter = build_backbone(config.backbone)   # name="hunyuanvideo" | "wan21" | "mock"
+    adapter = build_backbone(config.backbone)   # name="wan22" | "wan21" | "hunyuanvideo" | "mock"
 
 The heavy ``diffusers``/``transformers`` dependencies are imported lazily inside
 each adapter's ``_load``; importing the package itself only needs ``torch``.
@@ -26,6 +26,7 @@ from cocf.common.registry import BACKBONES
 from cocf.backbones import mock as _mock  # noqa: F401  (registers "mock")
 from cocf.backbones import hunyuan as _hunyuan  # noqa: F401  (registers "hunyuanvideo")
 from cocf.backbones import wan21 as _wan21  # noqa: F401  (registers "wan21")
+from cocf.backbones import wan22 as _wan22  # noqa: F401  (registers "wan22" — primary)
 
 
 def build_backbone(config: BackboneConfig) -> BackboneAdapter:

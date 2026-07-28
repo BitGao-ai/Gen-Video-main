@@ -26,6 +26,7 @@ the LMDB — a single streaming write pass, bounded memory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +48,7 @@ from cocf.data import (
     video_id_str,
     write_raw_dataset_index,
 )
-from cocf.lcocf.damage import MetricExtractor
+from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS, MetricExtractor
 from cocf.lcocf.data import (
     COCFDataGenerator,
     COCFTrainingSample,
@@ -57,6 +58,11 @@ from cocf.lcocf.data import (
 )
 from cocf.lcocf.strength import CausalStrengthFeatureBuilder
 from cocf.training.teacher_forward import TeacherForwardConfig, TeacherForwardRunner
+from cocf.data.video_dataset import (
+    VideoReader,
+    _resize_clip,
+    sample_frame_indices,
+)
 
 Tensor = torch.Tensor
 _log = get_logger(__name__)
@@ -83,8 +89,17 @@ class StageAConfig:
         "cuda" if torch.cuda.is_available() else "cpu"))
     limit: Optional[int] = None              # cap rows per CSV (debug / smoke)
     samples_per_video: Optional[int] = None  # override config.teacher.samples_per_video
-    persist_buckets: bool = True             # write §3 level-3/level-4 per-video buckets
+    persist_buckets: bool = True             # master switch for §3 level-3/level-4 buckets
+    persist_baseline: bool = True            # write §3 level-3 full_baseline (the ~1TB bucket)
+    persist_tube_features: bool = True       # write §3 level-4 tube_causal_features (small)
     seed: int = 1234
+    video_subdir: Optional[str] = None       # override config.data.video_subdir (e.g. "videos")
+    require_file: bool = False               # keep only clips whose mp4 exists on disk
+    use_real_video: bool = False             # anchor the teacher trajectory on real mp4 pixels
+    # -- shard-parallel + resume (§1 embarrassingly-parallel over clips) -------- #
+    num_shards: int = 1                      # total parallel workers over the clip set
+    shard_index: int = 0                     # this worker's 0-based shard id
+    finalize_only: bool = False              # skip generation; only build manifest/splits/index
 
 
 class DataGenerationStage:
@@ -101,7 +116,19 @@ class DataGenerationStage:
         self.backbone = backbone
         self.metric_extractor = metric_extractor
         self.accelerator = accelerator
+        # Keep the accelerator's plugins on the run device, matching the backbone
+        # (placed via config.backbone.device) and Stages B/C. The teacher path leaves
+        # the learnable plugins dormant today, but this makes the whole stage single-
+        # device so any future plugin call (or a real perception provider feeding the
+        # GPU tube path) composes without a CPU×CUDA mismatch.
+        self.accelerator.to(config.device)
         self.layout = ProcessedLayout(config.processed_root)
+        # Bucket persistence switches (§3 level-3/level-4). ``persist_buckets`` is the
+        # master off-switch; the two fine-grained flags let a full-scale run drop the
+        # ~1TB full_baseline bucket (unread by Stages B/C) while keeping the tiny tube
+        # features. Kept as attributes so the generation loop stays branch-cheap.
+        self._do_baseline = config.persist_buckets and config.persist_baseline
+        self._do_features = config.persist_buckets and config.persist_tube_features
 
         cfg = config.config
         self.teacher_runner = TeacherForwardRunner(
@@ -121,140 +148,227 @@ class DataGenerationStage:
             seeds_per_prompt=cfg.teacher.seeds_per_prompt,
         )
         self.transition = accelerator.transition
+        # Real-clip decoder (§1.3 real-video anchor). Built once and reused; only
+        # touched when ``use_real_video`` is set, so the caption-only path stays
+        # dependency-free (no decord/torchvision import).
+        self._video_reader: Optional[VideoReader] = (
+            self._build_video_reader() if config.use_real_video else None
+        )
+
+    @staticmethod
+    def _build_video_reader() -> VideoReader:
+        """Return a real-mp4 reader, preferring ``decord`` and falling back to
+        ``torchvision`` — whichever is installed. Raises if neither is available."""
+        from cocf.data.video_dataset import DecordVideoReader, TorchvisionVideoReader
+        try:
+            return DecordVideoReader()
+        except Exception as exc:  # decord missing / unbuildable (common on macOS)
+            _log.info("decord unavailable (%s); falling back to torchvision reader", exc)
+            return TorchvisionVideoReader()
 
     # ------------------------------------------------------------------ #
     # entry point
     # ------------------------------------------------------------------ #
 
     def run(self) -> Path:
-        """Execute Stage A and return the processed-store root."""
-        cfg = self.config.config
-        layout = self.layout.create()
-        _log.info("=== Stage A: Counterfactual Teacher Data Generation (§1) ===")
+        """Execute Stage A (optionally one shard of it) and return the store root.
 
-        # --- §1.1 ingest OpenVid metadata → raw_dataset_index.csv --------- #
+        The pipeline is split into a *generate* phase (§1.3–§1.5 — the VRAM-bound,
+        days-long teacher forward) and a *finalize* phase (§1.6 — a pure-CPU index /
+        splits / norm build). Decoupling them is what makes the stage:
+
+        * **shard-parallel** — ``--num-shards N --shard-index i`` runs N processes, each
+          over a stable-hash slice of the clips, all appending into one store;
+        * **resumable** — each shard appends a ``_progress`` line per finished clip and
+          skips them on restart, so an interrupted run continues instead of redoing the
+          teacher forward (an OOM / pre-empt no longer forfeits the shard);
+        * **bounded-memory** — the generate loop keeps *no* per-sample Python state; the
+          §1.6 statistics are streamed back off the shards in finalize (online min-max),
+          so RAM stays O(1) in sample count throughout the expensive phase.
+
+        A single-process run (``num_shards==1``) finalizes inline, preserving the old
+        one-call behaviour. A multi-shard run generates only; invoke once more with
+        ``--finalize-only`` after all shards finish to build the shared index.
+        """
+        layout = self.layout.create()
+        ns, si = max(1, self.config.num_shards), self.config.shard_index
+        _log.info("=== Stage A: Counterfactual Teacher Data Generation (§1) — shard %d/%d ===", si, ns)
+
+        # §1.1/§1.2 — every shard needs the kept set + split map, but only shard 0 writes
+        # the shared global metadata (concurrent writers would corrupt the large CSVs).
+        result = self._ingest_and_filter(
+            layout, write_global=(si == 0 and not self.config.finalize_only)
+        )
+
+        if self.config.finalize_only:
+            return finalize_processed_store(layout, result.split_by_video)
+
+        # §1.3–§1.5 — generate this shard's counterfactual samples (resumable).
+        self._generate(layout, result, ns, si)
+
+        if ns > 1:
+            _log.info(
+                "shard %d/%d generation done. Once ALL shards finish, run one more pass "
+                "with --finalize-only to build manifest/splits/sample_index.", si, ns,
+            )
+            return layout.root
+        # single-process run: finalize inline (the historical one-call behaviour).
+        return finalize_processed_store(layout, result.split_by_video)
+
+    # ------------------------------------------------------------------ #
+    # §1.1/§1.2 ingest + filter
+    # ------------------------------------------------------------------ #
+
+    def _ingest_and_filter(self, layout: ProcessedLayout, *, write_global: bool):
+        """Read OpenVid metadata and run the four-level quality filter (§1.1/§1.2).
+
+        ``write_global`` gates the one-time global-metadata writes to a single shard so
+        parallel workers never race on the (large) raw_dataset_index / filtered_final CSVs.
+        """
+        cfg = self.config.config
+        video_subdir = self.config.video_subdir or cfg.data.video_subdir
+        # Real-video mode is meaningless without the mp4 on disk, so it implies the
+        # existence filter (a clip with no file is silently dropped upstream).
+        require_file = self.config.require_file or self.config.use_real_video
         records = read_openvid_manifest(
             [str(p) for p in self.config.openvid_csvs],
             self.config.data_root,
-            video_subdir=cfg.data.video_subdir,
+            video_subdir=video_subdir,
             static_motion_max=cfg.filter.static_motion_max,
             limit_per_csv=self.config.limit,
+            require_file=require_file,
         )
-        write_raw_dataset_index(records, layout)
         _log.info("§1.1 ingested %d OpenVid records", len(records))
 
-        # --- §1.2/§2 four-level quality filter → filtered_final.csv ------- #
         qfilter = QualityFilter(cfg.filter, perception=self.accelerator.perception)
         result = qfilter.apply(records, seed=self.config.seed)
-        qfilter.write(layout, result)
-        layout.write_captions(self._caption_rows(result.kept))
-        self._write_report(layout, result.report.as_dict())
+        if write_global:
+            write_raw_dataset_index(records, layout)
+            qfilter.write(layout, result)
+            layout.write_captions(self._caption_rows(result.kept))
+            self._write_report(layout, result.report.as_dict())
         _log.info(
             "§2 filter kept %d/%d clips (hd=%.0f%%, complex=%.0f%%); split %d/%d/%d",
             result.report.kept_final, result.report.total_in,
             100 * result.report.hd_frac, 100 * result.report.complex_frac,
             result.report.n_train, result.report.n_val, result.report.n_test_hard,
         )
+        return result
 
-        # --- §1.3–§1.5 teacher forward + single-hop counterfactual labels - #
+    # ------------------------------------------------------------------ #
+    # §1.3–§1.5 generation (per shard, resumable, O(1) memory)
+    # ------------------------------------------------------------------ #
+
+    def _generate(self, layout: ProcessedLayout, result, num_shards: int, shard_index: int) -> None:
+        """Teacher forward + counterfactual generation for this shard's clips.
+
+        Holds no per-sample state: samples stream straight to the writer, per-tube meta
+        streams to a sidecar, and one ``_progress`` line per clip records what is done so
+        a restart resumes. All §1.6 statistics are recomputed from the shards in finalize.
+        """
+        cfg = self.config.config
         max_samples = self.config.samples_per_video or cfg.teacher.samples_per_video
-        index_rows: List[Dict[str, object]] = []
-        split_of_sample: Dict[str, str] = {}
-        damage_scalars: List[float] = []
-        norm_acc: Dict[str, List[np.ndarray]] = {g: [] for g in _NORM_GROUPS}
-        tube_meta_rows: List[Dict[str, object]] = []
+        prog_path = layout.lmdb_dir / f"_progress.s{shard_index:02d}.jsonl"
+        tube_path = layout.lmdb_dir / f"_tube_meta.s{shard_index:02d}.jsonl"
+        done = self._read_progress(prog_path)
+        if done:
+            _log.info("resuming shard %d: %d clips already processed, skipping them",
+                      shard_index, len(done))
 
-        n_clips = 0
-        with CounterfactualSampleWriter(layout.lmdb_dir, shard_size=cfg.teacher.shard_size) as writer:
+        # Sharded runs force the .pt backend (LMDB is single-writer) and namespace their
+        # shards/manifest by shard id; the merged manifest is built later by finalize.
+        sharded = num_shards > 1
+        writer = CounterfactualSampleWriter(
+            layout.lmdb_dir,
+            shard_size=cfg.teacher.shard_size,
+            shard_prefix=(f"shard_s{shard_index:02d}" if sharded else "shard"),
+            manifest_name=f"manifest.s{shard_index:02d}.json",
+            resume=True,
+            write_manifest=False,   # finalize owns the merged manifest.json
+            force_fallback=sharded,
+        )
+
+        n_new = 0
+        with writer, open(prog_path, "a", encoding="utf-8") as pf, \
+                open(tube_path, "a", encoding="utf-8") as tf:
             for rec in self._scene_interleaved(result.kept):
-                traj = self.teacher_runner.run(rec.video_id, rec.caption, rec.scene_type)
-                if traj is None:
+                if not _belongs_to_shard(rec.video_id, num_shards, shard_index):
                     continue
-                if self.config.persist_buckets:
+                if rec.video_id in done:
+                    continue
+                split = result.split_by_video.get(rec.video_id, "train")
+                video_frames = self._decode_clip(rec) if self.config.use_real_video else None
+                traj = self.teacher_runner.run(
+                    rec.video_id, rec.caption, rec.scene_type, video_frames=video_frames
+                )
+                if traj is None:
+                    # Degenerate clip (no tube). Record it done so a restart won't retry.
+                    self._log_progress(pf, rec.video_id, 0, split)
+                    continue
+                if self._do_baseline:
                     self._persist_baseline(traj)
+                if self._do_features:
                     self._persist_features(traj)
-                tube_meta_rows.extend(self._tube_meta(traj))
+                for row in self._tube_meta(traj):
+                    tf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                tf.flush()
 
                 samples = self.data_generator.generate(
                     traj, self.backbone, self.transition,
                     max_tubes=cfg.teacher.max_tubes_per_prompt,
                     max_samples=max_samples,
                 )
-                split = result.split_by_video.get(rec.video_id, "train")
+                n = 0
                 for s in samples:
-                    sid = self._sample_id(s)
-                    writer.put(sid, s)
-                    index_rows.append({
-                        "sample_id": sid,
-                        "video_id": s.video_id,
-                        "timestep": int(s.timestep),
-                        "action": int(s.action),
-                        "scene_type": s.scene_type,
-                    })
-                    split_of_sample[sid] = split
-                    damage_scalars.append(s.damage_scalar())
-                    self._accumulate_norm(norm_acc, s)
-                n_clips += 1
-                _log.info("  [%d] %s → %d samples", n_clips, rec.video_id, len(samples))
+                    writer.put(self._sample_id(s), s)
+                    n += 1
+                self._log_progress(pf, rec.video_id, n, split)
+                n_new += 1
+                _log.info("  [shard %d | +%d] %s → %d samples", shard_index, n_new, rec.video_id, n)
                 free_memory()
+        _log.info("shard %d: generated samples for %d new clips → %s",
+                  shard_index, n_new, layout.lmdb_dir)
 
-        # --- §1.6 cleaning, normalisation, index & leakage-safe splits ---- #
-        keep_mask = self._outlier_mask(damage_scalars)
-        kept_rows = [r for r, k in zip(index_rows, keep_mask) if k]
-        dropped = len(index_rows) - len(kept_rows)
-        layout.write_sample_index(kept_rows)
-        layout.write_tube_meta(tube_meta_rows)
-        layout.write_norm_stats(self._norm_stats(norm_acc, keep_mask))
-        self._write_splits(layout, kept_rows, split_of_sample)
-        _log.info(
-            "§1.6 wrote %d training samples (dropped %d 3σ outliers) from %d clips → %s",
-            len(kept_rows), dropped, n_clips, layout.root,
-        )
-        return layout.root
+    @staticmethod
+    def _log_progress(fh, video_id: str, n_samples: int, split: str) -> None:
+        """Append one durable (flushed) progress line so a restart can skip this clip."""
+        fh.write(json.dumps({"video_id": video_id, "n": int(n_samples), "split": split}) + "\n")
+        fh.flush()
+
+    @staticmethod
+    def _read_progress(path: Path) -> set:
+        """Set of video_ids already processed in a prior (interrupted) run of this shard."""
+        done: set = set()
+        if not path.exists():
+            return done
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    done.add(json.loads(line)["video_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return done
+
+    def finalize(self, layout: Optional[ProcessedLayout] = None,
+                 split_by_video: Optional[Dict[str, str]] = None) -> Path:
+        """Build the §1.6 shared index / splits / norm from whatever shards exist.
+
+        Thin instance wrapper over :func:`finalize_processed_store`; recomputes the split
+        map from the filter when not supplied (e.g. a standalone ``--finalize-only`` pass).
+        """
+        layout = layout or self.layout
+        if split_by_video is None:
+            split_by_video = self._ingest_and_filter(layout, write_global=False).split_by_video
+        return finalize_processed_store(layout, split_by_video)
 
     # ------------------------------------------------------------------ #
-    # §1.6 helpers
+    # §1.6 finalize lives at module scope (``finalize_processed_store``) so a
+    # standalone --finalize-only / rebuild pass can call it without a backbone
+    # or accelerator; it streams the stats back off the shards (online min-max).
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _outlier_mask(damage: Sequence[float], sigma: float = 3.0) -> List[bool]:
-        """3σ damage-outlier mask (§1.6). All-kept when too few samples to estimate σ."""
-        if len(damage) < 8:
-            return [True] * len(damage)
-        arr = np.asarray(damage, dtype="float64")
-        mu, sd = float(arr.mean()), float(arr.std())
-        if sd <= 1e-9:
-            return [True] * len(damage)
-        lo, hi = mu - sigma * sd, mu + sigma * sd
-        return [(lo <= x <= hi) for x in damage]
-
-    @staticmethod
-    def _accumulate_norm(acc: Dict[str, List[np.ndarray]], sample: COCFTrainingSample) -> None:
-        for group in _NORM_GROUPS:
-            vec = getattr(sample, group, None)
-            if isinstance(vec, Tensor) and vec.numel():
-                acc[group].append(vec.detach().cpu().float().numpy())
-
-    @staticmethod
-    def _norm_stats(acc: Dict[str, List[np.ndarray]], keep: Sequence[bool]) -> Dict[str, object]:
-        """Per-field min-max over the kept samples (§1.6 min-max 标准化 stats)."""
-        stats: Dict[str, object] = {}
-        for group, rows in acc.items():
-            kept = [r for r, k in zip(rows, keep) if k] if len(keep) == len(rows) else rows
-            if not kept:
-                continue
-            mat = np.stack(kept)
-            stats[group] = {"min": mat.min(0).tolist(), "max": mat.max(0).tolist()}
-        return stats
-
-    def _write_splits(
-        self, layout: ProcessedLayout, rows: Sequence[Dict[str, object]], split_of: Dict[str, str]
-    ) -> None:
-        buckets: Dict[str, List[str]] = {"train": [], "val": [], "test_hard": []}
-        for r in rows:
-            sid = str(r["sample_id"])
-            buckets.get(split_of.get(sid, "train"), buckets["train"]).append(sid)
-        layout.write_splits(buckets["train"], buckets["val"], buckets["test_hard"])
 
     # ------------------------------------------------------------------ #
     # persistence of §3 level-3 / level-4 buckets
@@ -296,6 +410,32 @@ class DataGenerationStage:
                 "s_E": round(f.s_E, 4), "s_A": round(f.s_A, 4), "s_T": round(f.s_T, 4),
             })
         return rows
+
+    # ------------------------------------------------------------------ #
+    # real-clip decode (§1.3 real-video anchor)
+    # ------------------------------------------------------------------ #
+
+    def _decode_clip(self, rec: OpenVidRecord) -> Tensor:
+        """Decode ``rec``'s mp4 to ``[F, 3, H, W]`` in ``[-1, 1]`` for the teacher.
+
+        Uses the *same* sampler and normalisation as :class:`VideoTextDataset` so the
+        pixels the teacher encodes are byte-identical to what the Stage-C training
+        loader would read (no train/serve skew). Frame count and resolution are pinned
+        to ``config.data.num_frames`` / ``height`` / ``width`` — the exact geometry the
+        teacher's ``TokenGrid`` is built from — so ``encode_video`` → ``to_grid`` aligns
+        (no aspect-ratio bucketing here, which could pick a mismatched resolution).
+        """
+        dcfg = self.config.config.data
+        reader = self._video_reader
+        assert reader is not None, "real-video decode requested but no reader built"
+        g = torch.Generator().manual_seed(dcfg.seed + (abs(hash(rec.video_id)) % (2 ** 20)))
+        available = reader.num_frames(rec.path)
+        idx = sample_frame_indices(available, dcfg.num_frames, dcfg.frame_interval, generator=g)
+        frames = reader.read(rec.path, idx)                 # [F, 3, h, w] in [0, 1]
+        frames = _resize_clip(frames, dcfg.height, dcfg.width)
+        if dcfg.normalize_to_unit:
+            frames = frames * 2.0 - 1.0                     # [0, 1] → [-1, 1] (VAE input)
+        return frames
 
     # ------------------------------------------------------------------ #
     # misc helpers
@@ -340,3 +480,164 @@ class DataGenerationStage:
             if all(not q for q in queues):
                 break
         return out
+
+
+# --------------------------------------------------------------------------- #
+# Module-level helpers: shard routing + §1.6 finalize (backbone-free, streaming)
+# --------------------------------------------------------------------------- #
+
+
+def _belongs_to_shard(video_id: str, num_shards: int, shard_index: int) -> bool:
+    """Stable, process-independent clip→shard routing (§1 embarrassingly parallel).
+
+    Uses md5 (not Python's salted ``hash``) so every worker — a separate process with
+    its own PYTHONHASHSEED — agrees on which shard owns a clip, giving a disjoint,
+    reproducible partition of the kept set with zero coordination between workers.
+    """
+    if num_shards <= 1:
+        return True
+    h = int(hashlib.md5(str(video_id).encode("utf-8")).hexdigest(), 16)
+    return h % num_shards == shard_index
+
+
+def _damage_scalar_from_payload(payload: Dict[str, object]) -> float:
+    """Recompute :meth:`COCFTrainingSample.damage_scalar` from a stored payload dict.
+
+    Finalize reads raw payloads off the shards, so it reproduces the weighted-sum damage
+    scalar straight from ``damage_label`` (identical maths to the typed method) to drive
+    the §1.6 3σ outlier mask — no need to rebuild a typed sample per record.
+    """
+    dl = payload.get("damage_label")
+    if dl is None:
+        return 0.0
+    arr = np.asarray(dl, dtype="float64").reshape(-1)
+    scalar = 0.0
+    for i, axis in enumerate(DAMAGE_DIMENSIONS):
+        if i < arr.shape[0]:
+            scalar += float(arr[i]) * DEFAULT_DAMAGE_WEIGHTS.get(axis, 0.0)
+    return min(1.0, scalar)
+
+
+def _outlier_mask(damage: Sequence[float], sigma: float = 3.0) -> List[bool]:
+    """3σ damage-outlier mask (§1.6). All-kept when too few samples to estimate σ."""
+    if len(damage) < 8:
+        return [True] * len(damage)
+    arr = np.asarray(damage, dtype="float64")
+    mu, sd = float(arr.mean()), float(arr.std())
+    if sd <= 1e-9:
+        return [True] * len(damage)
+    lo, hi = mu - sigma * sd, mu + sigma * sd
+    return [(lo <= x <= hi) for x in damage]
+
+
+def _iter_shard_records(shard_paths: Sequence[Path]):
+    """Yield ``(shard_filename, pos, sample_id, payload)`` streaming over the shards.
+
+    One shard is resident at a time (loaded, consumed, dropped), so finalize's peak RAM
+    is a single shard rather than the whole store — the property that lets §1.6 scale to
+    millions of samples on a memory-constrained box.
+    """
+    for sp in shard_paths:
+        recs = torch.load(sp, map_location="cpu", weights_only=False)
+        for pos, r in enumerate(recs):
+            yield sp.name, pos, r["sample_id"], r["payload"]
+        del recs
+        free_memory()
+
+
+def _merge_tube_meta(layout: ProcessedLayout) -> List[Dict[str, object]]:
+    """Merge every shard's ``_tube_meta.sNN.jsonl`` sidecar into the tube_meta rows."""
+    rows: List[Dict[str, object]] = []
+    for p in sorted(layout.lmdb_dir.glob("_tube_meta.s*.jsonl")):
+        with open(p, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return rows
+
+
+def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, str]) -> Path:
+    """Build the §1.6 shared index / splits / norm by streaming over all shards.
+
+    Backbone-free and, apart from the index/keys it must materialise for ``manifest.json``
+    (an intrinsic output), O(1) in sample count. Two streaming passes:
+
+    1. accumulate the per-field **online min-max** (§1.6 norm stats) and the damage
+       scalars needed for the 3σ mask — one shard resident at a time;
+    2. emit the merged ``manifest.json`` (every sample, so Stage B can address any
+       record) plus ``sample_index.csv`` + leakage-safe ``splits/*.txt`` (kept,
+       non-outlier samples only — 3σ outliers are omitted from the index, never deleted
+       from the store, matching the original §1.6 contract).
+
+    Works for both the sharded layout (``shard_sNN_*.pt``) and a legacy single-writer
+    store (``shard_NNNNN.pt``) — the glob matches both. Idempotent: safe to re-run.
+    """
+    shard_paths = sorted(layout.lmdb_dir.glob("shard_*.pt"))
+    if not shard_paths:
+        _log.warning("finalize: no shards under %s — nothing to index", layout.lmdb_dir)
+        return layout.root
+
+    # --- pass 1: online min-max (§1.6 norm) + damage scalars (streaming) ---- #
+    norm_min: Dict[str, np.ndarray] = {}
+    norm_max: Dict[str, np.ndarray] = {}
+    damage: List[float] = []
+    for _name, _pos, _sid, payload in _iter_shard_records(shard_paths):
+        damage.append(_damage_scalar_from_payload(payload))
+        for g in _NORM_GROUPS:
+            v = payload.get(g)
+            if v is None:
+                continue
+            a = np.asarray(v, dtype="float64").reshape(-1)
+            if not a.size:
+                continue
+            if g in norm_min:
+                np.minimum(norm_min[g], a, out=norm_min[g])
+                np.maximum(norm_max[g], a, out=norm_max[g])
+            else:
+                norm_min[g], norm_max[g] = a.copy(), a.copy()
+    keep_mask = _outlier_mask(damage)
+
+    # --- pass 2: manifest (all records) + sample_index/splits (kept) -------- #
+    keys: List[str] = []
+    index: Dict[str, list] = {}
+    sample_rows: List[Dict[str, object]] = []
+    buckets: Dict[str, List[str]] = {"train": [], "val": [], "test_hard": []}
+    gi = 0
+    for name, pos, sid, payload in _iter_shard_records(shard_paths):
+        keys.append(sid)
+        index[sid] = [name, pos]
+        if keep_mask[gi]:
+            vid = str(payload.get("video_id", ""))
+            sample_rows.append({
+                "sample_id": sid,
+                "video_id": vid,
+                "timestep": int(payload.get("timestep", 0)),
+                "action": int(payload.get("action", 0)),
+                "scene_type": payload.get("scene_type", ""),
+            })
+            buckets.get(split_by_video.get(vid, "train"), buckets["train"]).append(sid)
+        gi += 1
+
+    (layout.lmdb_dir / "manifest.json").write_text(
+        json.dumps({"keys": keys, "index": index}), encoding="utf-8"
+    )
+    layout.write_sample_index(sample_rows)
+    layout.write_splits(buckets["train"], buckets["val"], buckets["test_hard"])
+    layout.write_norm_stats({
+        g: {"min": norm_min[g].tolist(), "max": norm_max[g].tolist()} for g in norm_min
+    })
+    layout.write_tube_meta(_merge_tube_meta(layout))
+
+    dropped = len(keys) - len(sample_rows)
+    _log.info(
+        "§1.6 finalize: indexed %d samples across %d shards; sample_index kept %d "
+        "(dropped %d 3σ outliers); splits %d/%d/%d → %s",
+        len(keys), len(shard_paths), len(sample_rows), dropped,
+        len(buckets["train"]), len(buckets["val"]), len(buckets["test_hard"]), layout.root,
+    )
+    return layout.root

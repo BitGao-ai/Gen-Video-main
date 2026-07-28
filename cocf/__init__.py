@@ -1,10 +1,10 @@
 """COCF-SS-DCA: Causal-Counterfactual Compute Field with Semantic-Tube Anchoring.
 
 A *plug-in* acceleration layer for video diffusion transformers (DiT). It does not
-generate video on its own; instead it wraps a frozen backbone (HunyuanVideo, Wan2.1,
-...) and dynamically allocates compute per cross-frame *semantic tube* so that
-perceptually unimportant regions are cheaply approximated while causally important
-regions keep full fidelity.
+generate video on its own; instead it wraps a frozen backbone (Wan2.2, Wan2.1,
+HunyuanVideo, ...) and dynamically allocates compute per cross-frame *semantic tube*
+so that perceptually unimportant regions are cheaply approximated while causally
+important regions keep full fidelity.
 
 The package is organised into loosely-coupled subsystems, each mapping onto one
 section of the design document:

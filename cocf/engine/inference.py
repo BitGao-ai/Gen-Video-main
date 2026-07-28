@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from cocf.backbones.base import BackboneAdapter, BackboneCache, TextConditioning
+from cocf.backbones.base import BackboneAdapter, BackboneCache, TextConditioning, sigma_from_step
 from cocf.backbones.transition import TransitionExecutor, TransitionResult
 from cocf.cmsc.alignment import TextTubeAlignment
 from cocf.cmsc.losses import CMSCLoss
@@ -460,8 +460,11 @@ class InferenceEngine(nn.Module):
         Computes ε on every token and takes a single scheduler step, returning the
         advanced latent and the refreshed ε cache.
         """
-        t_now = torch.full((state.z.shape[0],), float(t), device=state.z.device)
-        t_next = torch.full((state.z.shape[0],), float(t - 1), device=state.z.device)
+        # The backbone denoises in σ∈(0,1] (see sigma_from_step); the loop counts the
+        # step index down, so convert before handing t to the model.
+        T = self.engine_cfg.num_inference_steps
+        t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
+        t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
         out = backbone.denoise(
             state.z, t_now, state.cond, grid=state.grid,
             active_mask=None, cache=state.cache,
@@ -502,8 +505,10 @@ class InferenceEngine(nn.Module):
         anchor latent is supplied so ANCHOR tubes freeze to it and the measured
         residual ``‖z_full − z_anchor‖`` is meaningful (the RAEC trigger signal).
         """
-        t_now = torch.full((state.z.shape[0],), float(t), device=state.z.device)
-        t_next = torch.full((state.z.shape[0],), float(t - 1), device=state.z.device)
+        # Model-space σ∈(0,1] from the descending step index (see sigma_from_step).
+        T = self.engine_cfg.num_inference_steps
+        t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
+        t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
         return self.accelerator.transition.step(
             z_t=state.z,
             t=t_now,

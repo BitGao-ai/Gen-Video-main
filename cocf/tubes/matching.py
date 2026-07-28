@@ -141,7 +141,9 @@ class TubeMatcher:
         rows = []
         for tr in row_tracks:
             rid = tr.regions[frame_a].region_id
-            rows.append(aff_full[rid] if rid < aff_full.shape[0] else torch.zeros(aff_full.shape[1]))
+            # new_zeros follows aff_full's device so the fallback row stacks with the
+            # real (possibly GPU) affinity rows without a device mismatch.
+            rows.append(aff_full[rid] if rid < aff_full.shape[0] else aff_full.new_zeros(aff_full.shape[1]))
         sub = torch.stack(rows)  # [num_tracks, R_b]
         return solve_assignment(sub, self.cfg.affinity_match_threshold)
 

@@ -98,7 +98,10 @@ def inject_lora(
         )
         return [], []
 
-    targets = blocks[-last_n_blocks:] if last_n_blocks > 0 else blocks
+    # Ask the backbone which blocks to wrap: the default is the last ``last_n`` of
+    # dit_blocks(), but a Mixture-of-Experts backbone returns each expert's own tail
+    # so LoRA is not starved onto a single expert (§7.1.3).
+    targets = list(backbone.lora_target_blocks(last_n_blocks))
     modules: List[LoRALinear] = []
     for block in targets:
         modules.extend(_wrap_linears_in(block, rank, alpha))

@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from cocf.backbones.base import BackboneAdapter, TextConditioning
+from cocf.backbones.base import BackboneAdapter, TextConditioning, sigma_from_step
 from cocf.common.config import Config
 from cocf.common.logging import get_logger
 from cocf.common.memory import teacher_forward
@@ -67,6 +67,23 @@ def _frames_per_latent_slot(video_fchw: Tensor, grid_t: int) -> Tensor:
         return video_fchw
     sel = torch.linspace(0, f - 1, grid_t, device=video_fchw.device).round().long()
     return video_fchw.index_select(0, sel)
+
+
+def _noise_latent(z0: Tensor, sigma: float, generator: Optional[torch.Generator]) -> Tensor:
+    """Forward-diffuse a clean latent ``z0`` to flow-matching level ``σ`` (§1.3).
+
+    In the rectified-flow σ-space the backbones denoise in (see
+    :func:`cocf.backbones.base.sigma_from_step`), the noisy latent interpolates the
+    clean sample and Gaussian noise as ``z_σ = (1−σ)·z0 + σ·ε``. At ``σ=1`` this is
+    pure ``ε`` — identical in law to :meth:`BackboneAdapter.initial_latent` — and at
+    ``σ→0`` it returns ``z0``. Used only when Stage A anchors the teacher trajectory
+    on a *real* clip: there is no reverse trajectory to cache, so the representative
+    ``z_t`` are produced by noising the encoded ``z0`` instead of by denoising noise.
+    """
+    eps = torch.randn(
+        z0.shape, generator=generator, device=z0.device, dtype=z0.dtype
+    )
+    return (1.0 - sigma) * z0 + sigma * eps
 
 
 @dataclass
@@ -155,8 +172,8 @@ class TeacherForwardRunner:
                 t = T - step_idx
                 if step_idx in want:
                     z_by_step[step_idx] = z.clone()
-                t_now = torch.full((z.shape[0],), float(t), device=z.device)
-                t_next = torch.full((z.shape[0],), float(t - 1), device=z.device)
+                t_now = torch.full((z.shape[0],), sigma_from_step(t, T), device=z.device)
+                t_next = torch.full((z.shape[0],), sigma_from_step(t - 1, T), device=z.device)
                 out = bb.full_transition(z, t_now, t_next, cond, grid=grid, cache=cache)
                 z = out.model_output
                 cache = out.cache
@@ -175,6 +192,7 @@ class TeacherForwardRunner:
         z_init: Optional[Tensor] = None,
         cond: Optional[TextConditioning] = None,
         grid: Optional[TokenGrid] = None,
+        video_frames: Optional[Tensor] = None,
     ) -> Optional[TeacherTrajectory]:
         """Run the full-compute teacher forward for one caption.
 
@@ -187,20 +205,54 @@ class TeacherForwardRunner:
         initial noise as the accelerated engine run — without that, a damage compared
         against this ``Y_full`` would measure the noise difference, not the effect of
         acceleration (§4.2 主损失).
+
+        ``video_frames`` (``[F, 3, H, W]`` in ``[-1, 1]``, F/H/W matching ``grid``)
+        anchors the trajectory on a **real** clip instead of a text-to-video
+        generation: ``z0`` is the VAE encoding of the frames, ``Y_full`` its decode
+        round-trip (so it stays frame-for-frame comparable with the rollout's decoded
+        ``z_0``), and the representative ``z_t`` are forward-noised from that ``z0``
+        (:func:`_noise_latent`). When omitted, the caption-driven denoise runs as before.
         """
         bb = self.backbone
         rep_steps = self.representative_step_indices()
 
         with teacher_forward():
-            if grid is None:
-                grid = bb.token_grid(self.cfg.num_frames, self.cfg.height, self.cfg.width)
             if cond is None:
                 cond = bb.encode_text([prompt]).to(self.device)
-            if z_init is None:
-                z_init = bb.initial_latent(grid, batch=1, device=self.device)
 
-            # --- §1.3: full, un-accelerated denoise; cache z_t at rep. steps --- #
-            z0, z_by_step = self.full_denoise(z_init, cond, grid, cache_steps=rep_steps)
+            if video_frames is not None:
+                # --- §1.3 (real-clip anchor): encode the mp4; noise z0 to rep steps -- #
+                # The token grid is derived from the *encoded latent* (not the pixel
+                # dims): ``to_tokens(encode_video(x))`` and ``to_grid(·, grid)`` are
+                # inverses only when ``grid`` describes that latent's patch layout, so
+                # the real clip's geometry — not a caller-supplied grid — governs here.
+                # ``video_frames`` is [F,3,H,W] (the codebase's frame layout, as
+                # produced by VideoTextDataset / _to_fchw); the VAE encoder wants
+                # channels-first temporal video [B,3,F,H,W], hence the permute.
+                video_bcfhw = video_frames.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
+                lat = bb.encode_video(video_bcfhw)  # [1,C,T,H,W]
+                p_t, p_h, p_w = getattr(bb, "patch", (1, 1, 1))
+                grid = TokenGrid(
+                    t=max(1, lat.shape[2] // p_t),
+                    h=max(1, lat.shape[3] // p_h),
+                    w=max(1, lat.shape[4] // p_w),
+                )
+                z0 = bb.to_tokens(lat)
+                gen = torch.Generator(device=z0.device).manual_seed(
+                    (abs(hash(video_id)) % (2 ** 31)) + 1
+                )
+                T = self.cfg.num_inference_steps
+                z_by_step = {
+                    step_idx: _noise_latent(z0, sigma_from_step(T - step_idx, T), gen)
+                    for step_idx in rep_steps
+                }
+            else:
+                if grid is None:
+                    grid = bb.token_grid(self.cfg.num_frames, self.cfg.height, self.cfg.width)
+                if z_init is None:
+                    z_init = bb.initial_latent(grid, batch=1, device=self.device)
+                # --- §1.3: full, un-accelerated denoise; cache z_t at rep. steps --- #
+                z0, z_by_step = self.full_denoise(z_init, cond, grid, cache_steps=rep_steps)
 
             # decode the reference video Y_full (full frame layout, as the rollout uses)
             video_full = _to_fchw(bb.decode_latent(bb.to_grid(z0, grid)))  # [F, 3, Hp, Wp]

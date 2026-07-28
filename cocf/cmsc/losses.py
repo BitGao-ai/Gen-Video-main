@@ -78,13 +78,17 @@ class CMSCLoss(nn.Module):
         """Return ``(scalar loss, per-term components)`` comparing full vs accel."""
         c = self.cfg
         ids = sorted(set(full.tube_embeds) & set(accel.tube_embeds))
+        # Anchor every term's constants/empty-fallbacks to the observation device so
+        # the summed loss stays on one device (the learnable align term is on the
+        # module's GPU device; the other terms must not inject CPU 0-dim scalars).
+        dev = full.text_embeds.device
 
-        l_align = self._align_term(full, accel, ids)
-        l_id = self._id_term(full.tube_identity, accel.tube_identity, ids)
-        l_motion = self._motion_term(full.video, accel.video)
-        l_spatial = self._spatial_term(full.tube_centroid, accel.tube_centroid, ids)
-        l_ocr = self._ocr_term(full.video, accel.video)
-        l_bnd = self._id_term(full.tube_boundary, accel.tube_boundary, ids)
+        l_align = self._align_term(full, accel, ids, dev)
+        l_id = self._id_term(full.tube_identity, accel.tube_identity, ids, dev)
+        l_motion = self._motion_term(full.video, accel.video, dev)
+        l_spatial = self._spatial_term(full.tube_centroid, accel.tube_centroid, ids, dev)
+        l_ocr = self._ocr_term(full.video, accel.video, dev)
+        l_bnd = self._id_term(full.tube_boundary, accel.tube_boundary, ids, dev)
 
         total = (
             c.lambda_align * l_align
@@ -164,10 +168,10 @@ class CMSCLoss(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _align_term(
-        self, full: CMSCObservation, accel: CMSCObservation, ids: List[int]
+        self, full: CMSCObservation, accel: CMSCObservation, ids: List[int], dev=None
     ) -> Tensor:
         if len(ids) < 1:
-            return torch.zeros(())
+            return torch.zeros((), device=dev)
         dim = next(iter(full.tube_embeds.values())).shape[-1]
         vf = TextTubeAlignment.stack_tube_embeds(full.tube_embeds, ids, dim)
         va = TextTubeAlignment.stack_tube_embeds(accel.tube_embeds, ids, dim)
@@ -177,22 +181,22 @@ class CMSCLoss(nn.Module):
 
     @staticmethod
     def _id_term(
-        full: Dict[int, Tensor], accel: Dict[int, Tensor], ids: List[int]
+        full: Dict[int, Tensor], accel: Dict[int, Tensor], ids: List[int], dev=None
     ) -> Tensor:
         common = [i for i in ids if i in full and i in accel]
         if not common:
-            return torch.zeros(())
+            return torch.zeros((), device=dev)
         fa = F.normalize(torch.stack([full[i].float() for i in common]), dim=-1)
         ac = F.normalize(torch.stack([accel[i].float() for i in common]), dim=-1)
         cos = (fa * ac).sum(-1).clamp(-1, 1)
         return (1.0 - cos).mean()
 
     @staticmethod
-    def _motion_term(full: VideoFeatures, accel: VideoFeatures) -> Tensor:
+    def _motion_term(full: VideoFeatures, accel: VideoFeatures, dev=None) -> Tensor:
         mf, ma = full.flow_mag_per_pair.float(), accel.flow_mag_per_pair.float()
         n = min(mf.numel(), ma.numel())
         if n == 0:
-            return torch.zeros(())
+            return torch.zeros((), device=dev)
         denom = mf[:n].abs().mean().clamp_min(1e-6)
         return ((ma[:n] - mf[:n]).abs().mean() / denom).clamp(0.0, 4.0)
 
@@ -201,17 +205,18 @@ class CMSCLoss(nn.Module):
         full: Dict[int, Tuple[float, float]],
         accel: Dict[int, Tuple[float, float]],
         ids: List[int],
+        dev=None,
     ) -> Tensor:
         common = [i for i in ids if i in full and i in accel]
         if len(common) < 2:
-            return torch.zeros(())
-        cf = torch.tensor([full[i] for i in common], dtype=torch.float32)
-        ca = torch.tensor([accel[i] for i in common], dtype=torch.float32)
+            return torch.zeros((), device=dev)
+        cf = torch.tensor([full[i] for i in common], dtype=torch.float32, device=dev)
+        ca = torch.tensor([accel[i] for i in common], dtype=torch.float32, device=dev)
         df = torch.cdist(cf, cf)
         da = torch.cdist(ca, ca)
         k = len(common)
         return (df - da).pow(2).sum().sqrt() / (k * k)
 
     @staticmethod
-    def _ocr_term(full: VideoFeatures, accel: VideoFeatures) -> Tensor:
-        return torch.tensor(max(0.0, full.ocr_accuracy - accel.ocr_accuracy))
+    def _ocr_term(full: VideoFeatures, accel: VideoFeatures, dev=None) -> Tensor:
+        return torch.tensor(max(0.0, full.ocr_accuracy - accel.ocr_accuracy), device=dev)

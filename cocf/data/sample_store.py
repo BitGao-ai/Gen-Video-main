@@ -79,11 +79,24 @@ class CounterfactualSampleWriter:
                 w.put(sid, sample)
     """
 
-    def __init__(self, lmdb_dir, *, shard_size: int = 256, map_size: int = _DEFAULT_MAP_SIZE):
+    def __init__(self, lmdb_dir, *, shard_size: int = 256, map_size: int = _DEFAULT_MAP_SIZE,
+                 shard_prefix: str = "shard", manifest_name: str = "manifest.json",
+                 resume: bool = False, write_manifest: bool = True,
+                 force_fallback: bool = False):
         self.dir = Path(lmdb_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.shard_size = max(1, int(shard_size))
-        self._use_lmdb = _have_lmdb()
+        # Sharded-fallback layout knobs. ``shard_prefix`` / ``manifest_name`` give each
+        # parallel Stage-A shard its own on-disk namespace inside one lmdb_dir, so
+        # ``--num-shards`` workers never clobber each other's shard files. The merged
+        # top-level ``manifest.json`` is built later by the finalize pass, so writers in
+        # the pipeline pass ``write_manifest=False`` and let finalize own the index.
+        self.shard_prefix = shard_prefix
+        self.manifest_name = manifest_name
+        self.write_manifest = write_manifest
+        # LMDB is single-writer; a sharded parallel run forces the .pt backend so N
+        # workers can each append to the shared dir. Non-sharded runs keep auto-select.
+        self._use_lmdb = _have_lmdb() and not force_fallback
         self._keys: List[str] = []
         if self._use_lmdb:
             import lmdb
@@ -92,10 +105,25 @@ class CounterfactualSampleWriter:
             self._txn = self._env.begin(write=True)
             self._pending = 0
         else:
-            # sharded fallback: accumulate in a buffer, flush every shard_size
-            self._shard_idx = 0
+            # sharded fallback: accumulate in a buffer, flush every shard_size. When
+            # ``resume`` picks up an interrupted shard, continue numbering *after* the
+            # highest existing shard so a restart appends rather than overwrites.
+            self._shard_idx = self._next_shard_index() if resume else 0
             self._buffer: List[Dict[str, Any]] = []
-            self._manifest: Dict[str, List[int]] = {}  # sample_id -> [shard_idx, pos]
+            self._manifest: Dict[str, List] = {}  # sample_id -> [shard_filename, pos]
+
+    def _shard_name(self, idx: int) -> str:
+        return f"{self.shard_prefix}_{idx:05d}.pt"
+
+    def _next_shard_index(self) -> int:
+        """Highest existing ``{prefix}_NNNNN.pt`` + 1 (0 when none) — the resume anchor."""
+        n = 0
+        for p in self.dir.glob(f"{self.shard_prefix}_*.pt"):
+            try:
+                n = max(n, int(p.stem.rsplit("_", 1)[1]) + 1)
+            except (ValueError, IndexError):
+                continue
+        return n
 
     # -- writing -------------------------------------------------------- #
 
@@ -111,7 +139,7 @@ class CounterfactualSampleWriter:
                 self._txn = self._env.begin(write=True)
                 self._pending = 0
         else:
-            self._manifest[sample_id] = [self._shard_idx, len(self._buffer)]
+            self._manifest[sample_id] = [self._shard_name(self._shard_idx), len(self._buffer)]
             self._buffer.append({"sample_id": sample_id, "payload": payload})
             if len(self._buffer) >= self.shard_size:
                 self._flush_shard()
@@ -124,7 +152,7 @@ class CounterfactualSampleWriter:
     def _flush_shard(self) -> None:
         if not self._buffer:
             return
-        shard_path = self.dir / f"shard_{self._shard_idx:05d}.pt"
+        shard_path = self.dir / self._shard_name(self._shard_idx)
         torch.save(self._buffer, shard_path)
         self._shard_idx += 1
         self._buffer = []
@@ -139,10 +167,11 @@ class CounterfactualSampleWriter:
             self._env.close()
         else:
             self._flush_shard()
-            (self.dir / "manifest.json").write_text(
-                json.dumps({"keys": self._keys, "index": self._manifest}),
-                encoding="utf-8",
-            )
+            if self.write_manifest:
+                (self.dir / self.manifest_name).write_text(
+                    json.dumps({"keys": self._keys, "index": self._manifest}),
+                    encoding="utf-8",
+                )
 
     def __enter__(self) -> "CounterfactualSampleWriter":
         return self
@@ -226,10 +255,13 @@ class CounterfactualLMDBDataset(Dataset):
             if blob is None:
                 raise KeyError(sample_id)
             return _decode(blob)
-        # fallback: load (and cache) the shard, return the record's payload
-        shard_idx, pos = self._index[sample_id]
-        shard = self._shard_cache.get(shard_idx)
+        # fallback: load (and cache) the shard, return the record's payload. The index
+        # value is either a shard *filename* (new shard-parallel layout) or a legacy
+        # integer shard index — accept both so pre-existing stores keep reading unchanged.
+        shard_ref, pos = self._index[sample_id]
+        shard_name = shard_ref if isinstance(shard_ref, str) else f"shard_{int(shard_ref):05d}.pt"
+        shard = self._shard_cache.get(shard_name)
         if shard is None:
-            shard = torch.load(self.dir / f"shard_{shard_idx:05d}.pt", weights_only=False)
-            self._shard_cache = {shard_idx: shard}  # keep only the last shard resident
+            shard = torch.load(self.dir / shard_name, weights_only=False)
+            self._shard_cache = {shard_name: shard}  # keep only the last shard resident
         return shard[pos]["payload"]

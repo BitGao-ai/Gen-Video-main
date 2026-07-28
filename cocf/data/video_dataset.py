@@ -106,6 +106,33 @@ class DecordVideoReader(VideoReader):  # pragma: no cover - needs decord + files
         return frames.permute(0, 3, 1, 2).float() / 255.0
 
 
+class TorchvisionVideoReader(VideoReader):  # pragma: no cover - needs torchvision + files
+    """Fallback reader backed by ``torchvision.io.read_video`` (PyAV under the hood).
+
+    Handy where ``decord`` will not build (e.g. Apple Silicon): it ships with the
+    same PyTorch stack the framework already depends on. Reads the whole clip once
+    and indexes in memory — fine for the short OpenVid clips Stage A ingests.
+    """
+
+    def __init__(self) -> None:
+        from torchvision.io import read_video  # noqa: F401  (import-time availability check)
+
+        self._read_video = read_video
+
+    def _frames(self, path: str) -> Tensor:
+        # read_video → (video[T,H,W,C] uint8, audio, info); pts_unit fixed for determinism.
+        video, _audio, _info = self._read_video(path, pts_unit="sec", output_format="TCHW")
+        return video.float() / 255.0  # [T, 3, H, W] in [0, 1]
+
+    def num_frames(self, path: str) -> int:
+        return int(self._frames(path).shape[0])
+
+    def read(self, path: str, frame_indices: Sequence[int]) -> Tensor:
+        frames = self._frames(path)
+        idx = torch.as_tensor(list(frame_indices), dtype=torch.long).clamp_(0, frames.shape[0] - 1)
+        return frames.index_select(0, idx)
+
+
 class SyntheticVideoReader(VideoReader):
     """Deterministic procedural clips — makes the pipeline runnable with no files.
 
