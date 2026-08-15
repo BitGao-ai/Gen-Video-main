@@ -81,7 +81,19 @@ class TubeBuilder:
             affinity_by_pair[(a, b)] = self.affinity.matrix(
                 regions_by_frame[a], regions_by_frame[b], latent_flows.get(a)
             )
-        tubes = self.matcher.build_tubes(regions_by_frame, affinity_by_pair, grid)
+        tubes = self.matcher.build_tubes(
+            regions_by_frame, affinity_by_pair, grid,
+            # Lets the matcher bridge a missed frame: it asks for the affinity between
+            # a stalled track's last frame and the current one, which the consecutive
+            # matrices above do not contain. Computed on demand, so a run with no
+            # broken tracks pays nothing (§P1-10).
+            affinity_fn=lambda fa, fb: (
+                self.affinity.matrix(
+                    regions_by_frame[fa], regions_by_frame[fb], latent_flows.get(fa)
+                )
+                if fa in regions_by_frame and fb in regions_by_frame else None
+            ),
+        )
         states = self.update(tubes, latent_flow_by_frame=latent_flows)
         return tubes, states, latent_flows
 

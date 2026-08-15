@@ -12,6 +12,7 @@ backbone, demonstrating that the algorithm code is backbone-agnostic.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Optional, Sequence
 
 import torch
@@ -37,6 +38,11 @@ class MockBackbone(BackboneAdapter):
     Patchify factors and dims are configurable through ``BackboneConfig.extra`` so
     tests can exercise different token-grid shapes.
     """
+
+    #: The mock gathers the active tokens and computes only those, so a sparse mask
+    #: really is cheaper here (which is what makes it a usable stand-in for a future
+    #: sparse-attention kernel — and why the real adapters must say ``False``).
+    supports_token_sparsity = True
 
     def __init__(self, config: BackboneConfig) -> None:
         super().__init__(config)
@@ -137,10 +143,15 @@ class MockBackbone(BackboneAdapter):
 
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
         b = len(prompts)
-        # deterministic pseudo-embedding from the hash of each prompt
+        # deterministic pseudo-embedding from a *stable* digest of each prompt.
+        # Python's built-in ``hash`` is salted per process (PYTHONHASHSEED), so seeding
+        # from it made the mock's conditioning — and therefore the whole generated
+        # video — differ between runs even under a fixed --seed. The repo already uses
+        # md5 for the same reason in Stage-A shard routing.
         embeds = torch.zeros(b, self._text_len, self._d_text)
         for i, p in enumerate(prompts):
-            g = torch.Generator().manual_seed(abs(hash(p)) % (2 ** 31))
+            digest = hashlib.md5(p.encode("utf-8")).hexdigest()
+            g = torch.Generator().manual_seed(int(digest, 16) % (2 ** 31))
             embeds[i] = torch.randn(self._text_len, self._d_text, generator=g)
         mask = torch.ones(b, self._text_len)
         return TextConditioning(embeds=embeds, mask=mask, prompts=tuple(prompts))
@@ -172,7 +183,10 @@ class MockBackbone(BackboneAdapter):
         if idx.numel() == 0:
             # nothing to compute: reuse the whole cached output
             eps = self._cached_or_zero(cache, tokens)
-            return DenoiseOutput(model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out)
+            return DenoiseOutput(
+                model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out,
+                compute_fraction=0.0,
+            )
 
         x = tokens.index_select(1, idx)  # [B, n_act, d] — the ONLY tokens we compute
         h = self.norm(x + t_emb)
@@ -189,7 +203,14 @@ class MockBackbone(BackboneAdapter):
         if want_attention and w is not None:
             full_attn = torch.zeros(b, idx.numel(), text.shape[1], device=tokens.device)
             attn_out["text"] = full_attn  # placeholder layout [B, n_act, L]
-        return DenoiseOutput(model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out)
+        return DenoiseOutput(
+            model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out,
+            # The mock really does gather → compute → scatter, so its spend genuinely
+            # tracks mask occupancy. Real DiT adapters report 1.0 for the same mask
+            # (see :meth:`DiffusersVideoBackbone.denoise`) — the difference is the
+            # point of reporting this per-adapter instead of deriving it from the mask.
+            compute_fraction=(float(idx.numel()) / max(1, n)),
+        )
 
     def unpatch_noise(self, x: Tensor) -> Tensor:
         # predict ε in *token* space (same dim as tokens) for a clean scheduler step

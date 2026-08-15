@@ -26,8 +26,7 @@ import torch
 import torch.nn as nn
 
 from cocf.common.config import PredictorConfig
-from cocf.common.memory import checkpointed
-from cocf.common.types import DamagePrediction, TubeState
+from cocf.common.types import Action, DamagePrediction, TubeState
 from cocf.lcocf.strength import StrengthFeatures
 
 Tensor = torch.Tensor
@@ -133,13 +132,37 @@ class DamagePredictor(nn.Module):
         self.mu_head = nn.Linear(config.hidden_dim, config.num_actions)
         # log-variance head for a calibrated, heteroscedastic σ
         self.var_head = nn.Linear(config.hidden_dim, config.num_actions)
-        nn.init.zeros_(self.mu_head.bias)
-        nn.init.zeros_(self.var_head.bias)
+        # Bias-init both heads so an *untrained* predictor yields a small μ and a
+        # small σ rather than μ≈0.70/σ≈1.0 (the softplus/exp values at bias 0). The
+        # error certificate is μ + κ·σ with κ=1.96, so zero biases put E_cert at ~2.7
+        # against a τ_high of 0.80 and every tube is rolled back on step 2 — the
+        # accelerator would disable itself before the predictor ever learns anything
+        # (§5.3.1 cold start). See PredictorConfig.mu_init / log_var_init.
+        nn.init.constant_(self.mu_head.bias, _inv_softplus(config.mu_init))
+        nn.init.constant_(self.var_head.bias, float(config.log_var_init))
+        # Small-weight init on the heads so the biases (not the random projections)
+        # dominate at step 0 and the cold-start certificate is actually calibrated.
+        nn.init.normal_(self.mu_head.weight, std=1e-3)
+        nn.init.normal_(self.var_head.weight, std=1e-3)
 
     def forward(self, features: Tensor) -> DamagePrediction:
         """``features`` is ``[B, in_dim]`` (B = number of tubes); returns batched μ, σ."""
-        h = checkpointed(self.trunk)(features) if self.training else self.trunk(features)
+        # No gradient checkpointing: the trunk is 3 layers of width 128, so its
+        # activations are a few hundred KB while recomputing them costs a second
+        # forward on every backward — the trade is inverted at this size (§P2-10).
+        h = self.trunk(features)
         mu = torch.nn.functional.softplus(self.mu_head(h))  # damage ≥ 0
+        if self.cfg.pin_full_zero:
+            # FULL is the *reference* the whole framework measures damage against:
+            # Stage A labels it as exactly zero (§1.5) and the allocator's benefit /
+            # cost arithmetic assumes it. Left free, softplus can emit μ[FULL] > μ[skip],
+            # and then upgrading toward FULL has negative benefit while downgrading is
+            # clamped to zero cost by ``max(0, ·)`` — a downgrade looks *free* and the
+            # allocation degenerates (§P1-12). Anchoring the column removes the
+            # degree of freedom instead of hoping training removes it.
+            keep = torch.ones_like(mu)
+            keep[..., int(Action.FULL)] = 0.0
+            mu = mu * keep
         if self.cfg.predict_log_variance:
             sigma = torch.exp(0.5 * self.var_head(h).clamp(-10.0, 10.0))
         else:
@@ -156,3 +179,10 @@ class DamagePredictor(nn.Module):
         if was_training:
             self.train()
         return DamagePrediction(mu=out.mu[0], sigma=out.sigma[0])
+
+
+def _inv_softplus(y: float) -> float:
+    """``x`` such that ``softplus(x) == y`` — so ``mu_head.bias`` init lands on ``μ₀``."""
+    y = max(float(y), 1e-6)
+    # log(exp(y) − 1), via expm1 for stability at small y (the regime we init in).
+    return float(math.log(math.expm1(y))) if y < 20.0 else y

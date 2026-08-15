@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 
 from cocf.common.config import Config
 from cocf.common.logging import get_logger
+from cocf.common.memory import autocast, resolve_dtype
 from cocf.core.accelerator import Accelerator
 from cocf.data import (
     CounterfactualLMDBDataset,
@@ -98,7 +99,20 @@ class JointTrainingStage:
         self.optimizer = optim.AdamW(
             self.trainable_params, lr=opt.lr, betas=opt.betas, weight_decay=opt.weight_decay
         )
-        self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
+        # AMP needs *both* halves: an autocast region for the forward (where the
+        # memory/throughput saving actually comes from) and a loss scaler for the
+        # backward. Only the scaler existed, so --mixed-precision bought scaling
+        # overhead and nothing else (§P2-9). The forward is wrapped in ``_autocast``
+        # below; the scaler is only meaningful for fp16 on CUDA.
+        self._amp_dtype = (
+            self.config.config.memory.amp_dtype if config.mixed_precision else "none"
+        )
+        use_scaler = (
+            config.mixed_precision
+            and str(self.device).startswith("cuda")
+            and resolve_dtype(self._amp_dtype) is torch.float16
+        )
+        self.scaler = torch.amp.GradScaler("cuda") if use_scaler else None
 
     # ------------------------------------------------------------------ #
     # data
@@ -109,7 +123,10 @@ class JointTrainingStage:
         ids = self.layout.read_split(split)
         if not ids:
             return None
-        dataset = CounterfactualLMDBDataset(self.layout.lmdb_dir, ids)
+        # Prompt embeddings are stored once per clip and joined on read (§P2-3).
+        dataset = CounterfactualLMDBDataset(
+            self.layout.lmdb_dir, ids, text_embed_dir=self.layout.text_embed_dir
+        )
         if len(dataset) == 0:
             return None
 
@@ -174,7 +191,10 @@ class JointTrainingStage:
                     for g in self.optimizer.param_groups:
                         g["lr"] = opt.lr * global_step / max(1, opt.warmup_steps)
 
-                total, comps = compute_joint_loss(self.accelerator, batch, training_cfg=self.train_cfg)
+                with autocast(str(self.device), self._amp_dtype):
+                    total, comps = compute_joint_loss(
+                        self.accelerator, batch, training_cfg=self.train_cfg
+                    )
                 self.optimizer.zero_grad(set_to_none=True)
                 max_norm = self.config.config.memory.max_grad_norm
                 if self.scaler is not None:

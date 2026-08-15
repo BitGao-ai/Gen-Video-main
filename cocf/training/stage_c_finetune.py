@@ -27,13 +27,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from cocf.common.config import Config, DataConfig
+from cocf.common.config import Config
 from cocf.common.logging import get_logger
 from cocf.core.accelerator import Accelerator
-from cocf.data import ProcessedLayout, VideoTextDataset, collate_video_samples
+from cocf.data import ProcessedLayout, RawFilteredDataset, collate_raw_filtered
 from cocf.engine import InferenceEngine
 from cocf.lcocf.predictor import build_predictor_input_batch
-from cocf.training.lora import inject_lora
+from cocf.training.checkpoint import build_checkpoint
+from cocf.training.lora import inject_lora, lora_state_dict
 from cocf.training.stage_b_losses import action_probs, budget_penalty
 from cocf.training.teacher_forward import TeacherForwardConfig, TeacherForwardRunner
 
@@ -84,8 +85,6 @@ class StageCConfig:
     checkpoint_dir: Path = Path("./checkpoints/stage_c")
     save_interval: int = 100
 
-    def __post_init__(self):
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 
 class FinettuneStage:
@@ -151,45 +150,34 @@ class FinettuneStage:
         # deterministic while parameters still receive gradient.
         self.accelerator.eval()
 
-        # Resolve the §4.2 data source: an explicit ``manifest_path`` wins, else the
-        # processed store's ``raw_filtered/captions.jsonl`` (written by Stage A).
-        # VideoTextDataset reads either as a {path/caption} manifest (its ``meta_file``).
-        #
-        # NOTE (ambiguous, intentionally not auto-resolved): the frame-sampling /
-        # bucketing params fall back to DataConfig defaults; thread the full
-        # ``Config.data`` into StageCConfig if Stage C must match the main run.
-        meta_file = ""
-        if self.config.manifest_path is not None:
-            meta_file = str(self.config.manifest_path)
-        elif self.config.processed_root is not None:
-            captions = ProcessedLayout(self.config.processed_root).raw_filtered_dir / "captions.jsonl"
-            meta_file = str(captions)
-        else:
+        # Resolve the §4.2 data source. ``RawFilteredDataset`` reads the processed
+        # store's ``raw_filtered/captions.jsonl`` (or a fallback manifest) as *metadata
+        # only* and carries each clip's ``video_id`` — two things that matter here:
+        # this stage never touches ``batch["video"]`` (it renders from the caption), so
+        # decoding clips was pure waste, and the ``video_id`` is what lets it fetch the
+        # ``Y_full`` Stage A already computed instead of re-denoising it (§P2-4).
+        if self.config.manifest_path is None and self.config.processed_root is None:
             _log.warning("Stage C: no --manifest or --processed-root given; nothing to train on.")
             return self.accelerator
-        data_cfg = DataConfig(
-            meta_file=meta_file,
-            num_workers=self.config.num_workers,
+        source = self.config.manifest_path or self.config.processed_root
+        dataset = RawFilteredDataset(
+            processed_root=self.config.processed_root,
+            manifest_path=self.config.manifest_path,
         )
-        dataset = VideoTextDataset(data_cfg)
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             shuffle=True,
-            # VideoSample is a dataclass; PyTorch's default collate can't stack it.
-            # collate_video_samples stacks shape-homogeneous (bucketed) clips into a
-            # batch dict, and pin_memory enables a faster async host→device copy on
-            # CUDA (a no-op on CPU).
-            collate_fn=collate_video_samples,
-            pin_memory=(self.device.type == "cuda"),
+            # Identity collate: the engine runs per clip because Y_full is per video.
+            collate_fn=collate_raw_filtered,
         )
 
-        _log.info(f"Stage C: {len(dataset)} videos, {len(dataloader)} batches")
+        _log.info(f"Stage C: {len(dataset)} clips, {len(dataloader)} batches")
         if len(dataloader) == 0:
             # No clips resolved (empty/missing manifest). Bail out cleanly instead of
             # dividing by a zero batch count in the epoch-average below.
-            _log.warning("Stage C: data source '%s' yielded no batches; skipping fine-tune.", meta_file)
+            _log.warning("Stage C: data source '%s' yielded no batches; skipping fine-tune.", source)
             return self.accelerator
 
         best_loss = float("inf")
@@ -225,19 +213,23 @@ class FinettuneStage:
                     )
 
                 if (batch_idx + 1) % self.config.save_interval == 0:
+                    # Created on first write, not in __post_init__: building a config
+                    # object should not touch the filesystem.
+                    self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                     ckpt_path = (
                         self.config.checkpoint_dir
                         / f"stage_c_epoch_{epoch+1}_batch_{batch_idx+1}.pt"
                     )
-                    torch.save(self.accelerator.state_dict(), ckpt_path)
+                    torch.save(self.checkpoint(), ckpt_path)
 
             avg_epoch_loss = epoch_loss / len(dataloader)
             _log.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
 
             if avg_epoch_loss < best_loss:
                 best_loss = avg_epoch_loss
+                self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 best_ckpt = self.config.checkpoint_dir / "stage_c_best.pt"
-                torch.save(self.accelerator.state_dict(), best_ckpt)
+                torch.save(self.checkpoint(), best_ckpt)
 
         _log.info("Stage C fine-tuning complete")
         return self.accelerator
@@ -258,14 +250,23 @@ class FinettuneStage:
         the L-COCF strength field + damage predictor — exactly the §4.2 gradient scope.
         """
         bb = self.accelerator.backbone
-        captions = list(batch["captions"])
+        captions = [item.caption for item in batch]
         if not captions:
             return torch.zeros((), device=self.device, requires_grad=True)
 
-        cond, grid, z_init = self._build_inputs(captions)
-
-        # Full-compute baseline on the *same* noise (the §4.2 主损失 reference; no grad).
-        y_full = self._full_baseline(z_init, cond, grid)
+        # Reuse Stage A's persisted baseline when it exists: it is the *same*
+        # computation, already paid for, and re-running it made every Stage-C step two
+        # full trajectories plus two decodes (§P2-4). It is only a valid reference for a
+        # run starting from the same noise, so z_T is loaded with it or neither is used.
+        video_ids = [item.video_id for item in batch]
+        grid = bb.token_grid(*self._frame_shape())
+        cached = self._cached_baseline(video_ids, grid)
+        if cached is not None:
+            z_init, y_full = cached
+            cond = bb.encode_text(captions).to(self.device)
+        else:
+            cond, grid, z_init = self._build_inputs(captions)
+            y_full = self._full_baseline(z_init, cond, grid)
 
         # Accelerated render with the differentiable decode + per-step feature capture.
         steps: list = []
@@ -289,6 +290,54 @@ class FinettuneStage:
     # §4.2 forward building blocks
     # ------------------------------------------------------------------ #
 
+    def _frame_shape(self):
+        d = self.config.config.data
+        return d.num_frames, d.height, d.width
+
+    def _cached_baseline(self, video_ids, grid):
+        """``(z_init, Y_full)`` from Stage A's level-3 bucket, or ``None``.
+
+        Requires *every* clip in the batch to have both halves, since the batch is
+        rendered in one engine call. Returns ``None`` — meaning "recompute" — for a
+        store built with ``--no-baseline`` (the documented way to skip the ~1 TB
+        bucket), and for a store whose geometry differs from this run's: Stage A may
+        have generated at another resolution or frame count, and a ``z_T`` of the
+        wrong token count would otherwise be reshaped into nonsense.
+        """
+        if self.config.processed_root is None:
+            return None
+        # Y_full is the full-compute render of a *specific* schedule. Reusing a
+        # 20-step baseline as the target for a 30-step accelerated run would charge
+        # the schedule difference to the accelerator, so the step counts must agree.
+        teacher_steps = self.config.config.teacher.num_inference_steps
+        if self.engine.engine_cfg.num_inference_steps != teacher_steps:
+            _log.warning(
+                "Stage C: engine runs %d steps but Stage A's baseline was generated "
+                "with %d — recomputing rather than comparing against a different "
+                "schedule.", self.engine.engine_cfg.num_inference_steps, teacher_steps,
+            )
+            return None
+        layout = ProcessedLayout(self.config.processed_root)
+        want = (grid.num_tokens, self.accelerator.backbone.hidden_dim)
+        zs, ys = [], []
+        for vid in video_ids:
+            z = layout.load_z_init(vid, device=self.device)
+            y = layout.load_y_full(vid, device=self.device)
+            if z is None or y is None:
+                return None
+            if tuple(z.shape[-2:]) != want:
+                _log.warning(
+                    "Stage C: %s was generated at token geometry %s but this run uses "
+                    "%s — recomputing the baseline instead of reusing it.",
+                    vid, tuple(z.shape[-2:]), want,
+                )
+                return None
+            zs.append(z.reshape(1, *z.shape[-2:]))
+            # Stage A stores Y_full as [F, 3, H, W] in [0, 1]; the loss compares
+            # against the engine's [B, 3, F, H, W] render, so restore that layout.
+            ys.append(y.permute(1, 0, 2, 3).contiguous())
+        return torch.cat(zs, dim=0), torch.stack(ys)
+
     def _build_inputs(self, captions):
         """Encode captions and sample the shared initial noise / token grid (§7.2)."""
         bb = self.accelerator.backbone
@@ -300,12 +349,19 @@ class FinettuneStage:
 
     def _full_baseline(self, z_init, cond, grid) -> Tensor:
         """Decode the un-accelerated baseline ``Y_full`` for the §4.2 main loss, on the
-        *same* initial noise as the accelerated run (label-only, no grad)."""
+        *same* initial noise as the accelerated run (label-only, no grad).
+
+        Run under ``grad_mode`` + ``no_grad`` rather than ``inference_mode``: the
+        reference is a *constant*, but it still gets multiplied against the accelerated
+        render in the semantic loss, and an inference tensor cannot be saved for
+        backward — it would raise the moment the §6.3.2 terms are evaluated. ``no_grad``
+        keeps the pass graph-free all the same, so nothing is paid for the correctness.
+        """
         tf_cfg = TeacherForwardConfig.from_config(self.config.config)
         tf_cfg.num_inference_steps = self.engine.engine_cfg.num_inference_steps
         runner = TeacherForwardRunner(self.accelerator, tf_cfg, device=self.device)
         bb = self.accelerator.backbone
-        with torch.no_grad():
+        with bb.grad_mode(True), torch.no_grad():
             z0, _ = runner.full_denoise(z_init, cond, grid)
             return bb.decode_latent(bb.to_grid(z0, grid))
 
@@ -390,9 +446,44 @@ class FinettuneStage:
     def _add_lora_adapters(self) -> None:
         """Inject LoRA into the backbone's last-``lora_layers`` DiT blocks (§4.2),
         storing the new trainable params. A logged no-op when the backbone exposes no
-        ``dit_blocks()`` (the plugin fine-tune still runs)."""
+        ``dit_blocks()`` (the plugin fine-tune still runs).
+
+        ``inject_lora`` materialises the backbone first: a real adapter builds its
+        transformer lazily on the first forward, and this runs at *construction* —
+        long before any forward — so without that the injection saw no blocks and
+        ``--use_lora`` was a silent no-op.
+        """
         self._lora_params, self._lora_modules = inject_lora(
             self.accelerator.backbone,
+            rank=self.config.lora_rank,
+            alpha=self.config.lora_alpha,
+            last_n_blocks=self.config.lora_layers,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Checkpointing (the adapters live inside the frozen backbone)
+    # ------------------------------------------------------------------ #
+
+    def lora_state_dict(self) -> Dict[str, Tensor]:
+        """Trained LoRA weights, or ``{}`` when LoRA is off / was not injected.
+
+        ``Accelerator.state_dict()`` cannot carry these — the backbone is a plain
+        attribute by design — so Stage C's checkpoint must save them explicitly or the
+        fine-tune is discarded at the moment it finishes.
+        """
+        if not self._lora_params:
+            return {}
+        return lora_state_dict(self.accelerator.backbone)
+
+    def checkpoint(self) -> Dict[str, object]:
+        """Full Stage-C checkpoint: plugin weights + LoRA adapters + their geometry.
+
+        The rank / target-block count are stored alongside the tensors because the
+        adapters must be re-injected with the *same* geometry before they can be
+        loaded back (see :func:`cocf.training.lora.attach_lora`).
+        """
+        return build_checkpoint(
+            self.accelerator,
             rank=self.config.lora_rank,
             alpha=self.config.lora_alpha,
             last_n_blocks=self.config.lora_layers,

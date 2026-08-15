@@ -29,7 +29,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from cocf.common.logging import setup_logging
+from cocf.common.logging import get_logger, setup_logging
 from cocf.data.processed_layout import ProcessedLayout
 from cocf.data.sample_store import CounterfactualLMDBDataset
 from cocf.training.stage_a_data_gen import finalize_processed_store
@@ -59,7 +59,10 @@ def main():
     args = parser.parse_args()
 
     setup_logging(level=logging.INFO)
-    log = logging.getLogger(__name__)
+    # setup_logging attaches the stdout handler to the "cocf" logger and sets
+    # propagate=False, so a bare getLogger("__main__") would emit nothing at
+    # INFO — this script's own progress lines included.
+    log = get_logger("cocf.rebuild_index")
 
     layout = ProcessedLayout(args.processed_root)
     if not layout.lmdb_dir.exists():

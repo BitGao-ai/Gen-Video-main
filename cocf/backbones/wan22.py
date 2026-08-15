@@ -92,6 +92,53 @@ class Wan22Backbone(Wan21Backbone):
         self.boundary_ratio: Optional[float] = None if br is None else float(br)
         self.num_train_timesteps = int(extra.get("num_train_timesteps", 1000))
 
+    # -- VAE geometry, read from the checkpoint's own config -------------- #
+
+    @staticmethod
+    def _vae_latent_channels(vae: nn.Module) -> Optional[int]:
+        """Latent channel count from the VAE config (``z_dim`` on Wan, else the
+        generic ``latent_channels``). ``None`` when neither is present."""
+        cfg = getattr(vae, "config", None)
+        for key in ("z_dim", "latent_channels"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    @staticmethod
+    def _detect_vae_compress(vae: nn.Module) -> Optional[Tuple[int, int, int]]:
+        """``(t, h, w)`` compression from the VAE config, or ``None`` if unstated.
+
+        Read from config rather than by walking ``encoder.down_blocks[*].downsamplers``:
+        that is the 2-D ``AutoencoderKL``/UNet layout, and ``AutoencoderKLWan``'s blocks
+        expose no such attribute — so the walk always fell through with a product of 1
+        and reported ``(1, 1, 1)``, overwriting the correct ``(4, 8, 8)`` and inflating
+        the token grid by 4·8·8 = 256×. (It also crashed outright on any block that
+        *defines* ``downsamplers = None``.)
+
+        Returning ``None`` when the config says nothing is the important part: the
+        adapter's declared ``vae_compress`` is then left alone. A geometry guess that
+        can be wrong is worse than no guess — it silently reshapes every latent.
+        """
+        cfg = getattr(vae, "config", None)
+        if cfg is None:
+            return None
+
+        temporal = getattr(cfg, "temporal_compression_ratio", None)
+        spatial = getattr(cfg, "spatial_compression_ratio", None)
+        if isinstance(temporal, int) and isinstance(spatial, int):
+            return temporal, spatial, spatial
+
+        # Wan's VAE states its downsampling schedule as a per-stage bool list (the
+        # upstream field carries a typo, so accept both spellings). This is the same
+        # derivation ``WanPipeline`` uses: 2**sum for time, 2**len for space.
+        stages = getattr(cfg, "temperal_downsample", None)
+        if stages is None:
+            stages = getattr(cfg, "temporal_downsample", None)
+        if isinstance(stages, (list, tuple)) and stages:
+            return 2 ** int(sum(bool(s) for s in stages)), 2 ** len(stages), 2 ** len(stages)
+        return None
+
     # -- component construction (adds the low-noise expert) ------------- #
 
     def _load(self) -> None:
@@ -101,8 +148,41 @@ class Wan22Backbone(Wan21Backbone):
         path = self.config.model_path
         extra = self.config.extra or {}
         self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae")
+        # Adapt to the *actual* checkpoint's geometry where its config states it, so
+        # A14B / TI2V-5B need no per-variant hardcoding. Each half is independent and
+        # only applied when genuinely found — an unstated value leaves the declared
+        # default (from ``extra`` or the class) in place.
+        vae_lc = self._vae_latent_channels(self.vae)
+        if vae_lc is not None and vae_lc != self._latent_channels:
+            _log.info(
+                "%s: overriding latent_channels %d → %d to match the VAE config",
+                type(self).__name__, self._latent_channels, vae_lc,
+            )
+            self._latent_channels = vae_lc
+            pt, ph, pw = self.patch
+            self._token_dim = self._latent_channels * pt * ph * pw
+        detected = self._detect_vae_compress(self.vae)
+        if detected is not None and detected != self.vae_compress:
+            _log.info(
+                "%s: overriding vae_compress %s → %s to match the VAE config",
+                type(self).__name__, self.vae_compress, detected,
+            )
+            self.vae_compress = detected
         # High-noise expert (always present).
         self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer")
+        # Cross-check transformer in_channels — should already match from the VAE
+        # detection above, but guard against mismatched checkpoints.
+        ckpt_channels = getattr(self.transformer.config, "in_channels", None)
+        if ckpt_channels is not None and ckpt_channels != self._latent_channels:
+            _log.warning(
+                "%s: transformer.config.in_channels=%d differs from "
+                "_latent_channels=%d (vae.config.latent_channels=%s); overriding "
+                "to match transformer",
+                type(self).__name__, ckpt_channels, self._latent_channels, vae_lc,
+            )
+            self._latent_channels = ckpt_channels
+            pt, ph, pw = self.patch
+            self._token_dim = self._latent_channels * pt * ph * pw
         # Low-noise expert (A14B MoE). Absent on single-expert checkpoints ⇒ fall back
         # to single-denoiser denoising rather than failing the load.
         if self.boundary_ratio is not None:
@@ -233,7 +313,9 @@ class Wan22Backbone(Wan21Backbone):
         out = expert(  # type: ignore[misc]
             hidden_states=latent_grid,
             timestep=timestep,
-            encoder_hidden_states=cond.embeds.to(self.device, self.dtype),
+            # Trimmed to the prompt's real length, with the mask where supported —
+            # see :meth:`DiffusersVideoBackbone._text_kwargs` (§P1-15).
+            **self._text_kwargs(cond, expert),
             return_dict=True,
         )
         eps = out.sample if hasattr(out, "sample") else out[0]
@@ -268,3 +350,18 @@ class Wan22Backbone(Wan21Backbone):
             low = self._blocks_of(self.transformer_2)
             targets.extend(low[-last_n:] if last_n > 0 else low)
         return targets
+
+    def lora_roots(self) -> List[Tuple[str, nn.Module]]:
+        """Both experts, separately named, so their LoRA checkpoint keys never collide.
+
+        The two experts are structurally identical, so a single root would give
+        ``blocks.39.attn1.to_q`` for *both* — the low-noise adapter would silently
+        overwrite the high-noise one on save and be loaded into the wrong expert on
+        restore. Naming them apart keeps a Stage-C checkpoint round-trippable.
+        """
+        roots: List[Tuple[str, nn.Module]] = []
+        if self.transformer is not None:
+            roots.append(("transformer", self.transformer))
+        if self.transformer_2 is not None:
+            roots.append(("transformer_2", self.transformer_2))
+        return roots

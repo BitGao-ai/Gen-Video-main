@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -57,9 +57,11 @@ from cocf.lcocf.strength import CausalStrengthFeatureBuilder, StrengthFeatures
 Tensor = torch.Tensor
 _log = logging.getLogger(__name__)
 
-# Per-action relative compute cost C(a) ∝ |g_k| (mirrors AllocatorConfig.action_cost
-# / TransitionExecutor's FULL/LOWFREQ/INTERP/ANCHOR tiers). FULL=1, ANCHOR=0.
-ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.45, 0.15, 0.0)
+# Per-action relative compute cost C(a) ∝ |g_k| — the fraction of a tube's tokens the
+# denoiser actually recomputes, matching AllocatorConfig.action_cost and the executor's
+# FULL/LOWFREQ/INTERP/ANCHOR tiers. FULL=1; LOWFREQ=1/stride² (the executor is
+# authoritative, see ``_cost_label``); INTERP/ANCHOR run no denoiser at all, so 0.
+ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.25, 0.0, 0.0)
 
 
 def _to_np(x: Optional[Tensor]) -> Optional[np.ndarray]:
@@ -126,6 +128,12 @@ class COCFTrainingSample:
     interaction_density: float = 0.0      # 0-1: how much this tube interacts (§4.1)
     strength_level: int = 1               # StrengthLevel prior (HIGH=0/MID=1/LOW=2)
     step_frac: float = 0.0                # t / T ∈ [0,1] (denoising phase)
+    # δ = ‖z_full − z_action‖ on the tube's tokens at the intervened step — the same
+    # quantity the inference-time certificate feeds its λ_res term. Recorded here so
+    # Stage B can calibrate that coefficient against a real signal instead of the
+    # hard zero it used to pass, which left λ_res (and λ_cmsc) stuck at their inits
+    # for the whole run (§P1-13).
+    skip_residual: float = 0.0
     tube_token_count: int = 0             # |g_k| latent tokens (cost context, §2.2)
     tube_pixels: int = 0                  # region size in pixels (diagnostic)
     tube_stability: float = 1.0           # identity stability ∈ [0,1]
@@ -150,7 +158,9 @@ class COCFTrainingSample:
             "uncertainty": _to_np(self.uncertainty),
             "tube_visual_embed_full": _to_np(self.tube_visual_embed_full),
             "tube_visual_embed_cf": _to_np(self.tube_visual_embed_cf),
-            "text_embed": _to_np(self.text_embed),
+            # ``text_embed`` is deliberately absent: it is per-*clip* data and is
+            # stored once under ``text_embeds/<video_id>.pt``, then joined back by
+            # the reader (§P2-3). Writing it here duplicated ~8 MiB per sample.
             # long scalars
             "action": int(self.action),
             "timestep": int(self.timestep),
@@ -159,6 +169,7 @@ class COCFTrainingSample:
             "strength_level": int(self.strength_level),
             # float scalars
             "step_frac": float(self.step_frac),
+            "skip_residual": float(self.skip_residual),
             "interaction_density": float(self.interaction_density),
             "tube_stability": float(self.tube_stability),
             # strings
@@ -192,6 +203,7 @@ class COCFTrainingSample:
             interaction_density=float(d.get("interaction_density", 0.0)),
             strength_level=int(d.get("strength_level", 1)),
             step_frac=float(d.get("step_frac", 0.0)),
+            skip_residual=float(d.get("skip_residual", 0.0) or 0.0),
             tube_token_count=int(d.get("tube_token_count", 0)),
             tube_pixels=int(d.get("tube_pixels", 0)),
             tube_stability=float(d.get("tube_stability", 1.0)),
@@ -222,7 +234,10 @@ class CounterfactualDamageComputer:
         self.damage_computer = MultiDimDamageComputer(eps=axis_eps)
         self.damage_weights = damage_weights or DEFAULT_DAMAGE_WEIGHTS
 
-    def reference_features(self, video_full: Tensor, prompt: str) -> VideoFeatures:
+    def reference_features(
+        self, video_full: Tensor, prompt: str,
+        tube_masks: Optional[Dict[int, Tensor]] = None,
+    ) -> VideoFeatures:
         """Extract the reference-side features once, for reuse across rollouts.
 
         ``video_full`` is fixed for a whole :class:`TeacherTrajectory` while dozens
@@ -230,8 +245,12 @@ class CounterfactualDamageComputer:
         sample burns a full DINOv2+CLIP+RAFT pass (and its peak VRAM) every time
         for a bit-identical result. Callers hoist this out of their loop and hand
         it to :meth:`compute_damage`.
+
+        ``tube_masks`` requests the per-tube identity features the localised damage
+        axes need (§7.1.1). Pass every tube that will be scored against this
+        reference: they are computed once here rather than once per rollout.
         """
-        return self.metric_extractor.extract(video_full, prompt)
+        return self.metric_extractor.extract(video_full, prompt, tube_masks=tube_masks)
 
     def compute_damage(
         self,
@@ -240,6 +259,7 @@ class CounterfactualDamageComputer:
         prompt: str,
         tube_mask: Optional[Tensor] = None,  # [F, H, W] binary: 1 inside tube
         *,
+        tube_id: Optional[int] = None,
         feats_full: Optional[VideoFeatures] = None,
     ) -> Tuple[Tensor, Dict[str, float]]:
         """Compute multi-dim damage vector for a counterfactual pair.
@@ -248,7 +268,13 @@ class CounterfactualDamageComputer:
             video_full: Full-compute reference video.
             video_cf: Counterfactual video (with action applied).
             prompt: Text prompt (for CLIP scoring).
-            tube_mask: Optional per-frame mask for localized damage.
+            tube_mask: Per-frame ``[F, H, W]`` mask of the intervened tube. Supplying
+                it (with ``tube_id``) localises the identity axes to that tube — the
+                §7.1.1 tube-group counterfactual. Without it the label is global, so
+                two different tubes intervened at the same step get nearly the same
+                damage and the predictor cannot learn a per-tube difference.
+            tube_id: Identifies which entry of ``feats_full.tube_dino`` to compare
+                against; must match the key used when the reference was extracted.
             feats_full: Pre-extracted reference features from
                 :meth:`reference_features`. Extracted on demand when omitted.
 
@@ -256,15 +282,21 @@ class CounterfactualDamageComputer:
             damage_vector: [NUM_DAMAGE_DIMS] ∈ [0,1]
             per_axis_dict: {axis_name: scalar_value} for diagnostics
         """
-        # Extract features from both videos (once each)
+        # Localise only when both halves are available; a tube_id whose reference
+        # features were never extracted would silently fall back to global anyway.
+        masks = (
+            {tube_id: tube_mask}
+            if (tube_mask is not None and tube_id is not None) else None
+        )
         if feats_full is None:
-            feats_full = self.metric_extractor.extract(video_full, prompt)
-        feats_cf = self.metric_extractor.extract(video_cf, prompt)
+            feats_full = self.metric_extractor.extract(video_full, prompt, tube_masks=masks)
+        localise = tube_id if (masks and tube_id in feats_full.tube_dino) else None
+        feats_cf = self.metric_extractor.extract(video_cf, prompt, tube_masks=masks)
 
         # Compute multi-dimensional damage. ``compute`` returns the per-axis dict
         # {axis_name: value}; convert it to the ordered [NUM_DAMAGE_DIMS] tensor via
         # ``as_vector`` before doing any tensor ops on it.
-        per_axis = self.damage_computer.compute(feats_full, feats_cf)
+        per_axis = self.damage_computer.compute(feats_full, feats_cf, tube_id=localise)
         damage_vec = self.damage_computer.as_vector(per_axis, device=video_full.device)
 
         return damage_vec.clamp(0, 1), per_axis
@@ -313,8 +345,6 @@ class StratifiedSamplingConfig:
 
     # General parameters
     samples_per_prompt: int = 3  # sample 3 seeds per prompt (§7.1.1)
-    interpolation_interval: int = 5  # compute full damage every 5 steps, interpolate
-    use_label_interpolation: bool = True  # linear interpolation of damage labels
 
 
 class StratifiedSampler:
@@ -329,44 +359,6 @@ class StratifiedSampler:
     def __init__(self, config: StratifiedSamplingConfig, device: torch.device):
         self.config = config
         self.device = device
-
-    def sample_timesteps(self, total_steps: int) -> List[Tuple[int, str]]:
-        """Sample representative timesteps across temporal strata.
-
-        Args:
-            total_steps: Total number of denoising steps T.
-
-        Returns:
-            List of (timestep, stratum_name) tuples.
-        """
-        sampled = []
-        for stratum, (tmin_frac, tmax_frac, weight) in self.config.timestep_strata.items():
-            t_min = int(tmin_frac * total_steps)
-            t_max = int(tmax_frac * total_steps)
-
-            # Sample count proportional to weight
-            num_samples = max(1, int(weight * 5))  # ~5 samples total per video
-
-            ts = torch.linspace(t_min, t_max, num_samples, dtype=torch.long).tolist()
-            sampled.extend([(t, stratum) for t in ts])
-
-        return sorted(sampled, key=lambda x: -x[0])  # descending order
-
-    def sample_tubes(
-        self, tubes: List[SemanticTube], max_per_frame: int = 3
-    ) -> List[int]:
-        """Sample representative tubes by scene stability.
-
-        Prioritize stable (low-mutation) tubes so damage predictions converge faster.
-        """
-        if not tubes:
-            return []
-
-        # Sort by stability (proxy: tube length), take top-K
-        tubes_by_stability = sorted(
-            enumerate(tubes), key=lambda x: len(x[1]), reverse=True
-        )
-        return [idx for idx, _ in tubes_by_stability[:max_per_frame]]
 
     def sample_actions(self, num_samples: int = 4) -> List[int]:
         """The four compute actions per tube (§1.5: 分别施加 FULL/LOWFREQ/INTERP/ANCHOR).
@@ -383,63 +375,6 @@ class StratifiedSampler:
 
 # ============================================================================= #
 # Label interpolation (cost optimization, §7.1.1)
-# ============================================================================= #
-
-
-class DamageLabelInterpolator:
-    """Interpolate damage labels between computed timesteps to reduce cost.
-
-    Key insight: damage varies smoothly across timesteps, so computing full
-    damage at every 5th step and linearly interpolating neighboring steps
-    reduces cost by ~5× with acceptable accuracy loss.
-    """
-
-    def __init__(self, interval: int = 5):
-        self.interval = interval
-        self.cache: Dict[Tuple[int, int, int], Tensor] = {}  # (step, tube_id, action) → damage
-
-    def cache_damage(self, step: int, tube_id: int, action: int, damage: Tensor) -> None:
-        """Store computed damage for later interpolation."""
-        self.cache[(step, tube_id, action)] = damage.clone()
-
-    def interpolate(
-        self, step: int, tube_id: int, action: int, num_total_steps: int
-    ) -> Optional[Tensor]:
-        """Retrieve or interpolate damage at the given step.
-
-        If step % interval == 0, return cached value.
-        Otherwise, linearly interpolate from neighbors.
-        """
-        key = (step, tube_id, action)
-        if key in self.cache:
-            return self.cache[key]
-
-        # Find nearest cached neighbors. The cache is keyed by the full
-        # (step, tube_id, action) tuple, so neighbor lookups must rebuild that
-        # tuple — an integer step alone never matches a tuple key.
-        step_lo = (step // self.interval) * self.interval
-        step_hi = step_lo + self.interval
-        key_lo = (step_lo, tube_id, action)
-        key_hi = (step_hi, tube_id, action)
-
-        if key_lo not in self.cache or key_hi not in self.cache:
-            # Can't interpolate; skip
-            return None
-
-        damage_lo = self.cache[key_lo]
-        damage_hi = self.cache[key_hi]
-
-        # Linear interpolation
-        alpha = (step - step_lo) / (step_hi - step_lo)
-        interpolated = (1 - alpha) * damage_lo + alpha * damage_hi
-
-        return interpolated.clamp(0, 1)
-
-
-# ============================================================================= #
-# Teacher-forward outputs the generator runs counterfactuals against (§1.3–§1.4)
-# ============================================================================= #
-
 
 @dataclass
 class TeacherTrajectory:
@@ -466,12 +401,35 @@ class TeacherTrajectory:
     tube_visual_embed_full: Dict[int, Tensor]       # tube_id -> [d_v]
     num_total_steps: int
     text_embed: Optional[Tensor] = None             # [L, d_c] (cond.embeds[0])
+    # z_T the baseline was generated from. Persisted alongside Y_full so Stage C can
+    # start its accelerated run on the *same* noise and compare against the stored
+    # reference instead of re-denoising the whole trajectory itself (§P2-4).
+    z_init: Optional[Tensor] = None                 # [1, N, d]
 
 
 def _frames_fchw(video: Tensor) -> Tensor:
     """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]`` in [0,1]."""
     v = video[0] if video.dim() == 5 else video
     return v.permute(1, 0, 2, 3).contiguous().clamp(0.0, 1.0)
+
+
+def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube) -> Tensor:
+    """``[F, Hp, Wp]`` bool: the tube's latent masks upsampled to pixel resolution.
+
+    The damage extractor works on pixels while a tube carries latent-grid masks, so
+    this is the bridge that lets a label be scored on the region the counterfactual
+    actually intervened on (§7.1.1).
+    """
+    f, _, hp, wp = video_fchw.shape
+    out = torch.zeros(f, hp, wp, dtype=torch.bool, device=video_fchw.device)
+    for frame, mask in tube.masks_by_frame.items():
+        if not (0 <= frame < f) or mask is None:
+            continue
+        up = F.interpolate(
+            mask[None, None].float(), size=(hp, wp), mode="nearest"
+        )[0, 0] > 0.5
+        out[frame] = up.to(out.device)
+    return out
 
 
 def tube_clip_embed(
@@ -507,6 +465,9 @@ def tube_clip_embed(
 
 # ============================================================================= #
 # Full counterfactual data generation pipeline (§1.5)
+# ============================================================================= #
+
+
 # ============================================================================= #
 
 
@@ -558,7 +519,6 @@ class COCFDataGenerator:
         self.free_memory_every = max(0, int(free_memory_every))
 
         self.sampler = StratifiedSampler(self.sampling_config, device)
-        self.interpolator = DamageLabelInterpolator(self.sampling_config.interpolation_interval)
 
     def generate(
         self,
@@ -582,61 +542,101 @@ class COCFDataGenerator:
         samples: List[COCFTrainingSample] = []
         # The reference side of every damage comparison below is the same
         # ``traj.video_full``; extract its features once instead of once per
-        # (tube, step, action, seed).
-        feats_full = self.damage_computer.reference_features(traj.video_full, traj.prompt)
+        # (tube, step, action, seed). The per-tube masks go in here too, so each
+        # selected tube's localised identity reference is computed once per clip
+        # rather than once per rollout (§7.1.1 / §P1-4).
+        tube_masks: Dict[int, Tensor] = {
+            traj.tubes[ti].tube_id: tube_pixel_mask(traj.video_full, traj.tubes[ti])
+            for ti in tube_idx_sel
+        }
+        feats_full = self.damage_computer.reference_features(
+            traj.video_full, traj.prompt, tube_masks=tube_masks
+        )
 
-        for step_idx in steps:
+        for step_idx, ti, a in self._balanced_triplets(
+            steps, tube_idx_sel, actions, max_samples
+        ):
             t = traj.num_total_steps - step_idx          # countdown timestep
             step_frac = t / max(1, traj.num_total_steps)
-            for ti in tube_idx_sel:
-                if len(samples) >= max_samples:
-                    break
-                tube = traj.tubes[ti]
-                tid = tube.tube_id
-                state = traj.tube_states[tid]
-                feats = traj.strength_feats[tid]
-                for a in actions:
-                    if len(samples) >= max_samples:
-                        break
-                    action = Action(a)
-                    damage, unc, cost, y_cf, per_axis = self._counterfactual_labels(
-                        traj, step_idx, tube, action, backbone, transition,
-                        feats_full=feats_full,
-                    )
-                    samples.append(
-                        COCFTrainingSample(
-                            tube_features=state.as_tensor(),
-                            timestep=int(t),
-                            action=int(action),
-                            damage_label=damage,
-                            damage_per_axis=per_axis,
-                            strength_features=feats.as_tensor(),
-                            cost_label=cost,
-                            uncertainty=unc,
-                            tube_visual_embed_full=traj.tube_visual_embed_full.get(tid),
-                            tube_visual_embed_cf=self._tube_visual_embed(y_cf, tube, traj.grid),
-                            text_embed=traj.text_embed,
-                            prompt=traj.prompt,
-                            video_id=traj.video_id,
-                            tube_id=tid,
-                            scene_type=traj.scene_type,
-                            interaction_density=float(min(max(state.interaction, 0.0), 1.0)),
-                            strength_level=int(self._strength_level(feats)),
-                            step_frac=float(step_frac),
-                            tube_token_count=int(tube.size),
-                            tube_pixels=self._count_tube_pixels(tube),
-                            tube_stability=float(state.identity_confidence),
-                        )
-                    )
-                    # Coarse backstop to the per-rollout reclaim in
-                    # :meth:`_counterfactual_labels`: catches the zeroth seed's clip
-                    # (held until the sample is built) and the metric backbones'
-                    # residue. ``empty_cache`` is a synchronising call, hence the
-                    # cadence rather than per-sample.
-                    if self.free_memory_every and len(samples) % self.free_memory_every == 0:
-                        free_memory()
+            tube = traj.tubes[ti]
+            tid = tube.tube_id
+            state = traj.tube_states[tid]
+            feats = traj.strength_feats[tid]
+            action = Action(a)
+            damage, unc, cost, y_cf, per_axis = self._counterfactual_labels(
+                traj, step_idx, tube, action, backbone, transition,
+                feats_full=feats_full, tube_mask=tube_masks.get(tid),
+            )
+            samples.append(
+                COCFTrainingSample(
+                    tube_features=self._state_for(state, action).as_tensor(),
+                    timestep=int(t),
+                    action=int(action),
+                    damage_label=damage,
+                    damage_per_axis=per_axis,
+                    strength_features=feats.as_tensor(),
+                    cost_label=cost,
+                    uncertainty=unc,
+                    tube_visual_embed_full=traj.tube_visual_embed_full.get(tid),
+                    tube_visual_embed_cf=self._tube_visual_embed(y_cf, tube, traj.grid),
+                    text_embed=traj.text_embed,
+                    prompt=traj.prompt,
+                    video_id=traj.video_id,
+                    tube_id=tid,
+                    scene_type=traj.scene_type,
+                    interaction_density=float(min(max(state.interaction, 0.0), 1.0)),
+                    strength_level=int(self._strength_level(feats)),
+                    step_frac=float(step_frac),
+                    skip_residual=float(getattr(self, "_last_residual", 0.0)),
+                    tube_token_count=int(tube.size),
+                    tube_pixels=self._count_tube_pixels(tube),
+                    tube_stability=float(state.identity_confidence),
+                )
+            )
+            # Coarse backstop to the per-rollout reclaim in
+            # :meth:`_counterfactual_labels`: catches the zeroth seed's clip
+            # (held until the sample is built) and the metric backbones'
+            # residue. ``empty_cache`` is a synchronising call, hence the
+            # cadence rather than per-sample.
+            if self.free_memory_every and len(samples) % self.free_memory_every == 0:
+                free_memory()
         _log.debug("Generated %d counterfactual samples for %s", len(samples), traj.video_id)
         return samples
+
+    @staticmethod
+    def _balanced_triplets(
+        steps: Sequence[int],
+        tube_idx_sel: Sequence[int],
+        actions: Sequence[int],
+        max_samples: int,
+    ) -> List[Tuple[int, int, int]]:
+        """``(step_idx, tube_idx, action)`` triplets ordered so truncation stays balanced.
+
+        The generator can only afford ``max_samples`` rollouts per clip, and the order
+        in which candidates are visited therefore *is* the sampling design. Nested
+        loops with an inner ``break`` visit the whole (tube × action) grid of the first
+        representative step before reaching the second, so a cap of 15 against 4 tubes ×
+        4 actions = 16 candidates per step drew **every** sample from the earliest step
+        (§P1-5). The predictor then saw one denoising phase while inference asks it to
+        decide on all of them, leaving ``step_frac`` a constant it cannot use.
+
+        Interleaving across steps first — one triplet from each step per round, cycling
+        actions before tubes — makes any prefix of the sequence balanced: steps differ
+        by at most one sample, and actions are evenly spread inside each step.
+        """
+        per_step: Dict[int, List[Tuple[int, int, int]]] = {}
+        for s in steps:
+            # actions vary fastest so a short prefix still covers all four
+            per_step[s] = [(s, ti, a) for ti in tube_idx_sel for a in actions]
+        out: List[Tuple[int, int, int]] = []
+        for round_i in range(max(len(v) for v in per_step.values()) if per_step else 0):
+            for s in steps:
+                bucket = per_step[s]
+                if round_i < len(bucket):
+                    out.append(bucket[round_i])
+                    if len(out) >= max_samples:
+                        return out
+        return out
 
     # ------------------------------------------------------------------ #
     # single-hop counterfactual rollout (§1.5)
@@ -652,6 +652,7 @@ class COCFDataGenerator:
         transition: TransitionExecutor,
         *,
         feats_full: Optional[VideoFeatures] = None,
+        tube_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float]]:
         """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis)``.
 
@@ -664,6 +665,7 @@ class COCFDataGenerator:
         rollouts of a trajectory compare against the same ``traj.video_full``).
         """
         cost = self._cost_label(action, transition)
+        self._last_residual = 0.0
         if action == Action.FULL:
             zero = torch.zeros(NUM_DAMAGE_DIMS)
             return zero, zero.clone(), cost, traj.video_full, {ax: 0.0 for ax in DAMAGE_DIMENSIONS}
@@ -678,7 +680,8 @@ class COCFDataGenerator:
             )
             y_cf = self._rollout(z0, step_idx, tube, action, traj, backbone, transition)
             dmg, per_axis = self.damage_computer.compute_damage(
-                traj.video_full, y_cf, traj.prompt, feats_full=feats_full
+                traj.video_full, y_cf, traj.prompt, tube_mask,
+                tube_id=tube.tube_id, feats_full=feats_full,
             )
             dmgs.append(dmg)
             if k == 0:
@@ -719,6 +722,14 @@ class COCFDataGenerator:
         out = backbone.denoise(z_t, t_now, cond, grid=grid, active_mask=None, cache=None)
         z_full = backbone.scheduler_step(out.cache.model_output, t_now, t_next, z_t)
         z = self._apply_action_to_tube(z_full, z_t, tube, action, grid, transition)
+        # δ_k at the intervened step: exactly the quantity RAEC's certificate weights
+        # with λ_res at inference. Measuring it here gives Stage B a real signal to
+        # calibrate that coefficient against (§P1-13).
+        idx = tube.all_token_indices().to(z.device)
+        self._last_residual = float(
+            (z_full.index_select(1, idx) - z.index_select(1, idx))
+            .pow(2).mean().sqrt().item()
+        ) if idx.numel() else 0.0
         # continue all-FULL (dense) to z_0 — single-hop: only step t was intervened
         for s in range(step_idx + 1, T):
             ts = T - s
@@ -742,41 +753,56 @@ class COCFDataGenerator:
         idx = tube.all_token_indices().to(z_full.device)
         if idx.numel() == 0:
             return z_full
+        if action == Action.INTERP:
+            # temporal interpolation via the shared inference realisation (it returns
+            # its own copy, so do not pre-clone: these rollouts run ~90× per clip and
+            # a full-latent clone each is pure waste). ``freeze_to=z_prev`` mirrors the
+            # executor's single-frame fallback — without it a one-frame tube's INTERP
+            # label would be identical to FULL (zero damage) while inference freezes it.
+            return transition.interp_temporal(z_full, tube, grid, freeze_to=z_prev)
+        if action == Action.LOWFREQ:
+            # strided subsample + nearest upsample via the shared inference realisation
+            return transition.coarsen_lowfreq(z_full, tube, grid)
         z_cf = z_full.clone()
         if action == Action.ANCHOR:
             # freeze: the tube does not advance this step (reuse the pre-step latent)
             z_cf.index_copy_(1, idx, z_prev.index_select(1, idx).to(z_cf.dtype))
-        elif action == Action.INTERP:
-            self._interp_tube(z_cf, tube)
-        elif action == Action.LOWFREQ:
-            # strided subsample + nearest upsample via the shared inference realisation
-            z_cf = transition.coarsen_lowfreq(z_cf, tube, grid)
         return z_cf
 
     @staticmethod
-    def _interp_tube(z_cf: Tensor, tube: SemanticTube) -> None:
-        """INTERP model: replace each frame's tube tokens with the temporally
-        interpolated mean of its neighbouring frames (loses within-frame detail and
-        motion — the temporal-interpolation lag the action induces)."""
-        frames = tube.frames
-        if len(frames) < 2:
-            return
-        means = {
-            f: z_cf[:, tube.tokens_by_frame[f].to(z_cf.device)].mean(1)  # [B, d]
-            for f in frames
-        }
-        for i, f in enumerate(frames):
-            lo = frames[max(0, i - 1)]
-            hi = frames[min(len(frames) - 1, i + 1)]
-            interp = 0.5 * (means[lo] + means[hi])
-            idx = tube.tokens_by_frame[f].to(z_cf.device)
-            z_cf[:, idx] = interp.unsqueeze(1).expand(-1, idx.numel(), -1).to(z_cf.dtype)
+    def _state_for(state: TubeState, action: Action) -> TubeState:
+        """The tube state to record *alongside this action's label* (§P1-3).
+
+        ``anchor_age`` is one of the 7 predictor inputs, so it must describe the world
+        the label was measured in. The ANCHOR rollout freezes the tube to the latent of
+        the **immediately preceding** step (``z_prev``), i.e. an anchor exactly one step
+        old — but the teacher's tube state carries the builder's default ``age = 0``,
+        teaching the predictor that this damage occurs at zero staleness.
+
+        Inference reuses an anchor that may be several steps old. That residual gap is
+        priced separately and deliberately: the certificate's ``λ_age · age/(age+τ)``
+        term (§5.3.1) models staleness on top of μ. Labelling the age the rollout
+        actually used is what makes that decomposition sound — μ becomes "the damage of
+        a one-step-old anchor" rather than "of an anchor of unknown age".
+        """
+        if action != Action.ANCHOR:
+            return state
+        return dataclass_replace(state, anchor_age=1.0)
 
     def _cost_label(self, action: Action, transition: TransitionExecutor) -> Tensor:
-        """``[FLOPs frac, active-token frac]`` of the action (§1.5 计算成本标签)."""
+        """``[relative compute cost, active-token fraction]`` of the action (§1.5).
+
+        Both entries are derived from the executor's own stride, so the label cannot
+        contradict itself: the store used to carry ``action_cost[LOWFREQ] = 0.45``
+        beside an active fraction of ``1/stride² = 0.25`` for the same sample, and a
+        cost head trained on that learns an average of two incompatible claims
+        (§P1-6). Under the corrected model the compute cost *is* the fraction of the
+        tube's tokens the denoiser recomputes, so the two agree by construction — kept
+        as two fields only because the on-disk schema is shared with older stores.
+        """
         stride = max(1, transition.lowfreq_stride)
         active = (1.0, 1.0 / (stride * stride), 0.0, 0.0)[int(action)]
-        return torch.tensor([self.action_cost[int(action)], active], dtype=torch.float32)
+        return torch.tensor([active, active], dtype=torch.float32)
 
     # ------------------------------------------------------------------ #
     # feature extraction (real, no placeholders)
@@ -832,58 +858,3 @@ class COCFDataGenerator:
         if not tube.masks_by_frame:
             return 0
         return int(sum(int(m.sum()) for m in tube.masks_by_frame.values()))
-
-
-# ============================================================================= #
-# Utilities for data caching & batch processing
-# ============================================================================= #
-
-
-class CounterfactualDataCache:
-    """Caches full-compute outputs to amortize cost across multiple counterfactuals.
-
-    Stores:
-        - Latent trajectory z_t for each timestep
-        - Attention cache KV for each step
-        - Semantic tube annotations
-        - Strength features
-    """
-
-    def __init__(self, max_cache_mb: int = 1024):
-        self.max_cache_mb = max_cache_mb
-        self.z_trajectory: Dict[int, Tensor] = {}
-        self.kv_cache: Dict[int, Dict[str, Tensor]] = {}
-        self.tubes_by_step: Dict[int, List[SemanticTube]] = {}
-        self.strength_features: Dict[int, StrengthFeatures] = {}
-
-    def cache_latent(self, step: int, z: Tensor) -> None:
-        """Store latent for the given timestep (move to CPU if full)."""
-        self.z_trajectory[step] = z.cpu()
-
-    def get_latent(self, step: int, device: torch.device) -> Optional[Tensor]:
-        """Retrieve latent, moving back to device."""
-        if step in self.z_trajectory:
-            return self.z_trajectory[step].to(device)
-        return None
-
-    def cache_tubes(self, step: int, tubes: List[SemanticTube]) -> None:
-        """Store tube annotations."""
-        self.tubes_by_step[step] = tubes
-
-    def cache_strength_features(self, step: int, feats: StrengthFeatures) -> None:
-        """Store pre-computed strength features."""
-        self.strength_features[step] = feats
-
-    def clear(self) -> None:
-        """Clear all cached data."""
-        self.z_trajectory.clear()
-        self.kv_cache.clear()
-        self.tubes_by_step.clear()
-        self.strength_features.clear()
-
-    def memory_mb(self) -> float:
-        """Estimate current memory usage in MB."""
-        total_bytes = 0
-        for z in self.z_trajectory.values():
-            total_bytes += z.element_size() * z.nelement()
-        return total_bytes / (1024 * 1024)

@@ -18,12 +18,12 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
-import yaml
 
 from cocf.common.config import Config
 from cocf.common.logging import get_logger
 from cocf.core.accelerator import Accelerator
 from cocf.engine import InferenceEngine
+from cocf.training.checkpoint import load_checkpoint
 from cocf.training.stage_a_data_gen import DataGenerationStage, StageAConfig
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 from cocf.training.stage_c_finetune import FinettuneStage, StageCConfig
@@ -70,6 +70,11 @@ class PipelineConfig:
     @classmethod
     def from_yaml(cls, path: Path) -> PipelineConfig:
         """Load config from YAML file."""
+        # Imported here, not at module scope: ``Config.load`` deliberately falls
+        # back to JSON when PyYAML is absent, and a top-level import made merely
+        # importing ``cocf.training`` fail on such a box.
+        import yaml
+
         with open(path) as f:
             data = yaml.safe_load(f)
         return cls(
@@ -108,11 +113,16 @@ class TrainingPipeline:
         # Build accelerator
         self.accelerator = Accelerator.from_config(config)
 
-        # Load checkpoint if specified
+        # Load checkpoint if specified. Accepts either layout — a bare Stage-B
+        # state_dict or the two-part Stage-C {"accelerator", "lora"} mapping — and
+        # re-attaches any LoRA adapters the checkpoint carries.
         if pipeline_cfg.checkpoint_load_path:
             _log.info(f"Loading checkpoint from {pipeline_cfg.checkpoint_load_path}")
-            state_dict = torch.load(pipeline_cfg.checkpoint_load_path, map_location=self.device)
-            self.accelerator.load_state_dict(state_dict)
+            ckpt = torch.load(
+                pipeline_cfg.checkpoint_load_path, map_location=self.device,
+                weights_only=False,
+            )
+            load_checkpoint(self.accelerator, ckpt, training_config=config.training)
 
         # Build engine. The trigger config is a top-level node on Config
         # (`config.trigger`), not `config.raec.trigger`.
@@ -227,10 +237,23 @@ class TrainingPipeline:
         self.accelerator = self._stage_c.run()
 
     def _save_checkpoint(self, stage: str) -> None:
-        """Save accelerator checkpoint after a stage."""
+        """Save the checkpoint for a completed stage.
+
+        After Stage C this must go through :meth:`FinettuneStage.checkpoint`, not
+        ``accelerator.state_dict()``: the LoRA adapters live inside the *frozen*
+        backbone, which is deliberately not an ``nn.Module`` child of the accelerator,
+        so a bare ``state_dict()`` silently discards the entire ``use_lora`` fine-tune
+        (§4.2). The stage object owns that knowledge, so ask it.
+        """
         ckpt_path = self.pipeline_cfg.experiment_dir / f"checkpoint_after_stage_{stage}.pt"
-        torch.save(self.accelerator.state_dict(), ckpt_path)
-        _log.info(f"Saved checkpoint to {ckpt_path}")
+        if stage.upper() == "C" and self._stage_c is not None:
+            payload = self._stage_c.checkpoint()
+            n_lora = len(payload.get("lora", {}))
+        else:
+            payload = {"accelerator": self.accelerator.state_dict()}
+            n_lora = 0
+        torch.save(payload, ckpt_path)
+        _log.info("Saved checkpoint to %s (%d LoRA tensors)", ckpt_path, n_lora)
 
     @classmethod
     def from_config(cls, config_path: Path, pipeline_cfg_path: Optional[Path] = None) -> TrainingPipeline:

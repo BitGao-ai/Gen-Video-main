@@ -26,15 +26,26 @@ class StepTrace:
     """Diagnostics for one denoising step (§9.4 efficiency/quality logging)."""
 
     step: int
-    active_ratio: float
+    # Fraction of tokens the allocation marked "recompute" — a *plan* statistic, not
+    # a cost. Reported separately from, and never as a substitute for, compute_ratio.
+    mask_ratio: float
     budget: float
     predicted_cost: float
     num_tubes: int
+    # Fraction of a dense denoiser forward actually executed this step, as reported by
+    # the backbone adapter (0.0 = the transformer was skipped entirely, 1.0 = full
+    # dense forward). This is the only number that may be quoted as a saving.
+    compute_ratio: float = 1.0
     actions: Dict[int, str] = field(default_factory=dict)
     rollbacks: int = 0
     repairs: int = 0
     cf_checks: int = 0
     cf_repairs: int = 0
+
+    @property
+    def active_ratio(self) -> float:
+        """Deprecated alias of :attr:`mask_ratio` (see :class:`TransitionResult`)."""
+        return self.mask_ratio
 
 
 @dataclass
@@ -48,16 +59,6 @@ class EngineState:
     anchor_store: AnchorStore
     cache: Optional[BackboneCache] = None
     tubes: List[SemanticTube] = field(default_factory=list)
-    # per-tube running quantities used by the next step's certificate / smoothing
-    prev_probs: Dict[int, Tensor] = field(default_factory=dict)
-    prev_residual: Dict[int, float] = field(default_factory=dict)
-    anchor_age: Dict[int, int] = field(default_factory=dict)
-    # per-tube countdown of remaining forced-FULL steps after a rollback/repair
-    # (§5.3.2): while > 0 the allocator pins the tube to FULL so it is recomputed
-    # forward instead of being allowed to skip again.
-    force_full_countdown: Dict[int, int] = field(default_factory=dict)
-    tube_visual_embed: Dict[int, Tensor] = field(default_factory=dict)
-    prev_z: Optional[Tensor] = None
     # mean damage uncertainty (mean σ over tubes) of the *previous* step, fed into the
     # next step's dynamic budget (§7.3 平均损害不确定度 term). Carried on the state
     # because the budget is sized before this step's σ is known (it conditions the
@@ -82,8 +83,25 @@ class GenerationResult:
     # -- convenience efficiency summaries (§9.4) ------------------------ #
 
     @property
+    def mean_compute_ratio(self) -> float:
+        """Mean fraction of a dense denoiser forward actually executed per step.
+
+        **This is the efficiency metric.** ``1.0`` means no compute was saved; a run
+        on a backbone without a token-sparse attention kernel will report ~1.0 minus
+        the fraction of steps that were skipped outright, no matter how aggressive
+        the tube allocation looks.
+        """
+        return sum(t.compute_ratio for t in self.traces) / max(1, len(self.traces))
+
+    @property
+    def mean_mask_ratio(self) -> float:
+        """Mean allocated-token occupancy — a *plan* statistic, not a saving."""
+        return sum(t.mask_ratio for t in self.traces) / max(1, len(self.traces))
+
+    @property
     def mean_active_ratio(self) -> float:
-        return sum(t.active_ratio for t in self.traces) / max(1, len(self.traces))
+        """Deprecated alias of :attr:`mean_mask_ratio`."""
+        return self.mean_mask_ratio
 
     @property
     def num_rollbacks(self) -> int:
@@ -94,9 +112,16 @@ class GenerationResult:
         return sum(t.repairs for t in self.traces)
 
     def summary(self) -> Dict[str, float]:
+        """Efficiency/quality summary.
+
+        ``mean_compute_ratio`` is the honest cost figure; ``mean_mask_ratio`` is kept
+        alongside it (clearly named) because the gap between the two is exactly the
+        saving a sparse-attention kernel would unlock and is worth watching.
+        """
         return {
             "steps": len(self.traces),
-            "mean_active_ratio": round(self.mean_active_ratio, 4),
+            "mean_compute_ratio": round(self.mean_compute_ratio, 4),
+            "mean_mask_ratio": round(self.mean_mask_ratio, 4),
             "rollbacks": self.num_rollbacks,
             "repairs": self.num_repairs,
             "cf_repairs": sum(t.cf_repairs for t in self.traces),

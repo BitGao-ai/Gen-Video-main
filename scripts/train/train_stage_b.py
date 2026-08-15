@@ -22,8 +22,9 @@ from pathlib import Path
 import torch
 
 from cocf.common.config import Config
-from cocf.common.logging import setup_logging
+from cocf.common.logging import get_logger, setup_logging
 from cocf.core.accelerator import Accelerator
+from cocf.training.checkpoint import load_checkpoint
 from cocf.data import CounterfactualLMDBDataset, ProcessedLayout
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 
@@ -31,6 +32,42 @@ from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 # with no flags — mirroring scripts/data/generate_counterfactual_data.py.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROCESSED_ROOT = REPO_ROOT / "LCOCF_OpenVid1M_Processed"
+
+
+def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
+    """Infer (text_dim, visual_dim) from the processed store's sample payloads.
+
+    Stage B must build the CMSC alignment projection with the same dims that Stage A
+    used when writing the counterfactual samples. Probing the backbone can silently
+    fall back to a wrong default (e.g. 4096 when the mock store holds 16-dim embeds),
+    so reading the ground-truth from the data itself is the robust path.
+    Returns (text_dim | None, visual_dim | None) — None when the field is absent.
+    """
+    text_dim = None
+    visual_dim = None
+    try:
+        ds = CounterfactualLMDBDataset(layout.lmdb_dir)
+        if len(ds) > 0:
+            sample = ds[0]
+            te = sample.get("text_embed")
+            if te is not None:
+                import numpy as np
+                arr = np.asarray(te)
+                if arr.ndim >= 2:
+                    text_dim = int(arr.shape[-1])
+            vf = sample.get("tube_visual_embed_full")
+            if vf is not None:
+                import numpy as np
+                arr = np.asarray(vf)
+                if arr.ndim >= 1 and arr.shape[-1] > 0:
+                    visual_dim = int(arr.shape[-1])
+    except Exception as e:
+        log.warning("Could not infer dims from store (will probe backbone): %s", e)
+    if text_dim is not None:
+        log.info("Inferred text_dim=%s from processed store", text_dim)
+    if visual_dim is not None:
+        log.info("Inferred visual_dim=%s from processed store", visual_dim)
+    return text_dim, visual_dim
 
 
 def _preflight(layout: ProcessedLayout, log: logging.Logger) -> None:
@@ -82,7 +119,10 @@ def main():
     args = parser.parse_args()
 
     setup_logging(level=logging.INFO)
-    log = logging.getLogger(__name__)
+    # setup_logging attaches the stdout handler to the "cocf" logger and sets
+    # propagate=False, so a bare getLogger("__main__") would emit nothing at
+    # INFO — this script's own progress lines included.
+    log = get_logger("cocf.stage_b")
     torch.manual_seed(args.seed)
 
     # Fail fast (with a precise message) if Stage A never finished writing the store.
@@ -103,13 +143,22 @@ def main():
     if args.lr is not None:
         config.training.optim.lr = args.lr
 
+    # Infer text/visual embedding dims from the data store so the CMSC alignment
+    # projection matches what Stage A actually wrote — avoids the silent fallback
+    # in Accelerator._probe_text_dim that can yield a wrong default (e.g. 4096 vs 16).
+    text_dim, visual_dim = _infer_dims_from_store(layout, log)
+
     log.info("Building accelerator")
-    accelerator = Accelerator.from_config(config)
+    accelerator = Accelerator.from_config(config, text_dim=text_dim, visual_dim=visual_dim)
 
     if args.checkpoint_load and args.checkpoint_load.exists():
         log.info("Loading checkpoint from %s", args.checkpoint_load)
-        state_dict = torch.load(args.checkpoint_load, map_location=args.device)
-        accelerator.load_state_dict(state_dict)
+        ckpt = torch.load(args.checkpoint_load, map_location=args.device,
+                          weights_only=False)
+        # Either layout: a bare state_dict, or Stage C's {"accelerator", "lora"}.
+        # Stage B trains the plugins only, so any LoRA in the checkpoint is loaded
+        # into the backbone but not touched by this stage's optimiser.
+        load_checkpoint(accelerator, ckpt, training_config=config.training)
 
     stage_b_config = StageBConfig(
         processed_root=args.processed_root,

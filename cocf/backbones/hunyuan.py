@@ -66,7 +66,10 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
         # The Llama encoder is the bulky one and runs once per prompt; under
         # ``offload_text_encoder`` it is resident only for this forward. The small
         # CLIP encoder stays put (it is ~0.1 GB — not worth a transfer).
-        with torch.inference_mode(), self._module_active(self.text_encoder):
+        # ``no_grad`` — not ``inference_mode``: the conditioning is consumed by the
+        # (possibly grad-enabled) DiT forward in Stage C, and an inference tensor can
+        # never be saved for backward (§4.2).
+        with torch.no_grad(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
                 list(prompts), return_tensors="pt", padding="max_length",
                 truncation=True, max_length=self._max_len,
@@ -92,8 +95,9 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
         out = self.transformer(  # type: ignore[union-attr]
             hidden_states=latent_grid,
             timestep=timestep,
-            encoder_hidden_states=cond.embeds.to(self.device, self.dtype),
-            encoder_attention_mask=cond.mask.to(self.device) if cond.mask is not None else None,
+            # Trimmed to the prompt's real length (§P1-15); this model already took
+            # the mask, so only the fixed-length padding cost needed removing.
+            **self._text_kwargs(cond, self.transformer),
             pooled_projections=cond.pooled.to(self.device, self.dtype)
             if cond.pooled is not None else None,
             return_dict=True,

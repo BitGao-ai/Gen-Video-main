@@ -39,14 +39,14 @@ training the plugins) — add ``--real-models`` (and the Wan variant on the serv
         --real-models --sam-model facebook/sam-vit-base \
         --device cuda --limit 8
 
-VRAM (80 GB card, a14b-t2v): the frozen stack is ~56 GB resident once the umT5 text
-encoder is parked on CPU, leaving ~23 GB for activations. Both defaults that keep it
-there — text-encoder offload and VAE tiling — are on automatically for a real GPU
-backbone; the run logs its resolved policy and measured resident footprint at load.
-If the card is smaller, in order of value: ``--vae-tile 192`` (or 128), then
-``--wan-variant ti2v-5b`` (single 5B expert + high-compression VAE, ~10 GB resident),
-then ``--offload-idle-expert`` (frees ~28 GB but pays two ~28 GB transfers per
-rollout). See §9.1.
+VRAM (40 GB card, ti2v-5b default): the single 5B expert + hi-comp VAE is ~10 GB
+resident, leaving ~30 GB for activations — comfortable on a 40 GB card. The text
+encoder is parked on CPU and VAE tiling (128 px) is on by default.
+For an 80 GB card with the full A14B dual-expert stack, pass ``--wan-variant a14b-t2v``;
+the frozen stack is ~28 GB with idle-expert offload (or ~56 GB without), and the
+default 128 px VAE tile keeps the transient under ~0.4 GB.
+If you still OOM: lower ``--vae-tile`` to 96, or add ``--metric-frame-chunk 2``.
+See §9.1.
 """
 
 import argparse
@@ -95,7 +95,7 @@ DEFAULT_PROCESSED_ROOT = REPO_ROOT / "LCOCF_OpenVid1M_Processed"
 DEFAULT_MODEL_PATH = REPO_ROOT / "checkpoints" / "wan22"
 
 from cocf.common.config import Config
-from cocf.common.logging import setup_logging
+from cocf.common.logging import get_logger, setup_logging
 from cocf.core.accelerator import Accelerator
 from cocf.data.metrics import DEFAULT_FRAME_CHUNK
 from cocf.training.stage_a_data_gen import DataGenerationStage, StageAConfig
@@ -121,16 +121,19 @@ def resolve_vram_policy(config, args, real_gpu_backbone: bool) -> None:
     ~90x per clip) — the more dangerous of the two, because it OOMs mid-run rather
     than at load. See :meth:`cocf.backbones.diffusers_base.
     DiffusersVideoBackbone._configure_vae_memory`.
+
+    Config defaults are now ON (40 GB-card safe); the CLI --no-* flags explicitly
+    disable them for larger cards that want the speed trade-off.
     """
     if not real_gpu_backbone:
         return
-    if args.offload:
-        config.backbone.offload_text_encoder = True
+    # Explicitly set from CLI so --no-offload / --no-vae-tiling override the
+    # config defaults (which are now True for 40 GB safety).
+    config.backbone.offload_text_encoder = args.offload
+    config.backbone.vae_tiling = args.vae_tiling
     if args.vae_tiling:
-        config.backbone.vae_tiling = True
         config.backbone.vae_tile_size = args.vae_tile
-    if args.offload_idle_expert:
-        config.backbone.offload_idle_expert = True
+    config.backbone.offload_idle_expert = args.offload_idle_expert
 
 
 def main():
@@ -186,9 +189,9 @@ def main():
     parser.add_argument("--metric-frame-chunk", type=int, default=DEFAULT_FRAME_CHUNK,
                         help="Frames (and frame pairs) per forward in the real metric "
                              "extractor. Bounds the RAFT correlation volume, which at "
-                             "the default chunk is ~1.2 GB — comparable to a tiled VAE "
-                             f"decode tile. Default {DEFAULT_FRAME_CHUNK}; lower it if "
-                             "the damage pass still OOMs.")
+                             "the default chunk is ~0.6 GB — safe on 40 GB cards. "
+                             f"Default {DEFAULT_FRAME_CHUNK}; lower to 2 if the damage "
+                             "pass still OOMs.")
     # -- VRAM residency policy for the frozen backbone (§9.1) ----------------- #
     # A real Wan2.2-A14B stack is ~67 GB resident (2×14B experts + 5.5B umT5),
     # which is the whole budget of an 80 GB card before a single activation.
@@ -205,24 +208,29 @@ def main():
     parser.add_argument("--no-vae-tiling", dest="vae_tiling", action="store_false",
                         help="Decode/encode the VAE in one un-tiled call. NOT "
                              "recommended: an untiled 480x832x49 Wan decode needs a "
-                             "single ~7.7 GiB block and Stage A runs ~90 decodes per "
+                             "single ~7.7 GiB block and Stage A runs ~24 decodes per "
                              "clip. Only safe with >10 GB free after the weights load.")
-    parser.add_argument("--vae-tile", type=int, default=256,
+    parser.add_argument("--vae-tile", type=int, default=128,
                         help="Tile edge in output pixels when VAE tiling is on. Peak "
-                             "decode memory scales with the square of this, so 256 "
-                             "bounds a 480x832 decode at ~1.4 GB. Lower it (192, 128) "
-                             "if the decode still OOMs.")
+                             "decode memory scales with the square of this, so 128 "
+                             "bounds a 480x832 decode at ~0.4 GB (safe on 40 GB cards). "
+                             "Raise to 256 (~1.4 GB) only if you have >16 GB free.")
     parser.add_argument("--offload-idle-expert", action="store_true",
                         help="Keep only the active Wan2.2 MoE expert resident (~28 GB "
                              "saved). Costs two ~28 GB transfers per noise-boundary "
                              "crossing — with the default representative steps every "
                              "rollout crosses, so this is throughput-expensive. Prefer "
                              "--wan-variant ti2v-5b when the run is time-bound.")
-    parser.set_defaults(offload=True, vae_tiling=True)
-    parser.add_argument("--wan-variant", type=str, default="a14b-t2v",
+    parser.add_argument("--no-offload-idle-expert", dest="offload_idle_expert",
+                        action="store_false",
+                        help="Keep BOTH MoE experts resident (needs 56+ GB free). "
+                             "Faster on 80 GB cards — no expert-swap transfers.")
+    parser.set_defaults(offload=True, vae_tiling=True, offload_idle_expert=True)
+    parser.add_argument("--wan-variant", type=str, default="ti2v-5b",
                         choices=sorted(_WAN_VARIANT_EXTRA),
-                        help="Wan2.2 variant → backbone geometry/MoE (§9.1). a14b-t2v (default) "
-                             "and a14b-i2v are dual-expert; ti2v-5b is single-expert + hi-comp VAE.")
+                        help="Wan2.2 variant → backbone geometry/MoE (§9.1). ti2v-5b (default) "
+                             "is single-expert + hi-comp VAE (~10 GB, 40GB-card safe); "
+                             "a14b-t2v and a14b-i2v are dual-expert (need 40GB+ with offload).")
     parser.add_argument("--backbone-dtype", type=str, default="bfloat16",
                         help="Compute dtype for the frozen backbone (bfloat16|float16|float32).")
     parser.add_argument("--limit", type=int, default=None,
@@ -260,7 +268,10 @@ def main():
                      f"(got shard-index={args.shard_index}, num-shards={args.num_shards})")
 
     setup_logging(level=logging.INFO)
-    log = logging.getLogger(__name__)
+    # setup_logging attaches the stdout handler to the "cocf" logger and sets
+    # propagate=False, so a bare getLogger("__main__") would emit nothing at
+    # INFO — this script's own progress lines included.
+    log = get_logger("cocf.stage_a")
     torch.manual_seed(args.seed)
 
     # ``action="append"`` starts from ``None`` so an explicit --openvid-csv replaces
@@ -305,7 +316,7 @@ def main():
         if not config.backbone.vae_tiling:
             log.warning(
                 "--no-vae-tiling: a 480x832x49 Wan decode will request a single "
-                "~7.7 GiB block, once per rollout seed (~90x per clip). Expect an "
+                "~7.7 GiB block, once per rollout seed (~24x per clip). Expect an "
                 "OOM unless this card has >10 GB free after the frozen weights load."
             )
     # Wan2.2 variant geometry (§9.1). Only a wan* backbone reads these keys; mock/other
@@ -340,6 +351,9 @@ def main():
             device=args.device, dino_name=args.dino_model,
             clip_name=args.clip_model, enable_ocr=args.enable_ocr,
             frame_chunk=args.metric_frame_chunk,
+            # Reuse the perception backend's DINOv2/CLIP rather than loading a second
+            # ~1 GB copy of the same frozen weights (§P2-7).
+            share_from=perception,
         )
 
     log.info("Building accelerator with backbone '%s' (perception=%s, metrics=%s)",

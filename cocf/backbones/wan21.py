@@ -55,7 +55,11 @@ class Wan21Backbone(DiffusersVideoBackbone):
         # umT5-XXL is ~11 GB in bf16 and runs once per prompt, so under
         # ``offload_text_encoder`` it only occupies VRAM for this one forward
         # (:meth:`DiffusersVideoBackbone._module_active` is a no-op otherwise).
-        with torch.inference_mode(), self._module_active(self.text_encoder):
+        # ``no_grad`` — not ``inference_mode``: the frozen encoder never needs a
+        # graph, but its output *is* consumed by the (possibly grad-enabled) DiT
+        # forward in Stage C, and an inference tensor can never be saved for
+        # backward — it would poison the whole §4.2 loss path.
+        with torch.no_grad(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
                 list(prompts), return_tensors="pt", padding="max_length",
                 truncation=True, max_length=self._max_len,
@@ -74,7 +78,10 @@ class Wan21Backbone(DiffusersVideoBackbone):
         out = self.transformer(  # type: ignore[union-attr]
             hidden_states=latent_grid,
             timestep=timestep,
-            encoder_hidden_states=cond.embeds.to(self.device, self.dtype),
+            # Padding-trimmed conditioning (+ the attention mask when this model
+            # accepts one): umT5 pads every prompt to 512 tokens and cross-attention
+            # was being charged for all of them, as real text (§P1-15).
+            **self._text_kwargs(cond, self.transformer),
             return_dict=True,
         )
         eps = out.sample if hasattr(out, "sample") else out[0]

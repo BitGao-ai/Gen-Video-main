@@ -16,9 +16,9 @@ best damage-reduction-per-extra-cost that still fits the budget. That is near-op
 for MCKP and needs no solver (so it runs anywhere, user requirement #3); an exact LP/
 MILP path is used instead when SciPy is present and ``greedy_fallback`` is off.
 
-The allocator also exposes differentiable per-tube action *probabilities* (softmax
-over −μ) for the tube smoothing loss (§4.3.2) and Stage-C training — the hard
-decision is for inference, the soft distribution is for learning.
+The differentiable counterpart used for training (softmax over −μ, feeding the tube
+smoothing and budget losses) lives with the losses that consume it, in
+:mod:`cocf.training.stage_b_losses`.
 """
 
 from __future__ import annotations
@@ -43,9 +43,28 @@ _NUM_ACTIONS = len(Action)
 class ActionAllocator:
     """Greedy (or LP) multiple-choice knapsack over per-tube actions (§2.2)."""
 
-    def __init__(self, config: AllocatorConfig) -> None:
+    def __init__(self, config: AllocatorConfig, lowfreq_stride: Optional[int] = None) -> None:
         self.cfg = config
         self.action_cost = list(config.action_cost)  # indexed by Action value
+        # LOWFREQ's true cost is set by the executor's spatial stride (a stride-s
+        # lattice computes 1/s² of the tube's tokens), so derive it rather than trust a
+        # constant that silently disagrees with the transition the engine performs.
+        if lowfreq_stride:
+            self.action_cost[int(Action.LOWFREQ)] = 1.0 / float(max(1, lowfreq_stride) ** 2)
+
+    @staticmethod
+    def distinct_token_count(tubes: List[SemanticTube]) -> int:
+        """``|⋃ g_k|`` — tokens covered by at least one tube.
+
+        Tubes overlap by design (the state vector models it as ``interaction``), so
+        ``Σ|g_k|`` counts shared tokens once per tube and inflates the budget
+        denominator: the allocator then believes it may spend compute it does not
+        have. Counting the union keeps ``B_t · |⋃ g_k|`` an actual token budget.
+        """
+        if not tubes:
+            return 0
+        seen = torch.cat([t.all_token_indices() for t in tubes]) if tubes else torch.empty(0)
+        return int(torch.unique(seen).numel()) if seen.numel() else 0
 
     # ------------------------------------------------------------------ #
     # main entry
@@ -67,7 +86,11 @@ class ActionAllocator:
         prior_actions = prior_actions or {}
         forced_full = forced_full or set()
 
-        total_size = max(1, sum(t.size for t in tubes))
+        # Budget denominator = distinct covered tokens, so overlapping tubes do not
+        # inflate the allowance (§P1-6). Per-tube costs still use each tube's own size:
+        # a shared token genuinely costs both tubes' actions, and charging it twice is
+        # the conservative direction.
+        total_size = max(1, self.distinct_token_count(tubes))
         budget_tokens = float(budget) * total_size
 
         # admissible actions + (cost, damage) tables per tube
@@ -81,7 +104,7 @@ class ActionAllocator:
             admissible[tid] = adm
             cost[tid] = {a: self.action_cost[int(a)] * tube.size for a in adm}
             # detach: μ here drives the non-differentiable control flow (knapsack);
-            # the differentiable training path uses ``action_probabilities`` instead.
+            # the differentiable training path uses ``stage_b_losses.action_probs``.
             mu = predictions[tid].mu.detach() if tid in predictions else None
             dmg[tid] = {
                 a: (float(mu[int(a)]) if mu is not None else _prior_damage(a, prior_actions.get(tid)))
@@ -222,24 +245,6 @@ class ActionAllocator:
                 continue  # this skip is too risky (§5.3.2) — forbid it
             acts.append(a)
         return acts
-
-    # ------------------------------------------------------------------ #
-    # differentiable action probabilities (training / smoothing loss)
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def action_probabilities(
-        predictions: Dict[int, DamagePrediction], sharpness: float = 4.0
-    ) -> Dict[int, Tensor]:
-        """``{tube_id: softmax(−sharpness·μ) [num_actions]}`` — low damage ⇒ high prob.
-
-        Differentiable w.r.t. the predictor's μ, so the smoothing loss (§4.3.2) and
-        Stage-C objective shape the allocator's preferences during training.
-        """
-        return {
-            tid: torch.softmax(-sharpness * p.mu, dim=-1) for tid, p in predictions.items()
-        }
-
 
 def _prior_damage(action: Action, prior: Optional[Action]) -> float:
     """Fallback damage when no prediction exists: 0 if it matches the cold-start

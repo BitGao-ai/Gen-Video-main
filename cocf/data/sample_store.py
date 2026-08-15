@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -102,6 +103,15 @@ class CounterfactualSampleWriter:
             import lmdb
 
             self._env = lmdb.open(str(self.dir), map_size=int(map_size), subdir=True)
+            # Read the prior key list *before* opening the write transaction. Both
+            # orders work in LMDB (read txns are independent of the writer), but
+            # reading first keeps the write txn's lifetime tight and avoids relying on
+            # that guarantee. Keys already committed by an earlier (interrupted) run
+            # matter because ``close()`` rewrites ``__keys__`` wholesale: without
+            # seeding from the store, a resumed run would publish only *this* session's
+            # keys and orphan every record written before the interruption — the data
+            # is still in data.mdb, but nothing can address it.
+            self._prior_keys: List[str] = self._read_keys() if resume else []
             self._txn = self._env.begin(write=True)
             self._pending = 0
         else:
@@ -114,6 +124,18 @@ class CounterfactualSampleWriter:
 
     def _shard_name(self, idx: int) -> str:
         return f"{self.shard_prefix}_{idx:05d}.pt"
+
+    def _read_keys(self) -> List[str]:
+        """Ordered key list already stored in the LMDB env (``[]`` when absent)."""
+        try:
+            with self._env.begin() as txn:
+                raw = txn.get(b"__keys__")
+                if raw is not None:
+                    return list(json.loads(raw.decode("utf-8")))
+                # No ``__keys__`` yet (crash before the first close): enumerate.
+                return [k.decode("utf-8") for k, _ in txn.cursor() if k != b"__keys__"]
+        except Exception:  # pragma: no cover — unreadable/fresh env
+            return []
 
     def _next_shard_index(self) -> int:
         """Highest existing ``{prefix}_NNNNN.pt`` + 1 (0 when none) — the resume anchor."""
@@ -160,9 +182,16 @@ class CounterfactualSampleWriter:
     def close(self) -> None:
         if self._use_lmdb:
             self._txn.commit()
-            # persist the ordered key list so the dataset need not enumerate the env
+            # Persist the ordered key list so the dataset need not enumerate the env.
+            # Merge with the keys a previous run committed (``resume``), de-duplicating
+            # while preserving order — a plain overwrite silently orphans them.
+            seen, merged = set(), []
+            for k in list(self._prior_keys) + self._keys:
+                if k not in seen:
+                    seen.add(k)
+                    merged.append(k)
             with self._env.begin(write=True) as txn:
-                txn.put(b"__keys__", json.dumps(self._keys).encode("utf-8"))
+                txn.put(b"__keys__", json.dumps(merged).encode("utf-8"))
             self._env.sync()
             self._env.close()
         else:
@@ -181,6 +210,49 @@ class CounterfactualSampleWriter:
 
 
 # --------------------------------------------------------------------------- #
+# Backend introspection + streaming read (used by the §1.6 finalize pass)
+# --------------------------------------------------------------------------- #
+
+
+def store_is_lmdb(lmdb_dir) -> bool:
+    """True when ``lmdb_dir`` holds a *readable* LMDB store.
+
+    Finalize and any other whole-store pass must branch on what is actually on disk,
+    not on which backend they would pick themselves — the writer auto-selects LMDB
+    whenever the package is importable, so a reader that only globs ``shard_*.pt``
+    finds nothing and silently concludes the store is empty (which is exactly how
+    installing ``lmdb`` used to break Stage A → Stage B).
+    """
+    return _have_lmdb() and (Path(lmdb_dir) / "data.mdb").exists()
+
+
+def iter_lmdb_records(lmdb_dir):
+    """Stream ``(sample_id, payload)`` over an LMDB store, one record resident.
+
+    Honours the stored ``__keys__`` order when present, else enumerates the env.
+    """
+    import lmdb
+
+    env = lmdb.open(str(lmdb_dir), readonly=True, lock=False, subdir=True)
+    try:
+        with env.begin() as txn:
+            raw = txn.get(b"__keys__")
+            keys = (
+                [k.encode("utf-8") for k in json.loads(raw.decode("utf-8"))]
+                if raw is not None
+                else [k for k, _ in txn.cursor() if k != b"__keys__"]
+            )
+            for k in keys:
+                blob = txn.get(k)
+                if blob is None:
+                    _log.warning("iter_lmdb_records: key %r listed but absent", k)
+                    continue
+                yield k.decode("utf-8"), _decode(blob)
+    finally:
+        env.close()
+
+
+# --------------------------------------------------------------------------- #
 # Dataset (reader)
 # --------------------------------------------------------------------------- #
 
@@ -194,8 +266,19 @@ class CounterfactualLMDBDataset(Dataset):
     ``splits/`` lists), which is how Stage B reads only the training samples.
     """
 
-    def __init__(self, lmdb_dir, sample_ids: Optional[Sequence[str]] = None) -> None:
+    def __init__(self, lmdb_dir, sample_ids: Optional[Sequence[str]] = None,
+                 text_embed_dir=None, shard_cache_size: int = 8) -> None:
         self.dir = Path(lmdb_dir)
+        # Per-clip prompt embeddings live outside the sample store (§P2-3); when a
+        # directory is given, each record is joined with its video's embedding on
+        # read so consumers still see a self-contained payload.
+        self.text_embed_dir = Path(text_embed_dir) if text_embed_dir else None
+        self._text_cache: "OrderedDict[str, Any]" = OrderedDict()
+        # Bounded LRU over decoded .pt shards. A single slot thrashed badly: the
+        # stratified sampler draws a batch from all over the store, so consecutive
+        # reads almost always landed in different shards and each one reloaded a
+        # whole shard (hundreds of samples) to serve one record.
+        self._shard_cache_size = max(1, int(shard_cache_size))
         self._use_lmdb = _have_lmdb() and (self.dir / "data.mdb").exists()
         if self._use_lmdb:
             self._open_lmdb()
@@ -228,7 +311,7 @@ class CounterfactualLMDBDataset(Dataset):
                     k.decode("utf-8") for k, _ in txn.cursor() if k != b"__keys__"
                 ]
         self._key_set = set(self._all_keys)
-        self._shard_cache: Dict[int, List[Dict[str, Any]]] = {}
+        self._shard_cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
     def _open_fallback(self) -> None:
         manifest_path = self.dir / "manifest.json"
@@ -238,7 +321,7 @@ class CounterfactualLMDBDataset(Dataset):
             m = json.loads(manifest_path.read_text(encoding="utf-8"))
             self._all_keys, self._index = m["keys"], m["index"]
         self._key_set = set(self._all_keys)
-        self._shard_cache = {}  # tiny LRU(1) on the most-recently-read shard
+        self._shard_cache = OrderedDict()
 
     # -- protocol ------------------------------------------------------- #
 
@@ -254,7 +337,7 @@ class CounterfactualLMDBDataset(Dataset):
                 blob = txn.get(sample_id.encode("utf-8"))
             if blob is None:
                 raise KeyError(sample_id)
-            return _decode(blob)
+            return self._with_text_embed(_decode(blob))
         # fallback: load (and cache) the shard, return the record's payload. The index
         # value is either a shard *filename* (new shard-parallel layout) or a legacy
         # integer shard index — accept both so pre-existing stores keep reading unchanged.
@@ -263,5 +346,34 @@ class CounterfactualLMDBDataset(Dataset):
         shard = self._shard_cache.get(shard_name)
         if shard is None:
             shard = torch.load(self.dir / shard_name, weights_only=False)
-            self._shard_cache = {shard_name: shard}  # keep only the last shard resident
-        return shard[pos]["payload"]
+            self._shard_cache[shard_name] = shard
+            while len(self._shard_cache) > self._shard_cache_size:
+                self._shard_cache.popitem(last=False)   # evict least-recently-used
+        else:
+            self._shard_cache.move_to_end(shard_name)
+        return self._with_text_embed(shard[pos]["payload"])
+
+    def _with_text_embed(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the clip's prompt embedding, loaded once per video (§P2-3)."""
+        if self.text_embed_dir is None or "text_embed" in payload:
+            return payload
+        vid = str(payload.get("video_id", ""))
+        if not vid:
+            return payload
+        emb = self._text_cache.get(vid)
+        if emb is None:
+            # Same normalisation Stage A wrote with, so an int-like id resolves.
+            from cocf.data.processed_layout import video_id_str
+
+            path = self.text_embed_dir / f"{video_id_str(vid)}.pt"
+            if not path.exists():
+                return payload
+            emb = torch.load(path, map_location="cpu", weights_only=False).float()
+            self._text_cache[vid] = emb
+            while len(self._text_cache) > self._shard_cache_size:
+                self._text_cache.popitem(last=False)
+        else:
+            self._text_cache.move_to_end(vid)
+        out = dict(payload)
+        out["text_embed"] = emb
+        return out

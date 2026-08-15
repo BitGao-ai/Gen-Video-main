@@ -59,6 +59,8 @@ from cocf.data.raw_filtered import (
 from cocf.data.sample_store import (
     CounterfactualLMDBDataset,
     CounterfactualSampleWriter,
+    iter_lmdb_records,
+    store_is_lmdb,
 )
 from cocf.data.video_dataset import (
     DecordVideoReader,
@@ -115,6 +117,8 @@ __all__ = [
     # counterfactual LMDB store (§3 level-5)
     "CounterfactualSampleWriter",
     "CounterfactualLMDBDataset",
+    "store_is_lmdb",
+    "iter_lmdb_records",
     # Stage-B stratified batch assembly (§4.1)
     "StratifiedBatchSampler",
     "collate_cocf_samples",

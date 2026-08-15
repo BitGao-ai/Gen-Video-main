@@ -17,7 +17,7 @@ is a provider change with zero edits to the algorithm.
 from __future__ import annotations
 
 import abc
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -59,7 +59,34 @@ class PerceptionProvider(abc.ABC):
 
     @abc.abstractmethod
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
-        """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``."""
+        """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``.
+
+        **Channel order is ``(dy, dx)``** — vertical displacement first — which is what
+        every consumer in the framework assumes: :meth:`TubeBuilder._downsample_flow`
+        rescales channel 0 by ``H`` and channel 1 by ``W``, and the mask/centroid warps
+        in :mod:`cocf.tubes.state` and :mod:`cocf.tubes.affinity` add channel 0 to the
+        row index. Note this is the *opposite* of torchvision's RAFT, which returns
+        ``(dx, dy)``; a provider wrapping it must transpose the channels (see
+        :func:`cocf.tubes.model_perception.raft_to_framework_flow`) or every occlusion,
+        motion-phase and affinity term is computed from a displacement pointing the
+        wrong way — invisibly so on square inputs with isotropic motion (§P1-11).
+        """
+
+    def region_features(
+        self, frame: Tensor, masks: Sequence[Tensor]
+    ) -> Tuple[List[Tensor], List[Tensor]]:
+        """``(identity, clip)`` features for several regions of **one** frame.
+
+        Concrete default: call the per-region methods, so an existing provider needs
+        no change. A provider backed by real checkpoints should override it with a
+        single batched forward — the per-region contract costs one processor
+        round-trip and one batch-of-1 forward per mask, i.e. 24 masks × 13 frames =
+        312 serial DINOv2 forwards plus 312 CLIP forwards for one clip (§P2-8).
+        """
+        return (
+            [self.identity_feature(frame, m) for m in masks],
+            [self.clip_feature(frame, m) for m in masks],
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -82,8 +109,7 @@ class RegionExtractor:
         if masks.numel() == 0:
             return []
         total_px = float(masks.shape[-1] * masks.shape[-2])
-        regions: List[Region] = []
-        rid = 0
+        kept: List[tuple] = []
         for r in range(masks.shape[0]):
             mask_px = masks[r]
             area_ratio = float(mask_px.float().mean().item())
@@ -96,20 +122,26 @@ class RegionExtractor:
             tok = self._mask_to_tokens(lat_mask, frame_idx, grid)
             if tok.numel() == 0:
                 continue
-            regions.append(
-                Region(
-                    frame=frame_idx,
-                    region_id=rid,
-                    mask=lat_mask,
-                    token_indices=tok,
-                    identity_feat=self.perception.identity_feature(frame_rgb, mask_px),
-                    text_feat=self.perception.clip_feature(frame_rgb, mask_px),
-                    center=self._centroid(lat_mask),
-                    clip_score=score,
-                )
+            kept.append((mask_px, lat_mask, tok, score))
+
+        # Features for all surviving regions in one call, so a real backend can run a
+        # single batched forward per frame instead of one per region (§P2-8).
+        ident, textf = self.perception.region_features(
+            frame_rgb, [k[0] for k in kept]
+        )
+        return [
+            Region(
+                frame=frame_idx,
+                region_id=rid,
+                mask=lat_mask,
+                token_indices=tok,
+                identity_feat=ident[rid],
+                text_feat=textf[rid],
+                center=self._centroid(lat_mask),
+                clip_score=score,
             )
-            rid += 1
-        return regions
+            for rid, (_, lat_mask, tok, score) in enumerate(kept)
+        ]
 
     # -- helpers --------------------------------------------------------- #
 

@@ -44,7 +44,9 @@ from cocf.data import (
     OpenVidRecord,
     ProcessedLayout,
     QualityFilter,
+    iter_lmdb_records,
     read_openvid_manifest,
+    store_is_lmdb,
     video_id_str,
     write_raw_dataset_index,
 )
@@ -135,9 +137,7 @@ class DataGenerationStage:
             accelerator, TeacherForwardConfig.from_config(cfg), device=config.device
         )
         self.damage_computer = CounterfactualDamageComputer(metric_extractor)
-        sampling_cfg = StratifiedSamplingConfig(
-            interpolation_interval=5, use_label_interpolation=cfg.teacher.interpolate_adjacent_steps
-        )
+        sampling_cfg = StratifiedSamplingConfig()
         self.data_generator = COCFDataGenerator(
             metric_extractor=metric_extractor,
             strength_feature_builder=CausalStrengthFeatureBuilder(),
@@ -312,6 +312,7 @@ class DataGenerationStage:
                 for row in self._tube_meta(traj):
                     tf.write(json.dumps(row, ensure_ascii=False) + "\n")
                 tf.flush()
+                self._persist_text_embed(traj)
 
                 samples = self.data_generator.generate(
                     traj, self.backbone, self.transition,
@@ -380,7 +381,28 @@ class DataGenerationStage:
         text_emb = traj.text_embed if traj.text_embed is not None else torch.zeros(1)
         self.layout.save_baseline(
             traj.video_id, text_emb=text_emb, z_t_by_step=z_by_t, y_full=traj.video_full,
+            z_init=traj.z_init,
         )
+
+    def _persist_text_embed(self, traj: TeacherTrajectory) -> None:
+        """Write the clip's prompt embedding once (§P2-3).
+
+        Trimmed to the caption's real length and stored in fp16: the tokenizer pads
+        to 512 and a caption uses a few dozen positions, so the pair of measures turns
+        a ~8 MiB per-*sample* duplicate into a ~0.3 MiB per-*clip* file. Stage B joins
+        it back by ``video_id``.
+        """
+        emb = traj.text_embed
+        if emb is None:
+            return
+        mask = getattr(traj.cond, "mask", None)
+        if mask is not None and mask.numel():
+            used = mask[0].bool() if mask.dim() > 1 else mask.bool()
+            keep = int(used.nonzero().max()) + 1 if bool(used.any()) else emb.shape[0]
+            emb = emb[:keep]
+        path = self.layout.text_embed_path(traj.video_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(emb.detach().to("cpu", torch.float16), path)
 
     def _persist_features(self, traj: TeacherTrajectory) -> None:
         """Write the §3 level-4 ``tube_causal_features/<video_id>/`` bucket."""
@@ -545,6 +567,24 @@ def _iter_shard_records(shard_paths: Sequence[Path]):
         free_memory()
 
 
+def _iter_store_records(layout: ProcessedLayout, shard_paths: Sequence[Path]):
+    """Stream ``(ref, pos, sample_id, payload)`` over whichever backend is on disk.
+
+    The sample writer picks LMDB automatically whenever the package is importable
+    (the documented production path), so finalize must read it too. Globbing only
+    ``shard_*.pt`` meant that a machine following the README's ``pip install lmdb``
+    wrote its samples to ``data.mdb`` and then had finalize declare the store empty —
+    no sample_index, no splits, no norm stats, and a hard Stage-B preflight failure.
+    ``ref``/``pos`` are the manifest coordinates for the ``.pt`` backend and are unused
+    (``("", -1)``) for LMDB, which addresses records by key.
+    """
+    if store_is_lmdb(layout.lmdb_dir):
+        for sid, payload in iter_lmdb_records(layout.lmdb_dir):
+            yield "", -1, sid, payload
+        return
+    yield from _iter_shard_records(shard_paths)
+
+
 def _merge_tube_meta(layout: ProcessedLayout) -> List[Dict[str, object]]:
     """Merge every shard's ``_tube_meta.sNN.jsonl`` sidecar into the tube_meta rows."""
     rows: List[Dict[str, object]] = []
@@ -575,18 +615,37 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
        from the store, matching the original §1.6 contract).
 
     Works for both the sharded layout (``shard_sNN_*.pt``) and a legacy single-writer
-    store (``shard_NNNNN.pt``) — the glob matches both. Idempotent: safe to re-run.
+    store (``shard_NNNNN.pt``) — the glob matches both — **and** for the LMDB backend
+    the writer selects whenever the ``lmdb`` package is installed (§3 "LMDB 训练主库"),
+    which is read by key rather than by shard. Idempotent: safe to re-run.
     """
+    is_lmdb = store_is_lmdb(layout.lmdb_dir)
     shard_paths = sorted(layout.lmdb_dir.glob("shard_*.pt"))
-    if not shard_paths:
-        _log.warning("finalize: no shards under %s — nothing to index", layout.lmdb_dir)
+    if not is_lmdb and not shard_paths:
+        _log.warning(
+            "finalize: no LMDB store and no .pt shards under %s — nothing to index",
+            layout.lmdb_dir,
+        )
         return layout.root
+    if is_lmdb and shard_paths:
+        # A store that changed backend mid-flight (e.g. ``pip install lmdb`` between
+        # two Stage-A runs). Indexing only one of them would quietly drop the other's
+        # samples, so say so rather than let the count look right. Warned once here,
+        # not inside the (twice-consumed) record iterator.
+        _log.warning(
+            "finalize: %s holds BOTH an LMDB store and %d .pt shard(s). Indexing the "
+            "LMDB only — the shards were written by a run with a different backend and "
+            "will not appear in sample_index/splits. Re-run that shard's generation, "
+            "or move the .pt files aside.",
+            layout.lmdb_dir, len(shard_paths),
+        )
+    backend = "LMDB" if is_lmdb else f"{len(shard_paths)} .pt shard(s)"
 
     # --- pass 1: online min-max (§1.6 norm) + damage scalars (streaming) ---- #
     norm_min: Dict[str, np.ndarray] = {}
     norm_max: Dict[str, np.ndarray] = {}
     damage: List[float] = []
-    for _name, _pos, _sid, payload in _iter_shard_records(shard_paths):
+    for _name, _pos, _sid, payload in _iter_store_records(layout, shard_paths):
         damage.append(_damage_scalar_from_payload(payload))
         for g in _NORM_GROUPS:
             v = payload.get(g)
@@ -608,9 +667,10 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
     sample_rows: List[Dict[str, object]] = []
     buckets: Dict[str, List[str]] = {"train": [], "val": [], "test_hard": []}
     gi = 0
-    for name, pos, sid, payload in _iter_shard_records(shard_paths):
+    for name, pos, sid, payload in _iter_store_records(layout, shard_paths):
         keys.append(sid)
-        index[sid] = [name, pos]
+        if pos >= 0:
+            index[sid] = [name, pos]
         if keep_mask[gi]:
             vid = str(payload.get("video_id", ""))
             sample_rows.append({
@@ -623,9 +683,13 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
             buckets.get(split_by_video.get(vid, "train"), buckets["train"]).append(sid)
         gi += 1
 
-    (layout.lmdb_dir / "manifest.json").write_text(
-        json.dumps({"keys": keys, "index": index}), encoding="utf-8"
-    )
+    if not is_lmdb:
+        # manifest.json is the .pt backend's *only* addressing index. The LMDB store
+        # addresses by key and carries its own ``__keys__``, so writing a manifest
+        # there would shadow it with a stale, position-based view.
+        (layout.lmdb_dir / "manifest.json").write_text(
+            json.dumps({"keys": keys, "index": index}), encoding="utf-8"
+        )
     layout.write_sample_index(sample_rows)
     layout.write_splits(buckets["train"], buckets["val"], buckets["test_hard"])
     layout.write_norm_stats({
@@ -635,9 +699,9 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
 
     dropped = len(keys) - len(sample_rows)
     _log.info(
-        "§1.6 finalize: indexed %d samples across %d shards; sample_index kept %d "
+        "§1.6 finalize: indexed %d samples from %s; sample_index kept %d "
         "(dropped %d 3σ outliers); splits %d/%d/%d → %s",
-        len(keys), len(shard_paths), len(sample_rows), dropped,
+        len(keys), backend, len(sample_rows), dropped,
         len(buckets["train"]), len(buckets["val"]), len(buckets["test_hard"]), layout.root,
     )
     return layout.root

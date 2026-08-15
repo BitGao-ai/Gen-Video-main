@@ -13,37 +13,50 @@ backbone (user requirement #2). The mapping from action → which tokens are
     FULL     all of the tube's tokens are active            cost ∝ 1.00·|g_k|
     LOWFREQ  a strided spatial subset is active, the rest    cost ∝ 0.45·|g_k|
              are upsampled from the computed neighbours
-    INTERP   no token is active; the latent is advanced by   cost ∝ 0.15·|g_k|
-             a fresh scheduler step reusing the *cached* ε_θ
+    INTERP   no token is active; the tube's tokens are       cost ∝ 0.15·|g_k|
+             temporally interpolated from the frames
+             around them (``interp_rows``)
     ANCHOR   no token is active; the latent is frozen to     cost ∝ 0.00
-             the last verified-safe anchor verbatim
+             the last verified-safe anchor verbatim (or to
+             the pre-step latent when none exists yet)
 
-Only FULL/LOWFREQ tokens enter ``adapter.denoise(active_mask=…)``; ANCHOR/INTERP
-tokens never touch the (expensive) attention, which is what saves both compute
-and the activation memory that dominates video-DiT VRAM.
+Only FULL/LOWFREQ tokens enter ``adapter.denoise(active_mask=…)``. What that buys
+depends entirely on the adapter: the mock (and any future sparse-attention kernel)
+genuinely gathers the active tokens and computes only those; today's real video-DiTs
+have no arbitrary-token-sparse attention, so they compute densely and only *splice*
+the inactive outputs from cache. The saving that is real on every backbone is the
+**whole-step skip** — when no token at all is active the transformer never runs.
+Each adapter reports what it truly spent (``DenoiseOutput.compute_fraction``), and
+:class:`TransitionResult` carries that through as ``compute_ratio``; the mask
+occupancy travels separately as ``mask_ratio`` and must never be quoted as a saving.
 
 Design note — axis conventions
 ------------------------------
 ``ANCHOR`` reuses across the *denoising-step* axis (skip this step, keep the last
-latent), matching cache methods like DeepCache/TeaCache. ``INTERP`` reuses the
-*cached ε_θ* but still takes a fresh, cheap scheduler step so the tube keeps
-moving with the global trajectory instead of stalling. ``LOWFREQ`` keeps the
-low-frequency band fresh (strided compute + upsample) and inherits high-frequency
-detail from cache. These choices are local to this file; the rest of the
-framework only sees "an action was executed".
+latent), matching cache methods like DeepCache/TeaCache. ``INTERP`` reuses across
+the *frame* axis: the tube's tokens are rebuilt from the frames on either side of
+them, so the tube keeps moving with the global trajectory without being denoised.
+``LOWFREQ`` keeps the low-frequency band fresh (strided compute + upsample) and
+inherits high-frequency detail from cache. These choices are local to this file —
+the rest of the framework only sees "an action was executed" — but both cheap
+reconstructions (:meth:`TransitionExecutor.coarsen_lowfreq`,
+:meth:`TransitionExecutor.interp_temporal`) are *shared verbatim* with Stage-A
+teacher generation, so the damage labels describe the operation inference performs.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from cocf.backbones.base import BackboneAdapter, BackboneCache, TextConditioning
+from cocf.common.logging import get_logger
 from cocf.common.types import Action, AllocationDecision, SemanticTube, TokenGrid
 
 Tensor = torch.Tensor
+_log = get_logger(__name__)
 
 
 @dataclass
@@ -52,15 +65,38 @@ class TransitionResult:
 
     z_next: Tensor  # [B, N, d] latent at t_next
     cache: BackboneCache  # refreshed ε_θ cache (full-resolution, for reuse)
-    active_mask: Tensor  # [N] bool — tokens freshly computed this step
+    active_mask: Tensor  # [N] bool — tokens the allocation *planned* to compute
     # per-tube residual δ_k = ‖z_full − z_action‖ on the tube, for RAEC (§5.3.1).
     # Only populated for tubes that skipped (INTERP/ANCHOR) when ``measure_residual``.
     tube_residual: Dict[int, float]
-    active_ratio: float  # |active| / N — the efficiency metric (§9.4)
+    # |active| / N — the *plan*: what fraction of tokens the allocator marked fresh.
+    # This is a mask-occupancy statistic and NOT an efficiency metric: an adapter
+    # without a token-sparse attention kernel computes densely regardless of it.
+    mask_ratio: float
+    # What the denoiser actually spent this step, as a fraction of a dense forward,
+    # self-reported by the adapter (:attr:`DenoiseOutput.compute_fraction`). This is
+    # the number to quote as a saving — 0.0 on a whole-step skip, 1.0 on a dense
+    # forward, |active|/N only where the adapter is genuinely sparse.
+    compute_ratio: float
     # the "compute-everywhere" candidate latent z_full (cached-ε scheduler step).
     # Returned so RAEC boundary fusion (§5.3.2) and the single-hop counterfactual
     # check (§3.3.4) have the full-compute reference without recomputing it.
     z_full: Optional[Tensor] = None
+    # Tubes whose *executed* action differs from the allocated one because the step
+    # was promoted to a whole-step skip (``dense_step_skip_below``). Empty on every
+    # ordinary step. Reported so the trace and the certificate describe what actually
+    # happened rather than what was planned.
+    downgraded: Dict[int, Action] = field(default_factory=dict)
+
+    @property
+    def active_ratio(self) -> float:
+        """Deprecated alias of :attr:`mask_ratio`.
+
+        Kept so external callers do not break, but renamed at the source: it was
+        being reported as a FLOPs saving while measuring only how much of the token
+        grid the allocator *wanted* recomputed. Use :attr:`compute_ratio` for cost.
+        """
+        return self.mask_ratio
 
 
 class TransitionExecutor:
@@ -71,10 +107,24 @@ class TransitionExecutor:
     this class stays trivially testable and reusable.
     """
 
-    def __init__(self, adapter: BackboneAdapter, lowfreq_stride: int = 2) -> None:
+    def __init__(
+        self,
+        adapter: BackboneAdapter,
+        lowfreq_stride: int = 2,
+        dense_step_skip_below: float = 0.0,
+        background_refresh_every: int = 0,
+    ) -> None:
         self.adapter = adapter
+        # Recompute the un-tubed background every N steps (0 = never, the old
+        # behaviour: it stayed at the warm-up step's ε for the whole trajectory).
+        self.background_refresh_every = max(0, int(background_refresh_every))
         # spatial stride for LOWFREQ active subsampling (2 ⇒ ~1/4 tokens computed)
         self.lowfreq_stride = max(1, int(lowfreq_stride))
+        # On an adapter without token-sparse attention, a mask occupancy at or below
+        # this fraction buys nothing: the dense forward runs at full price either way.
+        # Promoting such a step to a *whole-step skip* converts the plan into an
+        # actual saving. 0 disables the promotion (always pay for the dense forward).
+        self.dense_step_skip_below = max(0.0, float(dense_step_skip_below))
 
     # ------------------------------------------------------------------ #
     # Active-mask construction (the FLOPs lever)
@@ -90,10 +140,19 @@ class TransitionExecutor:
     ) -> Tensor:
         """Bool ``[N]`` mask of tokens to freshly compute this step.
 
-        Tokens not covered by *any* tube (background) default to inactive — they
-        are the cheapest to reuse and the axioms (§3.2.2) say their causal effect
-        is ~constant. FULL marks every tube token active; LOWFREQ marks a strided
-        spatial subset; INTERP/ANCHOR mark none.
+        FULL marks every tube token active; LOWFREQ marks a strided spatial subset;
+        INTERP/ANCHOR mark none.
+
+        Tokens covered by *no* tube — the background, typically ~3/4 of the grid — are
+        the cheapest to reuse and the axioms (§3.2.2) say their causal effect is
+        approximately constant. "Approximately constant" is not "reusable for thirty
+        steps", though: starting from an all-zero mask meant the background's ε was
+        taken from the single warm-up step for the entire trajectory, with no refresh
+        cadence, no certificate and no rollback covering it — every RAEC safety
+        mechanism is scoped to tubes (§P1-8). ``background_refresh_every`` recomputes
+        it periodically; on a dense-only adapter this is free (the forward runs at full
+        price regardless), and on a token-sparse one it is the cost of not letting the
+        largest region of the frame drift unmonitored.
         """
         mask = torch.zeros(grid.num_tokens, dtype=torch.bool, device=device)
         for tube in tubes:
@@ -103,7 +162,73 @@ class TransitionExecutor:
             elif action == Action.LOWFREQ:
                 mask[self._strided_indices(tube, grid).to(device)] = True
             # INTERP / ANCHOR contribute no active tokens
+        if self._refresh_background_at(decision.step):
+            covered = torch.zeros_like(mask)
+            for tube in tubes:
+                covered[tube.all_token_indices().to(device)] = True
+            mask |= ~covered
         return mask
+
+    def _refresh_background_at(self, step: int) -> bool:
+        """Whether this step recomputes the un-tubed background (§P1-8)."""
+        n = self.background_refresh_every
+        return n > 0 and step > 0 and step % n == 0
+
+    def _maybe_promote_to_step_skip(
+        self,
+        active_mask: Tensor,
+        cache: Optional[BackboneCache],
+        decision: AllocationDecision,
+        tubes: List[SemanticTube],
+    ) -> Tensor:
+        """Turn a near-empty allocation into a genuine whole-step skip.
+
+        On an adapter that cannot compute a token subset (``supports_token_sparsity
+        is False`` — every real video-DiT today) a mask with 3% of the tokens set
+        costs exactly as much as a mask with 100% set: the transformer runs densely
+        and the mask only decides which outputs are kept. Paying that full price to
+        refresh a handful of tokens is the worst of both worlds, so when the plan
+        falls at or below ``dense_step_skip_below`` we clear the mask entirely, which
+        :meth:`BackboneAdapter.denoise` then answers from cache without touching the
+        transformer — the one saving that is real on every backbone (§5.1).
+
+        **A FULL allocation vetoes the promotion, however small the tube.** FULL is
+        how the system expresses "this region must be recomputed": the allocator
+        assigns it to unstable tubes (§4.3.1) and RAEC pins it there for ``q`` steps
+        after a rollback (§5.3.2). Dropping the forward because such a tube happens to
+        be tiny would quietly cancel the safety mechanism that asked for it — the
+        opposite of what a cheap throughput heuristic is allowed to do.
+
+        **Known limitation — why this is opt-in.** A promotion downgrades every
+        LOWFREQ tube to plain cache reuse, and since nothing was computed there is no
+        reference to measure those tubes' skip residual against: the certificate sees
+        δ=0 and cannot price the extra error. The downgrade is reported back through
+        :attr:`TransitionResult.downgraded` so traces and logs do not claim LOWFREQ
+        ran, but the risk layer's *coverage* of those tubes is genuinely reduced.
+        Hence ``dense_step_skip_below`` defaults to 0.
+
+        No-op when the adapter *is* sparse (the mask is already proportional to cost),
+        when the threshold is 0, when the mask is empty or full, or when there is no
+        cache to answer from.
+        """
+        if self.adapter.supports_token_sparsity or self.dense_step_skip_below <= 0.0:
+            return active_mask
+        if cache is None or cache.model_output is None:
+            return active_mask  # nothing to reuse — the forward must run
+        if any(
+            decision.action_for(t.tube_id, default=Action.FULL) == Action.FULL
+            for t in tubes
+        ):
+            return active_mask  # a tube demanded full compute; honour it
+        occupancy = float(active_mask.float().mean().item())
+        if 0.0 < occupancy <= self.dense_step_skip_below:
+            _log.debug(
+                "transition: mask occupancy %.4f ≤ %.4f on a dense-only adapter with no "
+                "FULL tube — promoting to a whole-step skip (a partial dense forward "
+                "saves nothing)", occupancy, self.dense_step_skip_below,
+            )
+            return torch.zeros_like(active_mask)
+        return active_mask
 
     def _strided_indices(self, tube: SemanticTube, grid: TokenGrid) -> Tensor:
         """Spatially strided subset of a tube's tokens for LOWFREQ compute.
@@ -159,17 +284,43 @@ class TransitionExecutor:
             *cache-reused full step* reference, feeding the error certificate.
         """
         device = z_t.device
-        active_mask = self.build_active_mask(decision, tubes, grid, device=device)
+        planned_mask = self.build_active_mask(decision, tubes, grid, device=device)
+        active_mask = self._maybe_promote_to_step_skip(
+            planned_mask, cache, decision, tubes
+        )
+        # A promotion cleared a non-empty plan: every tube that was going to be
+        # refreshed is now reusing cache. Record it so the caller certifies and logs
+        # the action that ran, not the one that was allocated.
+        downgraded: Dict[int, Action] = {}
+        if active_mask is not planned_mask:
+            downgraded = {
+                t.tube_id: Action.ANCHOR
+                for t in tubes
+                if decision.action_for(t.tube_id, default=Action.FULL) == Action.LOWFREQ
+            }
 
         # 1) Denoise only the active tokens; the adapter splices inactive ε from cache.
         out = self.adapter.denoise(
             z_t, t, cond, grid=grid, active_mask=active_mask,
             cache=cache, want_attention=want_attention,
         )
-        eps = out.cache.model_output  # [B, N, d_out] full-resolution ε (active fresh)
+        # ``out.model_output``, *not* ``out.cache.model_output``: they carry identical
+        # values, but adapters detach the copy they hand back as cache (it is reuse
+        # state, and keeping a graph on it would chain every step's activations
+        # together forever). Stepping on the detached copy severs Stage C's §4.2 loss
+        # from the denoiser on exactly the backbones that detach — i.e. the real ones.
+        eps = out.model_output  # [B, N, d_out] full-resolution ε (active fresh)
 
         # 2) A single scheduler step gives the "compute everywhere" candidate.
         z_full = self.adapter.scheduler_step(eps, t, t_next, z_t)
+
+        # Did the denoiser actually run? LOWFREQ's reconstruction upsamples *from the
+        # freshly computed lattice*; when the transformer was skipped (an empty mask,
+        # or a promoted step skip) there is no such lattice — every token in z_full
+        # came from the same cached ε — so smearing lattice values over the holes
+        # would only destroy detail in exchange for nothing. INTERP/ANCHOR are pure
+        # latent-space operations and stay meaningful either way.
+        computed = float(getattr(out, "compute_fraction", 1.0)) > 0.0
 
         # 3) Per-action latent reconstruction for the skipped tubes.
         z_next = z_full.clone()
@@ -177,20 +328,55 @@ class TransitionExecutor:
         for tube in tubes:
             action = decision.action_for(tube.tube_id, default=Action.FULL)
             if action in (Action.FULL, Action.LOWFREQ):
-                if action == Action.LOWFREQ and self.lowfreq_stride > 1:
+                if action == Action.LOWFREQ and self.lowfreq_stride > 1 and computed:
                     self._fill_lowfreq(z_next, z_full, tube, grid)
                 continue  # already in z_full
+
+        # Skip write-backs are applied *after* every computed tube and in a fixed
+        # severity order, so an overlap does not resolve by list position (§P1-6).
+        # Two rules make the result order-independent: a token that was freshly
+        # computed for some other tube is never overwritten by a skip, and where two
+        # skips overlap the less destructive one (INTERP, which still moves with the
+        # trajectory) is written last and wins over ANCHOR's freeze.
+        active_now = active_mask.to(device)
+        skips = sorted(
+            (t for t in tubes
+             if decision.action_for(t.tube_id, default=Action.FULL).is_skip),
+            key=lambda t: -int(decision.action_for(t.tube_id, default=Action.FULL)),
+        )
+        for tube in skips:
+            action = decision.action_for(tube.tube_id, default=Action.FULL)
             idx = tube.all_token_indices().to(device)
             if action == Action.ANCHOR and anchor_latent is not None:
                 z_skip = anchor_latent.index_select(1, idx)
-            else:  # INTERP, or ANCHOR without an anchor latent → reuse cached ε step
-                z_skip = z_full.index_select(1, idx)  # already a cheap ε-reuse step
+            elif action == Action.INTERP:
+                # Real temporal interpolation (see :meth:`interp_rows`). Falls back to
+                # freezing the tube when it spans a single frame — there is nothing to
+                # interpolate between, and re-reading z_full would be the old no-op.
+                rows = self.interp_rows(z_full, tube, grid)
+                z_skip = rows if rows is not None else z_t.index_select(1, idx)
+            else:
+                # ANCHOR with no stored anchor: *freeze* the tube at the pre-step
+                # latent, which is what "anchor" means and what Stage A labels
+                # (``z_prev``). Reading z_full back was an identity, so the action had
+                # no effect and its residual was zero.
+                z_skip = z_t.index_select(1, idx)
             if measure_residual:
                 ref = z_full.index_select(1, idx)
                 tube_residual[tube.tube_id] = float(
                     (ref - z_skip).pow(2).mean().sqrt().item()
                 )
-            z_next.index_copy_(1, idx, z_skip.to(z_next.dtype))
+            # Never clobber a token another tube had freshly computed: it holds a real
+            # denoiser output, which is strictly better than any skip reconstruction.
+            keep = ~active_now.index_select(0, idx)
+            if bool(keep.all()):
+                z_next.index_copy_(1, idx, z_skip.to(z_next.dtype))
+            elif bool(keep.any()):
+                sel = keep.nonzero(as_tuple=True)[0]
+                z_next.index_copy_(
+                    1, idx.index_select(0, sel),
+                    z_skip.index_select(1, sel).to(z_next.dtype),
+                )
 
         active_ratio = float(active_mask.float().mean().item())
         return TransitionResult(
@@ -198,8 +384,11 @@ class TransitionExecutor:
             cache=out.cache,
             active_mask=active_mask,
             tube_residual=tube_residual,
-            active_ratio=active_ratio,
+            mask_ratio=active_ratio,
+            # What the adapter says it spent — not what the mask implies (§P0-1).
+            compute_ratio=float(getattr(out, "compute_fraction", 1.0)),
             z_full=z_full,
+            downgraded=downgraded,
         )
 
     def coarsen_lowfreq(
@@ -217,6 +406,77 @@ class TransitionExecutor:
         out = z.clone()
         self._fill_lowfreq(out, z, tube, grid)
         return out
+
+    def interp_temporal(
+        self, z: Tensor, tube: SemanticTube, grid: TokenGrid,
+        freeze_to: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Return a copy of ``z`` with ``tube``'s tokens temporally interpolated.
+
+        The INTERP counterpart of :meth:`coarsen_lowfreq`, and shared with Stage-A
+        teacher generation for the same reason: the offline damage label must be
+        produced by the *exact* operation inference performs, or the predictor learns
+        the wrong μ for the action (§7.1.1 no train/serve skew).
+
+        ``freeze_to`` supplies the pre-step latent used for the single-frame fallback
+        (a tube spanning one frame has nothing to interpolate *between*, so INTERP
+        degenerates to freezing it — what the executor does). Callers **must** pass it
+        or the fallback silently becomes a no-op: Stage A would then label a
+        single-frame tube's INTERP damage as exactly 0, teaching the predictor that
+        INTERP is free precisely where inference makes it a freeze.
+        """
+        rows = self.interp_rows(z, tube, grid)
+        idx = tube.all_token_indices().to(z.device)
+        if rows is None:
+            if freeze_to is None or idx.numel() == 0:
+                return z
+            rows = freeze_to.index_select(1, idx)
+        out = z.clone()
+        out.index_copy_(1, idx, rows.to(out.dtype))
+        return out
+
+    def interp_rows(
+        self, z: Tensor, tube: SemanticTube, grid: TokenGrid
+    ) -> Optional[Tensor]:
+        """INTERP's actual latent operation: ``[B, |g_k|, d]`` interpolated tube rows.
+
+        For every frame the tube spans, its tokens are replaced by a *temporal* blend
+        of the tube's content at the neighbouring frames, taken at the **same spatial
+        position** — i.e. "do not denoise this frame, infer it from the frames around
+        it". Endpoint frames have one neighbour and copy it.
+
+        This is what makes INTERP an action at all. It used to read its own tokens back
+        out of the freshly-stepped latent (``z_skip = z_full[idx]``), which is an
+        identity: the latent was unchanged, the skip residual δ_k was *identically
+        zero*, and with it the certificate's λ_res term, the §3.3.4 counterfactual
+        check and every repair that depends on them (§P1-1). Blending across time
+        preserves within-frame structure while introducing the temporal lag that is the
+        genuine cost of skipping — the damage the predictor is supposed to learn.
+
+        Returns ``None`` when the tube spans fewer than two frames (nothing to
+        interpolate from), leaving the caller to fall back.
+        """
+        frames = tube.frames
+        if len(frames) < 2:
+            return None
+        device = z.device
+        per_frame = grid.tokens_per_frame
+        rows: List[Tensor] = []
+        for i, f in enumerate(frames):
+            idx = tube.tokens_by_frame[f].to(device)
+            local = idx - f * per_frame  # spatial offset, identical across frames
+            lo = frames[i - 1] if i > 0 else None
+            hi = frames[i + 1] if i + 1 < len(frames) else None
+            if lo is None:  # first frame: hold the only neighbour it has
+                rows.append(z.index_select(1, hi * per_frame + local))
+            elif hi is None:  # last frame: likewise
+                rows.append(z.index_select(1, lo * per_frame + local))
+            else:
+                w = (f - lo) / float(hi - lo)
+                a = z.index_select(1, lo * per_frame + local)
+                b = z.index_select(1, hi * per_frame + local)
+                rows.append(a * (1.0 - w) + b * w)
+        return torch.cat(rows, dim=1)
 
     def _fill_lowfreq(
         self, z_next: Tensor, z_full: Tensor, tube: SemanticTube, grid: TokenGrid

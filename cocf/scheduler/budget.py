@@ -70,12 +70,23 @@ class BudgetScheduler:
     # ------------------------------------------------------------------ #
 
     def time_weight(self, step_frac: float) -> float:
-        """U-shaped ``q(t)`` over ``step_frac=t/T`` (high at both ends, low mid)."""
+        """U-shaped ``q(t) ∈ [floor, 1]`` over ``step_frac=t/T`` (high at both ends).
+
+        Normalised by the largest value the shape can attain, because ``early`` and
+        ``late`` are mutually exclusive ramps: the raw sum could only ever reach
+        ``q_mid_floor + max(boost)`` — 0.50 on the defaults — so ``B_t`` topped out at
+        ``b_min + 0.7·0.5 = 0.65`` and ``b_max = 1.0`` was a dead config value the
+        system could never spend, leaving it permanently in "downgrade" mode (§P1-9).
+        Dividing by that maximum keeps the configured early/late *ratio* intact while
+        making the ends of the trajectory actually reach the ceiling.
+        """
         sf = float(min(max(step_frac, 0.0), 1.0))
         early = max(0.0, (sf - 0.60) / 0.40)   # ramps up as sf → 1 (structure phase)
         late = max(0.0, (0.40 - sf) / 0.40)    # ramps up as sf → 0 (detail phase)
         c = self.cfg
-        return c.q_mid_floor + c.q_early_boost * early + c.q_late_boost * late
+        raw = c.q_mid_floor + c.q_early_boost * early + c.q_late_boost * late
+        q_max = c.q_mid_floor + max(c.q_early_boost, c.q_late_boost)
+        return float(min(raw / q_max, 1.0)) if q_max > 0 else 0.0
 
     # ------------------------------------------------------------------ #
     # budget
@@ -91,21 +102,23 @@ class BudgetScheduler:
     ) -> float:
         """Fraction of full compute allowed this step, in ``[b_min, b_max]`` (§7.3).
 
-        Verbatim §7.3 form: the U-shaped time weight ``q(t)`` is scaled into the
-        ``[b_min, b_max]`` band, and the three demand signals (scene complexity,
-        mean damage uncertainty, tube-interaction density) are added on top in
-        absolute compute-fraction units. The doc formula is unbounded above, so the
-        result is clamped back to ``[b_min, b_max]`` to stay a valid compute fraction.
+        ``B_t = b_min + (b_max − b_min) · clip(q(t) + demand, 0, 1)``.
+
+        Everything inside the clip is a *weight* in [0, 1]: the U-shaped time profile
+        plus the three demand signals (scene complexity, mean damage uncertainty,
+        tube-interaction density). Adding the demand terms in absolute compute-fraction
+        units instead — and clamping ``B_t`` afterwards, as this used to — made the
+        band boundaries do the work of the formula and did not match the documented
+        form, so a caller reading either one was misled about the other (§P1-9).
         """
         c = self.cfg
-        b_t = (
-            c.b_min
-            + (c.b_max - c.b_min) * self.time_weight(step_frac)
-            + c.eta_scene * complexity
+        demand = (
+            c.eta_scene * complexity
             + c.eta_uncertainty * mean_uncertainty
             + c.eta_interaction * interaction_density
         )
-        return min(max(b_t, c.b_min), c.b_max)
+        weight = min(max(self.time_weight(step_frac) + demand, 0.0), 1.0)
+        return c.b_min + (c.b_max - c.b_min) * weight
 
     def score_complexity(self, prompt: str, subgraph: Optional[CausalSubgraph] = None) -> float:
         return self.complexity.score(prompt, subgraph)

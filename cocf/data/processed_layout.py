@@ -148,6 +148,7 @@ class ProcessedLayout:
         for d in (
             self.metadata_dir, self.raw_filtered_dir, self.full_baseline_dir,
             self.tube_features_dir, self.lmdb_dir, self.splits_dir,
+            self.text_embed_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
         return self
@@ -160,6 +161,20 @@ class ProcessedLayout:
     def feature_bucket(self, video_id) -> Path:
         return self.tube_features_dir / video_id_str(video_id)
 
+    @property
+    def text_embed_dir(self) -> Path:
+        """One prompt embedding per *clip* — not per counterfactual sample.
+
+        The umT5 sequence is a property of the caption, so storing it inside every
+        (tube, step, action) record duplicated a ~8 MiB tensor 15× per clip: ~21 TiB
+        at the §2.4 target of 180k clips, before any of it is read. Stage B joins it
+        back by ``video_id`` at load time.
+        """
+        return self.root / "text_embeds"
+
+    def text_embed_path(self, video_id) -> Path:
+        return self.text_embed_dir / f"{video_id_str(video_id)}.pt"
+
     def save_baseline(
         self,
         video_id,
@@ -167,6 +182,7 @@ class ProcessedLayout:
         text_emb: Tensor,
         z_t_by_step: Mapping[int, Tensor],
         y_full: Tensor,
+        z_init: Optional[Tensor] = None,
         kv_cache: Optional[Mapping[str, Tensor]] = None,
     ) -> Path:
         """Write the §3 level-3 ``full_baseline/vid_XXXXXX/`` bucket for one video."""
@@ -176,6 +192,10 @@ class ProcessedLayout:
         for step, z in z_t_by_step.items():
             _save_npy(bucket / "z_t_sampled" / f"t_{int(step):02d}.npy", z)
         _save_npy(bucket / "Y_full.npy", y_full)
+        if z_init is not None:
+            # Y_full is only a usable reference for a run that starts from the same
+            # noise, so the two are stored together (§P2-4).
+            _save_npy(bucket / "z_init.npy", z_init)
         if kv_cache:
             kv_dir = bucket / "kv_cache"
             kv_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +208,13 @@ class ProcessedLayout:
     def load_baseline_latent(self, video_id, step: int, device=None) -> Optional[Tensor]:
         """Load one cached ``z_t`` for Stage C (or None if the bucket is absent)."""
         path = self.baseline_bucket(video_id) / "z_t_sampled" / f"t_{int(step):02d}.npy"
+        if not path.exists():
+            return None
+        return _load_npy(path, device)
+
+    def load_z_init(self, video_id, device=None) -> Optional[Tensor]:
+        """The ``z_T`` ``Y_full`` was generated from (``None`` when not persisted)."""
+        path = self.baseline_bucket(video_id) / "z_init.npy"
         if not path.exists():
             return None
         return _load_npy(path, device)

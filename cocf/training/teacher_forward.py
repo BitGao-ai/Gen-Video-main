@@ -289,4 +289,5 @@ class TeacherForwardRunner:
             tube_visual_embed_full=tube_visual_embed_full,
             num_total_steps=self.cfg.num_inference_steps,
             text_embed=cond.embeds[0],
+            z_init=z_init,
         )

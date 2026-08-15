@@ -1,12 +1,23 @@
 #!/usr/bin/env python
 """Entry script for accelerated video inference (§7.2).
 
+Runs the full COCF-SS-DCA loop end-to-end: encode the prompt, sample ``z_T`` in the
+backbone's own latent layout, denoise with per-tube compute allocation, then decode
+and write the video.
+
 Usage:
     python scripts/inference/infer_single_video.py \
         --prompt "a cat jumping" \
-        --checkpoint ./checkpoints/stage_c_final.pt \
+        --backbone mock \
         --output ./output.mp4 \
         --quality balanced
+
+    # with trained plugins (and Stage-C LoRA, if the checkpoint carries any)
+    python scripts/inference/infer_single_video.py \
+        --prompt "a cat jumping" \
+        --backbone wan22 --model-path /weights/Wan2.2-T2V-A14B \
+        --checkpoint ./checkpoints/stage_c_final.pt \
+        --output ./output.mp4
 """
 
 import argparse
@@ -16,78 +27,138 @@ from pathlib import Path
 import torch
 
 from cocf.common.config import Config
-from cocf.common.logging import setup_logging
+from cocf.common.logging import get_logger, setup_logging
 from cocf.core.accelerator import Accelerator
+from cocf.data.video_writer import save_video
 from cocf.engine import InferenceEngine
+from cocf.training.checkpoint import load_checkpoint
+
+# §7.3 compute-budget floor per quality preset. The budget scheduler's B_t is clamped
+# to [b_min, b_max], so this is the knob that decides *how much compute the run is
+# allowed to skip* — which is what "quality" means here. (Step count is orthogonal
+# and stays on --steps.)
+QUALITY_B_MIN = {"fast": 0.30, "balanced": 0.50, "quality": 0.80}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Accelerated video inference (§7.2)")
+    p.add_argument("--prompt", type=str, required=True, help="Text prompt")
+    p.add_argument("--backbone", type=str, default="mock",
+                   help="Registry key: mock | wan22 | wan21 | hunyuanvideo")
+    p.add_argument("--model-path", "--model_path", dest="model_path", type=str,
+                   help="Weights path for a real backbone (unused by 'mock')")
+    p.add_argument("--checkpoint", type=Path,
+                   help="Trained accelerator checkpoint (Stage B or C). Optional: "
+                        "without it the plugins run at their cold-start init.")
+    p.add_argument("--output", type=Path, default=Path("./output.mp4"))
+    p.add_argument("--quality", choices=sorted(QUALITY_B_MIN), default="balanced",
+                   help=f"Compute-budget floor b_min: {QUALITY_B_MIN}")
+    p.add_argument("--steps", type=int, help="Override num inference steps")
+    p.add_argument("--num-frames", "--num_frames", dest="num_frames", type=int,
+                   help="Frames to generate (default: config.data.num_frames)")
+    p.add_argument("--height", type=int, help="Frame height (default: config.data.height)")
+    p.add_argument("--width", type=int, help="Frame width (default: config.data.width)")
+    p.add_argument("--fps", type=int, default=16, help="Frame rate of the written file")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--seed", type=int, default=42)
+    return p
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Accelerated video inference")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Model checkpoint")
-    parser.add_argument("--output", type=Path, default=Path("./output.mp4"))
-    parser.add_argument("--quality", choices=["fast", "balanced", "quality"], default="balanced")
-    parser.add_argument("--steps", type=int, help="Override num inference steps")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     setup_logging(level=logging.INFO)
-    log = logging.getLogger(__name__)
+    # Under the framework's ``cocf`` logger namespace: setup_logging attaches the
+    # stdout handler there, so a bare ``getLogger(__name__)`` ("__main__") would be
+    # silently dropped and the run would print nothing but warnings.
+    log = get_logger("cocf.infer")
 
+    # -- config ----------------------------------------------------------- #
+    # Seed the global RNG too, not just the z_init generator: without a checkpoint the
+    # plugins are randomly initialised (the documented quick start), so leaving the
+    # global RNG unseeded makes two runs with the same --seed produce different videos.
     torch.manual_seed(args.seed)
-
-    # Build config from defaults, then apply the quality preset
     config = Config()
-    if args.quality == "fast":
-        config.engine.num_inference_steps = 20
-    elif args.quality == "quality":
-        config.engine.num_inference_steps = 50
+    config.seed = args.seed
+    config.backbone.name = args.backbone
+    config.backbone.device = args.device
+    if args.model_path:
+        config.backbone.model_path = args.model_path
 
-    # Override steps if specified
+    # --quality sets the budget floor (§7.3), matching the documented semantics.
+    config.budget.b_min = QUALITY_B_MIN[args.quality]
+    config.budget.b_max = max(config.budget.b_max, config.budget.b_min)
     if args.steps:
         config.engine.num_inference_steps = args.steps
 
-    # Place the frozen backbone on the run device. `engine.to(device)` below moves the
-    # plugins (a registered submodule) but NOT the backbone (a plain attribute), so
-    # without this a non-default --device leaves the backbone stranded on cuda while
-    # z_init lives on --device.
-    config.backbone.device = args.device
+    frames = args.num_frames or config.data.num_frames
+    height = args.height or config.data.height
+    width = args.width or config.data.width
 
-    # Build accelerator & engine
-    log.info(f"Loading checkpoint from {args.checkpoint}")
+    # -- accelerator & engine --------------------------------------------- #
     accelerator = Accelerator.from_config(config)
-    state_dict = torch.load(args.checkpoint, map_location=args.device)
-    accelerator.load_state_dict(state_dict)
+    backbone = accelerator.backbone
+    # The adapter resolves an unavailable backend down to CPU; follow *its* choice so
+    # the plugins, z_init and the frozen weights all land on one device.
+    device = torch.device(backbone.device)
+    if device != torch.device(args.device):
+        log.warning("requested device %s is unavailable; running on %s", args.device, device)
 
+    if args.checkpoint and args.checkpoint.exists():
+        log.info("Loading checkpoint from %s", args.checkpoint)
+        ckpt = torch.load(args.checkpoint, map_location=str(device), weights_only=False)
+        # Either layout: Stage B's bare state_dict or Stage C's two-part mapping;
+        # any LoRA the checkpoint carries is re-injected into the frozen backbone.
+        n = load_checkpoint(accelerator, ckpt, training_config=config.training)
+        if n:
+            log.info("Re-attached %d Stage-C LoRA adapter(s)", n)
+    elif args.checkpoint:
+        log.warning("checkpoint %s not found — running with cold-start plugins",
+                    args.checkpoint)
+    else:
+        log.info("No --checkpoint given: running with cold-start (untrained) plugins.")
+
+    accelerator.to(device)
     engine = InferenceEngine(accelerator, config.engine, config.trigger)
-    engine.to(torch.device(args.device))
+    engine.to(device)
 
-    # Prepare input
-    log.info(f"Generating video: '{args.prompt}'")
-    z_init = torch.randn(1, 1024, 64, device=torch.device(args.device))  # Stub shape
+    # -- inputs (owned by the adapter: layout, text encoding, noise) -------- #
+    # Materialise the weights *before* reading any geometry: a real adapter resolves
+    # its true latent channel count / VAE compression during the lazy load, so a
+    # token_grid computed beforehand can disagree with the z_init built afterwards.
+    backbone.ensure_loaded()
+    grid = backbone.token_grid(frames, height, width)
+    log.info(
+        "Generating %d frames @ %dx%d → token grid %s (%d tokens), %d steps, b_min=%.2f",
+        frames, height, width, grid, grid.num_tokens,
+        config.engine.num_inference_steps, config.budget.b_min,
+    )
+    cond = backbone.encode_text([args.prompt]).to(device)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    z_init = backbone.initial_latent(grid, batch=1, generator=generator, device=device)
 
-    # TODO: Prepare proper inputs: z_init, grid, cond, etc.
-
-    # Run inference
+    # -- run ---------------------------------------------------------------- #
+    log.info("Generating video: '%s'", args.prompt)
     with torch.no_grad():
         result = engine.generate(
             prompts=[args.prompt],
             z_init=z_init,
-            grid=None,  # TODO: build TokenGrid
-            cond=None,  # TODO: encode prompts
-            backbone=accelerator.backbone,
+            grid=grid,
+            cond=cond,
+            backbone=backbone,
         )
 
-    # Log efficiency
-    log.info("Generation complete!")
-    summary = result.summary()
-    for key, val in summary.items():
-        log.info(f"  {key}: {val}")
+    log.info("Generation complete. Efficiency summary:")
+    for key, val in result.summary().items():
+        log.info("  %s: %s", key, val)
+    log.info(
+        "  (mean_compute_ratio is the measured cost; mean_mask_ratio is the "
+        "allocation plan and is not a FLOPs saving)"
+    )
 
-    # Save video (stub)
-    log.info(f"Saving video to {args.output}")
-    # TODO: Encode video.cpu().numpy() and save
+    # -- write --------------------------------------------------------------- #
+    written, backend_name = save_video(result.video, args.output, fps=args.fps)
+    log.info("Saved video to %s (via %s)", written, backend_name)
 
 
 if __name__ == "__main__":

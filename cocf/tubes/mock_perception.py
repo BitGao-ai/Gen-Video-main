@@ -9,7 +9,7 @@ same four methods and are dropped in via config — no algorithm code changes.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -22,9 +22,14 @@ class MockPerception(PerceptionProvider):
     """Synthetic blobs with stable identities and a small constant drift."""
 
     def __init__(self, num_objects: int = 3, drift: float = 2.0, d_id: int = 64,
-                 d_clip: int = 64, seed: int = 0) -> None:
+                 d_clip: int = 64, seed: int = 0, drift_x: Optional[float] = None) -> None:
         self.num_objects = num_objects
         self.drift = drift
+        # Horizontal drift differs from vertical on purpose. With one isotropic value
+        # the (dy, dx) flow contract is unfalsifiable — swapping the two channels
+        # changes nothing — which is exactly why the real provider could return RAFT's
+        # (dx, dy) unnoticed (§P1-11). An anisotropic mock makes a swap observable.
+        self.drift_x = float(drift * 2.0 if drift_x is None else drift_x)
         self.d_id = d_id
         self.d_clip = d_clip
         g = torch.Generator().manual_seed(seed)
@@ -64,7 +69,7 @@ class MockPerception(PerceptionProvider):
         masks = []
         for o in range(self.num_objects):
             cy = (self._centers0[o, 0] + self.drift / hp * fi) % 1.0
-            cx = (self._centers0[o, 1] + self.drift / wp * fi) % 1.0
+            cx = (self._centers0[o, 1] + self.drift_x / wp * fi) % 1.0
             d = (yy - cy) ** 2 + (xx - cx) ** 2
             masks.append(d < self._radius[o] ** 2)
         return torch.stack(masks)
@@ -83,8 +88,8 @@ class MockPerception(PerceptionProvider):
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
         _, hp, wp = frame_a.shape
         flow = torch.zeros(2, hp, wp, device=frame_a.device)
-        flow[0] = self.drift  # dy
-        flow[1] = self.drift  # dx
+        flow[0] = self.drift    # dy — vertical first, per the provider contract
+        flow[1] = self.drift_x  # dx
         return flow
 
     def _object_of(self, mask: Tensor, frame: Tensor) -> int:

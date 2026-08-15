@@ -41,8 +41,6 @@ class AnchorStore:
     def __init__(self, offload_to_cpu: bool = False) -> None:
         self.offload = offload_to_cpu
         self._anchors: Dict[int, _Anchor] = {}
-        # optional whole-latent safe snapshot (last globally low-risk step)
-        self._global: Optional[Tuple[int, Tensor]] = None
 
     # ------------------------------------------------------------------ #
     # update
@@ -64,10 +62,6 @@ class AnchorStore:
         )
         tube.last_safe_anchor_step = step
 
-    def update_global(self, z: Tensor, step: int) -> None:
-        store_dev = "cpu" if self.offload else z.device
-        self._global = (step, z.detach().to(store_dev))
-
     # ------------------------------------------------------------------ #
     # query / rollback
     # ------------------------------------------------------------------ #
@@ -80,9 +74,18 @@ class AnchorStore:
         return a.step if a is not None else None
 
     def age(self, tube_id: int, step: int) -> int:
-        """Steps since this tube was last anchored (0 if never → treat as fresh)."""
+        """Steps since this tube was last anchored.
+
+        A tube that has **never** been anchored is the *stalest* case, not the
+        freshest: nothing about it has ever been verified safe, so the certificate's
+        ``λ_age · age/(age+τ)`` term should charge it the most. Returning 0 (the old
+        "treat as fresh") inverted that — the least-trustworthy tubes were priced as
+        the most trustworthy, which is the wrong direction for a risk bound (§P1-14).
+        Their age is the whole trajectory so far, i.e. ``step``, which is 0 at the
+        start (nothing has drifted yet) and grows as the omission persists.
+        """
         a = self._anchors.get(tube_id)
-        return 0 if a is None else max(0, step - a.step)
+        return max(0, int(step)) if a is None else max(0, step - a.step)
 
     def rollback(self, z: Tensor, tube: SemanticTube) -> Tensor:
         """Return a copy of ``z`` with ``tube``'s tokens restored to its safe anchor.
@@ -94,9 +97,24 @@ class AnchorStore:
         if a is None:
             return z
         out = z.clone()
-        idx = a.indices.to(z.device)
-        out.index_copy_(1, idx, a.tokens.to(z.device, z.dtype))
+        self.scatter_into(out, tube)
         return out
+
+    def scatter_into(self, z: Tensor, tube: SemanticTube) -> bool:
+        """Write ``tube``'s anchor into ``z`` **in place**; True if it had one.
+
+        The in-place half of :meth:`rollback`, for callers assembling several tubes
+        into one buffer. Restoring K tubes by calling ``rollback`` K times allocates
+        and discards K full latents — on Wan2.2 at 480×832×49 that is ~7.8 MB copied
+        and thrown away per tube per step, exactly the churn the memory budget is
+        trying to avoid. One clone plus K scatters costs a single allocation.
+        """
+        a = self._anchors.get(tube.tube_id)
+        if a is None:
+            return False
+        idx = a.indices.to(z.device)
+        z.index_copy_(1, idx, a.tokens.to(z.device, z.dtype))
+        return True
 
     def get_tokens(self, tube_id: int, device=None, dtype=None) -> Optional[Tensor]:
         """The stored safe tokens ``[B, n_tok, d]`` for a tube (for boundary fusion)."""
@@ -107,4 +125,18 @@ class AnchorStore:
 
     def clear(self) -> None:
         self._anchors.clear()
-        self._global = None
+
+    def retain(self, tube_ids) -> int:
+        """Drop anchors whose tube no longer exists; return how many were dropped.
+
+        Called after a re-segmentation. Tube ids are monotonic, so a stale anchor can
+        never be *mistaken* for a live tube's — but it still pins the tokens it
+        snapshotted in memory for the rest of the generation, and on a long video with
+        frequent refreshes that accumulates. Dropping them keeps the store proportional
+        to the tubes actually in play.
+        """
+        keep = set(tube_ids)
+        stale = [tid for tid in self._anchors if tid not in keep]
+        for tid in stale:
+            del self._anchors[tid]
+        return len(stale)

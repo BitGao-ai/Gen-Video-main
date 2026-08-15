@@ -41,6 +41,26 @@ from cocf.tubes.regions import PerceptionProvider
 
 Tensor = torch.Tensor
 
+
+def raft_to_framework_flow(flow: Tensor) -> Tensor:
+    """torchvision RAFT ``(dx, dy)`` → this framework's ``(dy, dx)`` channel order.
+
+    torchvision returns horizontal displacement in channel 0; every consumer here
+    reads channel 0 as the *vertical* one (see
+    :meth:`cocf.tubes.regions.PerceptionProvider.optical_flow`). Handing the raw
+    output through therefore transposed every warp: occlusion, motion phase, the
+    affinity flow kernel and the warped-mask IoU were all computed from a
+    displacement rotated 90°, and on a non-square frame the down-sampling in
+    :meth:`TubeBuilder._downsample_flow` scaled each axis by the wrong extent on top
+    of that. Silent under the mock, which drives both channels identically (§P1-11).
+    """
+    if flow.shape[0] != 2:
+        raise ValueError(f"expected a [2, H, W] flow field, got {tuple(flow.shape)}")
+    return flow.flip(0)
+
+
+Tensor = torch.Tensor
+
 # Type aliases for the injected callables (documentation only).
 SegmentFn = Callable[[Tensor], Tensor]              # frame[3,Hp,Wp] -> masks[R,Hp,Wp] bool
 FeatureFn = Callable[[Tensor, Tensor], Tensor]      # (frame, mask) -> [d]
@@ -85,12 +105,15 @@ class ModelPerception(PerceptionProvider):
         d_id: int,
         d_clip: int,
         device: str | torch.device = "cpu",
+        batch_fn: Optional[Callable] = None,
     ) -> None:
         self._segment_fn = segment_fn
         self._identity_fn = identity_fn
         self._clip_image_fn = clip_image_fn
         self._clip_text_fn = clip_text_fn
         self._flow_fn = flow_fn
+        # (frame, [mask]) -> ([identity], [clip]); enables the batched path below.
+        self._batch_fn = batch_fn
         self.d_id = int(d_id)
         self.d_clip = int(d_clip)
         self.device = torch.device(device)
@@ -135,6 +158,28 @@ class ModelPerception(PerceptionProvider):
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
         """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``."""
         return self._flow_fn(frame_a, frame_b).to(frame_a.device)
+
+    def region_features(self, frame: Tensor, masks):
+        """All of a frame's regions in **one** DINOv2 + one CLIP forward (§P2-8).
+
+        Uses the batched callables when :meth:`from_pretrained` supplied them; falls
+        back to the per-region default otherwise, so a hand-injected instance keeps
+        working. Empty masks are excluded from the batch and filled with zeros, which
+        is what the per-region methods do.
+        """
+        masks = list(masks)
+        if self._batch_fn is None or not masks:
+            return super().region_features(frame, masks)
+        keep = [i for i, m in enumerate(masks) if self._nonempty(m)]
+        ident = [torch.zeros(self.d_id, device=frame.device) for _ in masks]
+        textf = [torch.zeros(self.d_clip, device=frame.device) for _ in masks]
+        if not keep:
+            return ident, textf
+        d_feats, c_feats = self._batch_fn(frame, [masks[i] for i in keep])
+        for j, i in enumerate(keep):
+            ident[i] = d_feats[j].detach().float().to(frame.device)
+            textf[i] = c_feats[j].detach().float().to(frame.device)
+        return ident, textf
 
     # -- helpers -------------------------------------------------------- #
 
@@ -244,6 +289,21 @@ class ModelPerception(PerceptionProvider):
                 feat = clip.get_image_features(px)[0]  # [d_clip]
             return feat
 
+        def batch_fn(frame: Tensor, masks):
+            """All regions of one frame in a single DINOv2 + CLIP forward (§P2-8)."""
+            crops = [_masked_crop(frame, m) for m in masks]
+            pil = [_to_pil(c) for c in crops if c is not None and c.numel()]
+            if not pil:
+                z_d = [_t.zeros(d_id, device=frame.device)] * len(masks)
+                z_c = [_t.zeros(d_clip, device=frame.device)] * len(masks)
+                return z_d, z_c
+            d_px = dino_proc(images=pil, return_tensors="pt")["pixel_values"].to(device)
+            c_px = clip_proc(images=pil, return_tensors="pt")["pixel_values"].to(device)
+            with _t.no_grad():
+                d_feat = dino(d_px).last_hidden_state.mean(dim=1)   # [n, d_id]
+                c_feat = clip.get_image_features(c_px)              # [n, d_clip]
+            return list(d_feat), list(c_feat)
+
         def clip_text_fn(prompt: str) -> Tensor:
             tin = clip_proc(
                 text=[prompt or " "], return_tensors="pt", padding=True, truncation=True
@@ -269,14 +329,21 @@ class ModelPerception(PerceptionProvider):
                 ap, h, w = _pad8(frame_a)
                 bp, _, _ = _pad8(frame_b)
                 with _t.no_grad():
-                    fl = raft(ap, bp)[-1][0]  # [2, H+pad, W+pad]
-                return fl[:, :h, :w].to(out_dev)
+                    fl = raft(ap, bp)[-1][0]  # [2, H+pad, W+pad] in RAFT's (dx, dy)
+                return raft_to_framework_flow(fl[:, :h, :w]).to(out_dev)
         except Exception:  # torchvision RAFT unavailable → zero flow (motion_phase=0)
             def flow_fn(frame_a: Tensor, frame_b: Tensor) -> Tensor:
                 _, h, w = frame_a.shape
                 return _t.zeros(2, h, w, device=frame_a.device)
 
-        return cls(
+        self = cls(
             segment_fn, identity_fn, clip_image_fn, clip_text_fn, flow_fn,
-            d_id=d_id, d_clip=d_clip, device=device,
+            d_id=d_id, d_clip=d_clip, device=device, batch_fn=batch_fn,
         )
+        # Publish the loaded backbones so a co-resident consumer can reuse them.
+        # DINOv2 + CLIP is ~1 GB, and Stage A builds *both* this and the metric
+        # extractor when --real-models is given, which held two identical copies on
+        # the card (§P2-7). See ``ModelMetricExtractor.from_pretrained(share_from=…)``.
+        self.models = {"dino": dino, "dino_proc": dino_proc,
+                       "clip": clip, "clip_proc": clip_proc}
+        return self

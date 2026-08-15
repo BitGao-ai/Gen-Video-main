@@ -78,6 +78,30 @@ class VideoFeatures:
         return int(self.dino_per_frame.shape[0])
 
 
+def crop_to_tube(video: Tensor, mask: Tensor) -> Tensor:
+    """Restrict ``[F, 3, H, W]`` to one tube: its frames only, zeroed outside its region.
+
+    This is what makes a damage label *about a tube* rather than about the whole clip.
+    The tube-group counterfactual of §7.1.1 intervenes on one tube, so scoring the
+    result on global features dilutes the signal into whatever the rest of the frame
+    happened to do — the predictor then has to recover per-tube differences from a
+    label that barely contains them.
+
+    ``mask`` is ``[F, H, W]`` bool over the *same* frame axis as ``video``; frames the
+    tube does not span are dropped (so the returned tensor is ``[n, 3, H, W]``, n ≤ F),
+    which keeps the per-frame consistency metrics measuring the tube's own lifetime.
+    Falls back to the unmasked video when the mask is empty.
+    """
+    if mask is None or mask.numel() == 0:
+        return video
+    present = mask.reshape(mask.shape[0], -1).any(dim=1).nonzero(as_tuple=True)[0]
+    if present.numel() == 0:
+        return video
+    v = video.index_select(0, present.to(video.device))
+    m = mask.index_select(0, present.to(mask.device)).to(v.device, v.dtype).unsqueeze(1)
+    return v * m
+
+
 class MetricExtractor(abc.ABC):
     """Extracts :class:`VideoFeatures` from a decoded video — injected dependency.
 
@@ -87,7 +111,9 @@ class MetricExtractor(abc.ABC):
 
     @abc.abstractmethod
     def extract(
-        self, video: Tensor, prompt: str, *, differentiable: bool = False
+        self, video: Tensor, prompt: str, *,
+        differentiable: bool = False,
+        tube_masks: Optional[Dict[int, Tensor]] = None,
     ) -> VideoFeatures:
         """``video`` is ``[F, 3, H, W]`` in [0,1]; returns its quality features.
 
@@ -96,6 +122,12 @@ class MetricExtractor(abc.ABC):
         where the features are detached references. ``differentiable=True`` keeps the
         autograd graph **and** the input device, so the accelerated branch of the §6.3.2
         Stage-C semantic loss can back-propagate into the render (repair net / LoRA).
+
+        ``tube_masks`` maps ``tube_id → [F, H, W]`` bool; each one adds a *localised*
+        identity feature to :attr:`VideoFeatures.tube_dino`, which is what lets the
+        damage computer score a tube-group counterfactual on the tube it intervened on
+        (§7.1.1) instead of on the whole frame. Costs one extra identity pass per tube,
+        so callers pass only the tubes they will actually score.
         """
 
 
@@ -172,13 +204,27 @@ class MultiDimDamageComputer:
             return float((1.0 - (f[1:] * f[:-1]).sum(-1)).mean())
         return max(0.0, flicker(cf) - flicker(ref))
 
-    @staticmethod
-    def _jerk_increase(ref_mag: Tensor, cf_mag: Tensor) -> float:
+    def _jerk_increase(self, ref_mag: Tensor, cf_mag: Tensor) -> float:
+        """Increase in flow-magnitude jerk, **relative to the reference's own scale**.
+
+        The absolute difference is not comparable across metric backends: the mock's
+        ``flow_mag`` is a descriptor-difference mean while the real extractor's is
+        ``‖flow‖ / W``, so the same motion yields values orders of magnitude apart and
+        a damage label generated with one backend cannot be read with the other.
+        Every other axis here is already a *ratio* or a bounded drop; this one was the
+        exception. Normalising by the reference jerk makes it scale-free and puts it
+        on the same [0, 1] footing as the rest.
+        """
         def jerk(mag: Tensor) -> float:
             if mag.numel() < 2:
                 return 0.0
             return float((mag[1:] - mag[:-1]).abs().mean())
-        return max(0.0, jerk(cf_mag) - jerk(ref_mag))
+
+        ref, cf = jerk(ref_mag), jerk(cf_mag)
+        if cf <= ref:
+            return 0.0
+        denom = max(ref, float(ref_mag.abs().mean()) if ref_mag.numel() else 0.0)
+        return float(min((cf - ref) / max(denom, self.eps), 1.0))
 
     def _motion_deviation(self, ref_mag: Tensor, cf_mag: Tensor) -> float:
         if ref_mag.numel() == 0:

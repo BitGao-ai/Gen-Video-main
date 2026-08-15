@@ -26,9 +26,11 @@ from typing import Dict, List, Optional
 import torch
 
 from cocf.common.config import TubeConfig
+from cocf.common.logging import get_logger
 from cocf.common.types import SemanticTube, TubeState
 
 Tensor = torch.Tensor
+_log = get_logger(__name__)
 
 
 class TubeStateEncoder:
@@ -80,18 +82,46 @@ class TubeStateEncoder:
     # -- components ------------------------------------------------------ #
 
     def _identity_confidence(self, tube: SemanticTube) -> float:
-        """Mean cosine similarity of consecutive per-frame identity features.
+        """Mean cosine similarity of consecutive per-frame identity features (§4.3.1).
 
-        Uses the running EMA identity feature vs each frame's region feature when
-        per-frame features are unavailable; defaults to high confidence (1.0) for a
-        single-frame tube.
+        A tube whose appearance is stable across the frames it spans scores near 1;
+        one whose region drifts onto a different object (a tracking failure, an
+        occlusion hand-off) scores low, and below
+        ``identity_unstable_threshold`` the allocator pins it to FULL.
+
+        The similarity is mapped from ``[-1, 1]`` to ``[0, 1]`` as ``cos·0.5 + 0.5``,
+        so the 0.5 threshold sits exactly at "orthogonal appearance".
+
+        This used to compute ``normalize(identity_feat) @ normalize(identity_feat)``
+        — a unit vector dotted with *itself* — and therefore returned exactly 1.0 for
+        every tube, always. That silently disabled the §4.3.1 stability override,
+        pinned the first component of the 7-dim state vector to a constant, and halved
+        the temporal strength ``s_T`` (which is ``0.5·occlusion + 0.5·(1−I_k)``),
+        suppressing the §3.3.4 counterfactual checks that depend on it (§P1-2). The
+        fix needs the per-frame features the matcher now keeps.
         """
-        if tube.identity_feat is None or tube.length <= 1:
+        feats = tube.identity_feat_by_frame
+        frames = [f for f in tube.frames if f in feats]
+        if len(frames) < 2:
+            # Nothing to compare against (single-frame tube, or a perception provider
+            # that supplies no identity features): assume stable rather than invent
+            # instability, but say so via the value, not by fabricating a comparison.
             return 1.0
-        ref = torch.nn.functional.normalize(tube.identity_feat.float(), dim=-1)
-        # we only retained the EMA feature on the tube; approximate stability by
-        # its norm consistency — a real impl compares per-frame DINOv2 crops.
-        return float(torch.clamp((ref @ ref) * 0.5 + 0.5, 0.0, 1.0))
+        vectors = [feats[f].detach().float().reshape(-1) for f in frames]
+        width = vectors[0].numel()
+        if any(v.numel() != width for v in vectors):
+            # A provider returning ragged feature widths would otherwise crash the
+            # whole denoising step inside ``torch.stack``. Degrade to "no information"
+            # instead — this is a diagnostic signal, not a correctness-critical one.
+            _log.warning(
+                "tube %d: identity features have inconsistent widths %s; "
+                "identity_confidence falls back to 1.0",
+                tube.tube_id, sorted({int(v.numel()) for v in vectors}),
+            )
+            return 1.0
+        normed = torch.nn.functional.normalize(torch.stack(vectors), dim=-1)
+        cos = (normed[:-1] * normed[1:]).sum(-1)  # consecutive-frame similarity
+        return float(torch.clamp(cos.mean() * 0.5 + 0.5, 0.0, 1.0))
 
     def _occlusion(
         self, tube: SemanticTube, latent_flow_by_frame: Optional[Dict[int, Tensor]]

@@ -44,6 +44,24 @@ Tensor = torch.Tensor
 _log = get_logger(__name__)
 
 
+def _accepts(module: Optional[nn.Module], name: str) -> bool:
+    """Whether ``module.forward`` takes a keyword called ``name``.
+
+    Upstream transformer signatures differ (HunyuanVideo takes
+    ``encoder_attention_mask``, some Wan variants do not), and passing an unknown
+    keyword is a hard TypeError — so the mask is offered only where it is accepted.
+    """
+    if module is None:
+        return False
+    try:
+        params = inspect.signature(module.forward).parameters
+    except (TypeError, ValueError):  # pragma: no cover - unintrospectable forward
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _diffusers_version() -> str:
     """Installed diffusers version, for the tiling-unavailable error message."""
     try:
@@ -102,6 +120,15 @@ class DiffusersVideoBackbone(BackboneAdapter):
             # After *every* component is placed, so the report reflects the real
             # resident footprint (a subclass's extra experts included).
             self._log_vram_report()
+
+    def ensure_loaded(self) -> None:
+        """Public :class:`BackboneAdapter` hook → force the lazy ``_load``.
+
+        Stage-C LoRA injection calls this before reading :meth:`dit_blocks`, which
+        would otherwise return ``[]`` on a not-yet-loaded adapter and make the whole
+        ``--use_lora`` path a silent no-op (§4.2).
+        """
+        self._ensure_loaded()
 
     def _place_auxiliary_modules(self) -> None:
         """Freeze/device-place components beyond vae/text_encoder/transformer.
@@ -298,16 +325,23 @@ class DiffusersVideoBackbone(BackboneAdapter):
     def encode_video(self, video: Tensor) -> Tensor:
         self._ensure_loaded()
         self._reclaim_before_vae()
-        with torch.inference_mode():
+        with self._forward_ctx():
             x = video.to(self.device, self.dtype)
             lat = self.vae.encode(x).latent_dist.sample()  # type: ignore[union-attr]
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             return lat * scale
 
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
+        """``[B, C, T, H, W] -> [B, C_pix, F, H_pix, W_pix]``.
+
+        Runs under :meth:`_forward_ctx`, so a Stage-C caller inside
+        ``backbone.grad_mode()`` gets a decode that is **on** the autograd graph (the
+        §4.2 pixel/semantic loss path); everyone else keeps the ``inference_mode``
+        decode and its memory saving.
+        """
         self._ensure_loaded()
         self._reclaim_before_vae()
-        with torch.inference_mode():
+        with self._forward_ctx():
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             x = latent_grid.to(self.device, self.dtype) / scale
             return self.vae.decode(x).sample  # type: ignore[union-attr]
@@ -344,45 +378,124 @@ class DiffusersVideoBackbone(BackboneAdapter):
         *some* tokens are active we compute the dense forward and splice the
         inactive token outputs from ``cache`` (correct; the saving on real
         backbones comes from the *whole-step* skip below and any sparse-attention
-        kernel a subclass chooses to wire in). When **no** token is active we skip
-        the transformer entirely and reuse the cache verbatim — the dominant
-        cache-acceleration saving (§5.1).
+        kernel a subclass chooses to wire in via :meth:`_run_transformer_sparse`).
+        When **no** token is active we skip the transformer entirely and reuse the
+        cache verbatim — the dominant cache-acceleration saving (§5.1).
+
+        The returned ``compute_fraction`` states what was really spent, so the
+        engine never reports the mask occupancy as if it were a FLOPs saving:
+
+        ============================  ==================
+        path taken                    compute_fraction
+        ============================  ==================
+        whole-step skip (no active)   ``0.0``
+        sparse kernel (subclass)      ``|active| / N``
+        dense forward (default)       ``1.0``
+        ============================  ==================
         """
         self._ensure_loaded()
         b, n, dim = tokens.shape
+        active: Optional[Tensor] = None
         if active_mask is not None:
-            active = active_mask.reshape(-1) if active_mask.dim() == 1 else active_mask[0]
+            am = active_mask.to(tokens.device)
+            active = am.reshape(-1) if am.dim() == 1 else am[0]
             if active.sum() == 0 and cache is not None and cache.model_output is not None:
                 step = cache.step + 1
                 return DenoiseOutput(
                     model_output=cache.model_output,
                     cache=BackboneCache(model_output=cache.model_output, step=step),
                     attention={},
+                    compute_fraction=0.0,  # the transformer never ran
                 )
 
-        grid_in = self.to_grid(tokens, grid).to(self.device, self.dtype)
-        with torch.inference_mode():
-            eps_grid, attn = self._run_transformer(grid_in, t, cond, want_attention)
-        eps = self.to_tokens(eps_grid).to(tokens.dtype)
+        # Optional token-sparse path (a subclass that wires in a sparse-attention
+        # kernel). ``None`` ⇒ no such kernel ⇒ dense forward below.
+        sparse = (
+            self._run_transformer_sparse(tokens, t, cond, grid, active, want_attention)
+            if active is not None else None
+        )
+        if sparse is not None:
+            eps, attn = sparse
+            compute_fraction = float(active.float().mean()) if n else 0.0
+        else:
+            grid_in = self.to_grid(tokens, grid).to(self.device, self.dtype)
+            with self._forward_ctx():
+                eps_grid, attn = self._run_transformer(grid_in, t, cond, want_attention)
+            eps = self.to_tokens(eps_grid).to(tokens.dtype)
+            compute_fraction = 1.0  # dense: every token was computed, mask or not
 
-        if active_mask is not None and cache is not None and cache.model_output is not None:
-            # Decide the [N] mask before flattening so a [B, N] mask keeps its rank
-            # (the per-token splice below indexes axis 1, so ``inactive`` must be [N];
-            # a blind ``reshape(-1)`` on a [B, N] mask yields [B*N] and mis-indexes).
-            am = active_mask.to(tokens.device)
-            active = am.reshape(-1) if am.dim() == 1 else am[0]
+        if active is not None and cache is not None and cache.model_output is not None:
+            # ``active`` is already the [N] mask (decided before flattening so a
+            # [B, N] mask keeps its rank — the per-token splice indexes axis 1, and a
+            # blind ``reshape(-1)`` on a [B, N] mask would yield [B*N] and mis-index).
             inactive = ~active
             eps[:, inactive] = cache.model_output[:, inactive]
 
         step = (cache.step + 1) if cache is not None else 0
         out_cache = BackboneCache(model_output=eps.detach(), step=step)
-        return DenoiseOutput(model_output=eps, cache=out_cache, attention=attn)
+        return DenoiseOutput(
+            model_output=eps, cache=out_cache, attention=attn,
+            compute_fraction=compute_fraction,
+        )
+
+    def _run_transformer_sparse(
+        self,
+        tokens: Tensor,
+        t: Tensor,
+        cond: TextConditioning,
+        grid: TokenGrid,
+        active: Tensor,
+        want_attention: bool,
+    ) -> Optional[Tuple[Tensor, Dict[str, Tensor]]]:
+        """Optional token-sparse ε_θ over ``active`` tokens only (§9.4 future work).
+
+        Return ``(eps_tokens [B, N, d], attention)`` — with the inactive rows left
+        for the caller to splice from cache — or ``None`` (the default) to fall back
+        to the dense forward. This is the seam a real sparse-attention kernel plugs
+        into; until one exists, :meth:`denoise` reports ``compute_fraction = 1.0``
+        so the efficiency numbers stay truthful rather than optimistic.
+        """
+        return None
 
     @abc.abstractmethod
     def _run_transformer(
         self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Run the model-specific transformer, returning (ε grid, attention readouts)."""
+
+    # -- text conditioning handed to the transformer --------------------- #
+
+    @staticmethod
+    def _trim_text(cond: TextConditioning) -> Tuple[Tensor, Optional[Tensor]]:
+        """Drop trailing positions that are padding in *every* batch row.
+
+        The tokenizers here pad to a fixed ``max_length`` (512 for Wan's umT5), and a
+        real caption occupies a few dozen of those. Cross-attention over the untrimmed
+        sequence costs ``O(N · 512)`` per step no matter how short the prompt is — and,
+        without a mask, the model attends to hundreds of pad embeddings as if they were
+        text (§P1-15). Trimming is exact: the dropped positions are padding for the
+        whole batch, so no row loses a token.
+        """
+        embeds = cond.embeds
+        mask = cond.mask
+        if mask is None or mask.numel() == 0:
+            return embeds, None
+        m = mask.to(embeds.device)
+        if m.dim() == 1:
+            m = m[None]
+        used = m.bool().any(dim=0).nonzero()
+        keep = int(used.max()) + 1 if used.numel() else embeds.shape[1]
+        return embeds[:, :keep], m[:, :keep]
+
+    def _text_kwargs(self, cond: TextConditioning, module: Optional[nn.Module]) -> Dict[str, Any]:
+        """``encoder_hidden_states`` (+ mask when the model accepts one), trimmed."""
+        embeds, mask = self._trim_text(cond)
+        kwargs: Dict[str, Any] = {
+            "encoder_hidden_states": embeds.to(self.device, self.dtype)
+        }
+        if mask is not None and _accepts(module, "encoder_attention_mask"):
+            kwargs["encoder_attention_mask"] = mask.to(self.device)
+        return kwargs
 
     # -- scheduler ------------------------------------------------------- #
 

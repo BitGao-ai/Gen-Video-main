@@ -58,6 +58,15 @@ class RiskTrigger:
         """Pin a tube to FULL for the next ``force_full_steps`` steps."""
         self._force_full[tube_id] = self.cfg.force_full_steps
 
+    def register_repair(self, tube_id: int, steps: int = 1) -> None:
+        """Pin a *repaired* (medium-risk) tube to FULL for one refresh step.
+
+        Shorter than a rollback's window on purpose: the tube was fused toward the
+        freshly computed latent rather than revoked, so it needs one recompute to
+        settle, not ``q``. Never shortens an active rollback pin.
+        """
+        self._force_full[tube_id] = max(self._force_full.get(tube_id, 0), int(steps))
+
     def is_forced_full(self, tube_id: int) -> bool:
         return self._force_full.get(tube_id, 0) > 0
 

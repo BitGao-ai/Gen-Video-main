@@ -47,7 +47,6 @@ class TubeConfig:
     max_tube_len: int = 16  # split tubes longer than 16 frames
     affinity_match_threshold: float = 0.30  # Hungarian gating threshold
     identity_unstable_threshold: float = 0.50  # I_k < 0.5 ⇒ force FULL
-    identity_ema: float = 0.90  # EMA factor for the running identity feature
     # Tube-level action-smoothing loss (§4.3.2)
     lambda_temporal: float = 0.20
     lambda_boundary: float = 0.10
@@ -82,6 +81,21 @@ class PredictorConfig:
     dropout: float = 0.0
     # predict log-variance for numerical stability; σ = exp(0.5·logger)
     predict_log_variance: bool = True
+    # -- head bias initialisation: the cold-start calibration of E_cert ------- #
+    # An untrained predictor must not certify every action as catastrophic. With
+    # zero biases, softplus(0)=0.693 and exp(0)=1.0 give μ₀≈0.70 and σ₀≈1.0, so
+    # E_cert = μ + κσ ≈ 0.70 + 1.96 ≈ 2.7 — 3.4× the τ_high=0.80 trigger. Every tube
+    # was rolled back and pinned to FULL on the *second* step, permanently disabling
+    # the accelerator on the out-of-the-box config (no checkpoint = README quick
+    # start). These set the head biases so the cold start begins *below* τ_low:
+    #   μ₀ = mu_init, σ₀ = exp(0.5·log_var_init)  ⇒  E_cert₀ ≈ 0.02 + 1.96·0.135 ≈ 0.29
+    # They only affect initialisation; a Stage-B checkpoint overwrites both heads.
+    # Force μ[FULL] = 0. FULL is the zero-damage reference the labels (§1.5) and the
+    # allocator's benefit/cost arithmetic are both defined against; letting the head
+    # emit a free positive value there breaks that premise (§P1-12).
+    pin_full_zero: bool = True
+    mu_init: float = 0.02  # μ at init (small but non-zero: damage is unknown, not nil)
+    log_var_init: float = -4.0  # ⇒ σ₀ ≈ 0.135; κ·σ₀ ≈ 0.26 instead of 1.96
 
 
 @dataclass
@@ -99,9 +113,8 @@ class LCOCFConfig:
     strength: StrengthConfig = field(default_factory=StrengthConfig)
     predictor: PredictorConfig = field(default_factory=PredictorConfig)
     counterfactual: CounterfactualConfig = field(default_factory=CounterfactualConfig)
-    # spatio-temporal locality neighborhood (axiom §3.2.1): time ±tau, space radius r
+    # temporal locality neighbourhood (axiom §3.2.1): ±tau steps
     tau: int = 2
-    spatial_radius: int = 2
     vlm_name: str = "frozen-vlm"  # causal-triplet parser, frozen (§3.3.5)
 
 
@@ -132,6 +145,17 @@ class TriggerConfig:
     tau_high: float = 0.80
     force_full_steps: int = 2  # q: steps to force FULL after a rollback
     sigma_bnd: float = 4.0  # boundary soft-mask bandwidth
+    # -- anchor-library admission (deliberately *not* τ_low) ------------------ #
+    # τ_low is the trigger boundary "below this, do nothing"; reusing it as the
+    # anchor-write gate coupled two unrelated policies and produced a deadlock:
+    # a mis-calibrated certificate sat above τ_low, so nothing was ever anchored,
+    # so rollback() had no anchor to restore and degenerated into a no-op — while
+    # the force-FULL pin it set still fired every step. Anchoring is *cheap and
+    # reversible* (a snapshot), so it is admitted on a looser gate.
+    tau_anchor: float = 0.60  # E_cert ≤ this ⇒ snapshot the tube as a safe anchor
+    # Always snapshot a tube the first time it is computed at acceptable risk, even
+    # if its certificate exceeds τ_anchor: an imperfect rollback target beats none.
+    seed_anchor_on_first_compute: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -177,8 +201,15 @@ class BudgetConfig:
 class AllocatorConfig:
     """Budget-constrained action allocation (§2.2)."""
 
-    # per-action relative cost multipliers C(a, |g_k|) ∝ |g_k| (§2.2)
-    action_cost: Tuple[float, float, float, float] = (1.0, 0.45, 0.15, 0.0)
+    # Per-action relative cost multipliers C(a, |g_k|) ∝ |g_k| (§2.2): the fraction of
+    # a tube's tokens the action actually recomputes. These must agree with what the
+    # transition executor really does, or the knapsack optimises a fiction — the old
+    # (1.0, 0.45, 0.15, 0.0) priced LOWFREQ at 0.45 while a stride-2 lattice computes
+    # 1/4 of the tokens, and INTERP at 0.15 though it runs no denoiser at all, so the
+    # solver believed a downgrade bought savings that never materialised (§P1-6).
+    # The LOWFREQ entry is *derived* from ``EngineConfig.lowfreq_stride`` at
+    # construction (1/stride²); the value here is the stride-2 default.
+    action_cost: Tuple[float, float, float, float] = (1.0, 0.25, 0.0, 0.0)
     risk_threshold: float = 0.80  # τ_r hard risk constraint (== TriggerConfig.tau_high)
     greedy_fallback: bool = True  # use greedy knapsack if LP solver unavailable
 
@@ -197,13 +228,38 @@ class EngineConfig:
     # state cheaply. ``tube_build_step`` counts from the *start* (t=T is step 0).
     tube_build_step: int = 1  # build after 1 warm-up FULL step so structure exists
     tube_refresh_every: int = 0  # re-segment every N steps (0 = never re-segment)
-    warmup_full_steps: int = 2  # first steps run dense FULL (cold-start stability)
     lowfreq_stride: int = 2  # LOW FREQ spatial stride (2 ⇒ ~1/4 tokens computed)
+    # Opt-in throughput heuristic, **off by default**. On a backbone without
+    # token-sparse attention a mask this sparse costs a full dense forward anyway, so
+    # the transition executor can promote it to a whole-step cache reuse — a real
+    # saving. The catch is that a promoted step silently downgrades any LOWFREQ tube
+    # to "reuse cached ε", and there is then no computed reference to measure that
+    # tube's skip residual against, so RAEC's certificate sees δ=0 and cannot price
+    # the extra error (§5.3.1). Enable it only when throughput matters more than the
+    # risk layer's coverage. A step where *every* tube skips is still skipped for free
+    # without this — that path needs no heuristic and keeps the certificate honest.
+    dense_step_skip_below: float = 0.0
+    # Recompute the tokens no tube covers every N steps (0 = never). The background
+    # is ~3/4 of the grid and is outside every RAEC guarantee — certificates, rollback
+    # and repair are all tube-scoped — so leaving it on the warm-up step's ε for the
+    # whole trajectory is an unmonitored quality loss (§P1-8). On a dense-only backbone
+    # this costs nothing: the forward runs at full price whatever the mask says.
+    background_refresh_every: int = 4
     measure_residual: bool = True  # measure skip residuals for the certificate
     cf_check_enabled: bool = True  # run §3.3.4 single-hop counterfactual checks
-    decode_preview_for_tubes: bool = True  # decode a preview to segment when no GT
     use_dynamic_budget: bool = True  # else spend b_max every step
     risk_control_enabled: bool = True  # enable RAEC trigger/repair at inference
+    # Stage-C truncated BPTT (§4.2), in the classic segment sense: the graph is cut
+    # every ``grad_window_steps`` *computed* denoising steps (steps whose denoiser
+    # actually ran — skipped steps add no activations and carry no gradient). Counting
+    # computed steps rather than wall-clock ones is what keeps the LoRA branch
+    # trainable on an accelerated trajectory: a run that computes 2 of 30 steps must
+    # not have its graph cut simply because those 2 were early.
+    # Note this is a periodic reset, not a sliding window — at the final decode the
+    # graph holds between 1 and ``grad_window_steps`` computed steps depending on
+    # where the last cut landed. Peak activation memory is what the bound buys.
+    # 0 = full BPTT (real backbones will OOM). Ignored at inference (decode_grad=False).
+    grad_window_steps: int = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -224,16 +280,16 @@ class BackboneConfig:
     # Wan2.2-A14B is ~67 GB (2×14B experts + a 5.5B umT5) — the entire budget of an
     # 80 GB card, leaving nothing for the VAE decode / metric activations Stage A
     # needs. These switches park the components that are idle most of the time.
-    # All default to False so Stages B/C keep their historical placement; Stage A
-    # (the only pass that holds the whole stack resident *and* decodes video) turns
-    # them on from the CLI.
-    offload_text_encoder: bool = False  # park the text encoder on CPU between prompts
-    offload_idle_expert: bool = False   # keep only the active MoE expert resident
-    vae_tiling: bool = False            # tiled/sliced VAE encode+decode (bounded peak)
+    # They default **on**: an OOM tens of minutes into a run is far more expensive
+    # than the transfers, so the safe setting is the default and the CLI's --no-*
+    # flags buy the speed back on cards with room to spare.
+    offload_text_encoder: bool = True  # park the text encoder on CPU between prompts (saves ~11 GB)
+    offload_idle_expert: bool = True   # keep only the active MoE expert resident (saves ~28 GB)
+    vae_tiling: bool = True            # tiled/sliced VAE encode+decode (bounded peak)
     # Tile edge (output pixels) when vae_tiling is on. The decoder's peak transient
-    # scales with tile_size², so 256 bounds a 480×832 decode at ~1.4 GB where the
-    # untiled call needs a single ~7.7 GiB block. Lower it if the decode still OOMs.
-    vae_tile_size: int = 256
+    # scales with tile_size². 128 bounds a 480×832 decode at ~0.4 GB (vs 1.4 GB at
+    # 256, vs 7.7 GiB untiled) — necessary headroom on 40 GB cards.
+    vae_tile_size: int = 128
     # backbone-specific knobs passed straight through to the adapter
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -244,12 +300,8 @@ class MemoryConfig:
 
     amp_dtype: str = "bfloat16"  # autocast dtype; "none" disables AMP
     gradient_checkpointing: bool = True  # checkpoint trainable blocks
-    grad_accum_steps: int = 4  # accumulate to shrink effective batch memory
     offload_backbone_to_cpu: bool = False  # keep frozen backbone on CPU until needed
-    offload_optimizer_state: bool = False  # 8-bit / paged optimiser state
     cache_latents: bool = True  # pre-encode videos → latents on disk (no VAE in RAM)
-    cache_teacher_labels: bool = True  # Stage-A labels precomputed offline
-    empty_cache_every: int = 0  # call torch.cuda.empty_cache every N steps (0=never)
     max_grad_norm: float = 1.0
 
 
@@ -318,7 +370,6 @@ class FilterConfig:
     min_caption_words: int = 5
     min_clip_align: float = 0.25
     aesthetic_drop_frac: float = 0.20  # drop the bottom 20% aesthetic
-    dedup_sim_threshold: float = 0.95  # caption/fingerprint near-duplicate cut
     # L3 — task-fitness filter (§2.3)
     drop_static: bool = True  # drop pure-static / no-motion / no-semantic-change
     static_motion_max: float = 0.02  # motion score below ⇒ treated as static
@@ -342,16 +393,18 @@ class TeacherConfig:
     """
 
     out_dir: str = "cache/teacher"
-    num_inference_steps: int = 30
-    seeds_per_prompt: int = 3  # ≥3 seeds per prompt (§7.1.1)
-    # representative ``step_frac = t/T`` values that get a *full* CF rollout; the
-    # in-between steps are filled by label interpolation (§7.1.1 cost trick).
-    representative_step_fracs: Tuple[float, ...] = (0.9, 0.7, 0.5, 0.3, 0.1)
-    interpolate_adjacent_steps: bool = True
+    num_inference_steps: int = 20  # reduced from 30 for throughput (40GB-card friendly)
+    seeds_per_prompt: int = 2  # reduced from 3: 2 seeds still give variance, 3× faster
+    # ``step_frac = t/T`` values that get a full CF rollout. Every generated sample
+    # sits on one of these, so this list *is* the timestep coverage the predictor
+    # learns from. 3 points give early/mid/late coverage at ~40% fewer rollouts than
+    # 5. (§7.1.1 also proposes interpolating labels for the in-between steps; that is
+    # not implemented — the generator samples only at these steps.)
+    representative_step_fracs: Tuple[float, ...] = (0.8, 0.5, 0.2)
     # skip actions probed per (tube, step) — FULL (=0) is the zero-damage reference.
     probe_actions: Tuple[int, ...] = (1, 2, 3)  # LOW FREQ, INTERP, ANCHOR
-    max_tubes_per_prompt: int = 8  # cap tube-group interventions per prompt
-    samples_per_video: int = 30  # cap on (tube,step,action) labels per video (§1.5)
+    max_tubes_per_prompt: int = 4  # reduced from 8: halves rollout count per clip
+    samples_per_video: int = 15  # reduced from 30: matches 3 steps × 4 tubes × ~1 action
     scene_balanced: bool = True  # balance static/dynamic/text/face/multi/occlusion
     use_preview_decode_for_tubes: bool = True  # segment a preview decode of z_t
     shard_size: int = 256  # records per on-disk shard
@@ -368,8 +421,6 @@ class OptimConfig:
     weight_decay: float = 0.01
     betas: Tuple[float, float] = (0.9, 0.999)
     warmup_steps: int = 200
-    max_steps: int = 20000
-    use_8bit_adam: bool = False
 
 
 @dataclass
@@ -387,7 +438,6 @@ class TrainingConfig:
     lora_alpha: float = 16.0
     lora_target_last_n_blocks: int = 4
     log_every: int = 20
-    ckpt_every: int = 1000
     # Stage-B validation & early stopping (§4.1): evaluate degradation-prediction
     # MAE, certificate-violation rate, budget-hit rate and action smoothness.
     val_every_epochs: int = 1

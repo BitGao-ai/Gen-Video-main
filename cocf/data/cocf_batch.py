@@ -37,7 +37,8 @@ _VECTOR_FIELDS = (
     "uncertainty", "tube_visual_embed_full", "tube_visual_embed_cf",
 )
 _SCALAR_LONG_FIELDS = ("action", "timestep", "tube_token_count", "tube_id", "strength_level")
-_SCALAR_FLOAT_FIELDS = ("step_frac", "interaction_density", "tube_stability")
+_SCALAR_FLOAT_FIELDS = ("step_frac", "interaction_density", "tube_stability",
+                        "skip_residual")
 _STRING_FIELDS = ("prompt", "scene_type", "video_id")
 
 
@@ -97,10 +98,14 @@ class StratifiedBatchSampler(Sampler[List[int]]):
 
     def __iter__(self) -> Iterator[List[int]]:
         rng = random.Random(self.seed + self.epoch)
-        # shuffle each action pool; scene/timestep diversity emerges from the shuffle
-        pools = {a: idxs[:] for a, idxs in self.action_buckets.items()}
-        for idxs in pools.values():
-            rng.shuffle(idxs)
+        # Each action pool is ordered by *interleaving* its (stratum, scene) groups
+        # rather than by a plain shuffle. A plain shuffle only makes scene/timestep
+        # diversity emerge in expectation, which is not the same as the §4.1
+        # "场景分层 + 时间步分层" the constructor advertises — and both fields were
+        # accepted and then never read at all (§P1-5). Round-robining the groups makes
+        # every *contiguous* draw span as many strata and scenes as the data allows,
+        # which is what a batch actually consumes.
+        pools = {a: self._interleaved(idxs, rng) for a, idxs in self.action_buckets.items()}
         present = list(pools)
         if not present:
             return
@@ -111,10 +116,34 @@ class StratifiedBatchSampler(Sampler[List[int]]):
             for a in present:
                 pool = pools[a]
                 for _k in range(per_action):
+                    # Small pools repeat (cursor wraps): forcing a 1:1:1:1 action mix
+                    # on an imbalanced store necessarily oversamples the rare actions.
                     batch.append(pool[cursors[a] % len(pool)])
                     cursors[a] += 1
             rng.shuffle(batch)
             yield batch[: self.batch_size] if len(batch) > self.batch_size else batch
+
+    def _interleaved(self, idxs: Sequence[int], rng: random.Random) -> List[int]:
+        """Order ``idxs`` so consecutive entries vary in timestep stratum and scene.
+
+        Groups by ``(stratum, scene)``, shuffles within each group and across the group
+        order, then draws round-robin. With one group (no strata/scenes supplied) this
+        degrades to a plain shuffle, so the sampler behaves exactly as before when the
+        caller has no metadata to stratify on.
+        """
+        groups: Dict[tuple, List[int]] = {}
+        for i in idxs:
+            groups.setdefault((self.strata[i], self.scenes[i]), []).append(i)
+        keys = list(groups)
+        rng.shuffle(keys)
+        for k in keys:
+            rng.shuffle(groups[k])
+        out: List[int] = []
+        for r in range(max((len(g) for g in groups.values()), default=0)):
+            for k in keys:
+                if r < len(groups[k]):
+                    out.append(groups[k][r])
+        return out
 
 
 def collate_cocf_samples(batch: Sequence[Mapping[str, object]]) -> Dict[str, object]:

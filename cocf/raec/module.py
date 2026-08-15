@@ -27,6 +27,8 @@ from cocf.raec.certificate import ErrorCertificateModule
 from cocf.raec.repair import BoundaryRepair, RepairResult
 from cocf.raec.trigger import RiskTrigger
 
+Tensor = torch.Tensor
+
 
 class RAECModule(nn.Module):
     """Revocable anchoring & error certificates, wired together (§5)."""
@@ -69,4 +71,36 @@ class RAECModule(nn.Module):
             tube_id, step, action, prediction,
             residual=residual, boundary=boundary,
             anchor_age=anchor_age, local_cmsc=local_cmsc,
+        )
+
+    @torch.no_grad()
+    def action_risk(
+        self,
+        prediction: DamagePrediction,
+        *,
+        boundary: float = 0.0,
+        anchor_age: float = 0.0,
+        local_cmsc: float = 0.0,
+    ) -> Tensor:
+        """A-priori ``E_cert`` for **every** candidate action — ``[num_actions]``.
+
+        The §2.2 allocation is stated subject to ``E_cert_k(a_k) ≤ τ_r``, a *hard*
+        constraint that has to be evaluated before an action is chosen. The full
+        certificate also carries the skip residual δ, which only exists after the
+        transition — so this computes the same expression with ``δ = 0``, i.e. a lower
+        bound on the risk of each action. That is exactly the right direction for a
+        feasibility filter: it never forbids an action that would have been safe, and
+        the post-transition certificate still catches whatever δ adds (§5.3.2).
+
+        Without this the allocator's ``action_risk`` parameter was never supplied and
+        the constraint simply did not exist at allocation time (§P1-7).
+        """
+        zeros = torch.zeros_like(prediction.mu)
+        return self.certificate.value(
+            prediction.mu,
+            prediction.sigma,
+            zeros,                              # δ unknown before the transition
+            zeros + float(boundary),
+            zeros + float(anchor_age),
+            zeros + float(local_cmsc),
         )

@@ -130,8 +130,15 @@ class Accelerator(nn.Module):
 
         # -- decision layer: budget + allocator + action executor ------------ #
         self.budget_scheduler = BudgetScheduler(config.budget)
-        self.allocator = ActionAllocator(config.allocator)
-        self.transition = TransitionExecutor(backbone, lowfreq_stride=config.engine.lowfreq_stride)
+        self.allocator = ActionAllocator(
+            config.allocator, lowfreq_stride=config.engine.lowfreq_stride
+        )
+        self.transition = TransitionExecutor(
+            backbone,
+            lowfreq_stride=config.engine.lowfreq_stride,
+            dense_step_skip_below=config.engine.dense_step_skip_below,
+            background_refresh_every=config.engine.background_refresh_every,
+        )
 
         self.freeze_backbone()
         trainable, total = count_parameters(self)
@@ -198,9 +205,17 @@ class Accelerator(nn.Module):
         try:
             with torch.inference_mode():
                 return int(backbone.encode_text(["probe"]).embeds.shape[-1])
-        except Exception:  # pragma: no cover - real backbone without weights
+        except Exception as exc:  # pragma: no cover - real backbone without weights
             extra = getattr(backbone.config, "extra", {}) or {}
-            return int(extra.get("text_dim", _DEFAULT_TEXT_DIM))
+            dim = int(extra.get("text_dim", _DEFAULT_TEXT_DIM))
+            _log.warning(
+                "_probe_text_dim: encode_text probe failed (%s: %s); falling back to "
+                "text_dim=%d. If Stage-A data was generated with a different backbone "
+                "(e.g. mock with text_dim=16), pass text_dim explicitly to "
+                "Accelerator.from_config to avoid a shape mismatch in CMSC.",
+                type(exc).__name__, exc, dim,
+            )
+            return dim
 
     # ------------------------------------------------------------------ #
     # parser convenience

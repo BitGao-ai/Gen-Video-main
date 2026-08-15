@@ -168,6 +168,48 @@ def tube_temporal_smoothness(
     return total / pairs if pairs else total
 
 
+def _batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
+    """Per-sample float column as ``[B]`` on ``like``'s device (zeros when absent)."""
+    v = batch.get(key)
+    if not isinstance(v, Tensor) or v.numel() == 0:
+        return like.new_zeros(like.shape)
+    return v.to(like.device).float().reshape(-1)[: like.shape[0]]
+
+
+def _local_cmsc_violation(accelerator, batch: Dict[str, object], like: Tensor) -> Tensor:
+    """Per-sample local CMSC violation ``1 − align(tube, prompt)`` as ``[B]``.
+
+    The certificate's ``λ_cmsc`` term exists to raise the risk of skipping a tube that
+    is poorly aligned to the prompt. Stage B fed it a constant zero, so the
+    coefficient never moved — and :meth:`CMSCLoss.local_conservation`, written for
+    exactly this, had no caller anywhere (§P1-13). The counterfactual render's tube
+    embed is the right side to score: it is what the skip actually produced.
+    """
+    text = batch.get("text_embed")
+    tube_cf = batch.get("tube_visual_embed_cf")
+    if not (isinstance(text, Tensor) and isinstance(tube_cf, Tensor)):
+        return like.new_zeros(like.shape)
+    if text.numel() == 0 or tube_cf.numel() == 0:
+        return like.new_zeros(like.shape)
+    dev = like.device
+    txt = text.to(dev).float()
+    cf = tube_cf.to(dev).float()
+    mask = batch.get("text_mask")
+    out = like.new_zeros(like.shape)
+    with torch.no_grad():
+        # ``tube_scores`` takes one prompt's [L, d_c] tokens against [K, d_v] tube
+        # embeds, and every sample carries its own prompt — so this is per-sample.
+        for i in range(min(like.shape[0], txt.shape[0], cf.shape[0])):
+            tokens = txt[i]
+            if isinstance(mask, Tensor) and mask.numel():
+                keep = mask.to(dev)[i].bool()
+                if bool(keep.any()):
+                    tokens = tokens[keep]        # ignore padding tokens
+            score = accelerator.cmsc_alignment.tube_scores(tokens, cf[i : i + 1])
+            out[i] = 1.0 - score.reshape(-1)[0]
+    return out
+
+
 def _cmsc_conservation(accelerator, batch: Dict[str, object], device) -> Optional[Tensor]:
     """CMSC alignment-conservation term, or ``None`` when the batch lacks text/embeds."""
     text = batch.get("text_embed")
@@ -249,13 +291,21 @@ def compute_joint_loss(
     l_tube = tube_temporal_smoothness(accelerator, probs, batch)
 
     # --- L_cert: certificate calibrated as an upper bound on true damage ----- #
+    # ``residual`` and ``local_cmsc`` used to be hard zeros here, so ``λ_res`` and
+    # ``λ_cmsc`` received no gradient at any point in training and stayed at their
+    # config inits for the whole run — two of the certificate's five learnable
+    # coefficients were decorative (§P1-13). Both now carry the real per-sample
+    # signal Stage A measured: δ on the intervened tube, and the tube's local
+    # text-alignment violation from the stored CMSC embeds.
     zeros = mu_a.new_zeros(mu_a.shape)
+    residual = _batch_float(batch, "skip_residual", mu_a)
+    local_cmsc = _local_cmsc_violation(accelerator, batch, mu_a)
     e_cert = accelerator.raec.certificate.value(
         mu_a, sigma_a,
-        residual=zeros,
+        residual=residual,
         boundary=tube_features[:, _BOUNDARY_IDX],
         anchor_age=tube_features[:, _AGE_IDX],
-        local_cmsc=zeros,
+        local_cmsc=local_cmsc,
     )
     l_cert = accelerator.raec.certificate.loss(e_cert, damage_true)
 

@@ -247,6 +247,12 @@ class SemanticTube:
     masks_by_frame: Dict[int, Tensor] = field(default_factory=dict)
     # running identity feature (EMA of per-frame DINOv2 features)
     identity_feat: Optional[Tensor] = None
+    # frame index -> that frame's own identity feature, kept *alongside* the pooled
+    # ``identity_feat``. Pooling alone destroys the only signal identity confidence
+    # can be computed from: a mean vector compared against itself is trivially
+    # similar, which is how ``identity_confidence`` came to be the constant 1.0 and
+    # the §4.3.1 "unstable tube ⇒ force FULL" rule became unreachable (§P1-2).
+    identity_feat_by_frame: Dict[int, Tensor] = field(default_factory=dict)
     state: TubeState = field(default_factory=TubeState)
     # bookkeeping for RAEC: step index of the last verified-safe anchor
     last_safe_anchor_step: Optional[int] = None
