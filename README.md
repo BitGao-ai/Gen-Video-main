@@ -129,25 +129,71 @@ print(result.summary())
 python scripts/data/generate_counterfactual_data.py \
     --openvid-csv datasets/OpenVidHD.csv \
     --data-root datasets --video-subdir videos \
-    --only-existing-videos --use-real-video \
+    --only-existing-videos \
     --processed-root ./LCOCF_OpenVid1M_Processed \
-    --backbone wan22 --wan-variant ti2v-5b \
-    --model-path /path/to/Wan2.2-TI2V-5B-Diffusers \
-    --real-models --device cuda
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /data/suqiang/Text2Video-main/weights/Wan2.2 \
+    --backbone-dtype bfloat16 \
+    --num-frames 49 --height 384 --width 640 \
+    --vae-tile 256 --metric-frame-chunk 4 \
+    --real-models --sam-points-per-crop 16 --perception-dtype bfloat16 \
+    --sam-model /data/suqiang/Text2Video-main/weights/SAM \
+    --dino-model /data/suqiang/Text2Video-main/weights/DINO \
+    --clip-model  /data/suqiang/Text2Video-main/weights/Clip \
+    --limit 2600 --device cuda
 ```
+
+单机 8×40 GB 的实际跑法 —— 每卡一个分片，跑完再单进程合并索引：
+
+```bash
+COMMON=(--openvid-csv datasets/OpenVidHD.csv --data-root datasets --video-subdir videos
+        --only-existing-videos --processed-root ./LCOCF_OpenVid1M_Processed
+        --backbone wan22 --wan-variant a14b-t2v
+        --model-path /path/to/Wan2.2-T2V-A14B-Diffusers --backbone-dtype bfloat16
+        --sam-model  /path/to/...
+        --dino-model /path/to/...
+        --clip-model /path/to/...
+        --num-frames 49 --height 384 --width 640
+        --vae-tile 256 --metric-frame-chunk 4
+        --real-models --sam-points-per-crop 16 --perception-dtype bfloat16
+        --limit 2600 --device cuda --seed 1234)
+
+for i in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$i python scripts/data/generate_counterfactual_data.py \
+    "${COMMON[@]}" --num-shards 8 --shard-index $i > logs/stage_a.s$i.log 2>&1 &
+done
+wait
+python scripts/data/generate_counterfactual_data.py "${COMMON[@]}" \
+    --num-shards 8 --shard-index 0 --finalize-only
+```
+
+> ⚠️ **`--wan-variant` 必须与权重目录一致。** A14B 是双专家（有 `transformer_2/` 子目录），
+> 5B 是单专家。搞反了会让低噪专家根本不加载、所有噪声档都路由到高噪专家，产出的标签
+> off-distribution 而运行速度看起来完全正常。适配器现在会在**加载期直接 raise** 并给出
+> 应该传的 variant，不再静默降级。
+>
+> ⚠️ **CPU 内存是多分片并行的实际瓶颈**，不是显存。每个进程稳态约 40 GB（离线的 28 GB
+> 空闲专家 + 11 GB umT5），8 进程约 320 GB。先 `free -g`，不足就减少分片数。
 
 关键开关：
 
 | 开关 | 作用 |
 |------|------|
 | `--real-models` | 同时打开真实感知（SAM/DINOv2/CLIP/RAFT）与真实损伤指标。**只有真实模型生成的数据才可用于训练插件。** |
-| `--use-real-video` | 教师轨迹锚定在真实 mp4 上（VAE 编码 + 前向加噪）而非纯文生视频 |
+| `--num-frames / --height / --width` | 渲染几何。**必须与阶段 C 一致**（C 的目标就是这里落盘的 `Y_full`）。校验 4k+1 与 16 整除，并写入 `metadata/stage_a_env.json` 供 B/C 回读 |
 | `--num-shards N --shard-index i` | 按 md5(video_id) 稳定分片，N 个进程各跑一片，同一存储追加写 |
 | `--finalize-only` | 全部分片跑完后执行一次，构建合并的 `sample_index.csv` / `splits/` / 归一化统计 |
-| `--no-baseline` | 跳过占空间的 `full_baseline` 桶。**Stage B 不读它，但 Stage C 需要它**（见下方「已知限制」） |
-| `--vae-tile 96` / `--metric-frame-chunk 2` | OOM 时的降档旋钮 |
+| `--limit N` | 每个 CSV 的取样上限。配 `--only-existing-videos` 时限制的是**保留数**而非扫描行数，所以小 N 也会一直扫到找满 |
+| `--use-real-video` | 教师轨迹锚定在真实 mp4 上而非纯文生视频。**会导致不落盘 `z_init`，阶段 C 因此无法复用 `Y_full`**（见下方「已知限制」），只适合不喂给阶段 C 的存储 |
+| `--vae-tile` | 分块解码的输出边长。峰值 ∝ tile²、块数 ∝ 1/tile²，所以标签期的阶段 A 取大（256，384×640 下 8 块）、可微解码的阶段 C 取小（128） |
+| `--sam-points-per-crop` | SAM 点提示网格边长，实际提示数是其平方。SAM 每解码帧跑一次，是非 DiT 部分的主要开销 |
+| `--perception-dtype` | DINOv2/CLIP/SAM 的权重精度（RAFT 恒为 fp32，其全对相关体积在半精度下不稳） |
+| `--no-baseline` | 跳过 `full_baseline` 桶。省 ~72 MB/clip，但**会关掉阶段 C 的基线缓存**，使 C 每个 batch 重跑两条完整轨迹 |
+| `--metric-frame-chunk 2` / `--vae-tile 128` | OOM 时的降档旋钮 |
 
-每个 clip 处理完写一行 `_progress` 日志，中断后重跑自动跳过，不会重做教师前向。
+每个 clip 处理完写一行 `_progress` 日志，中断后重跑自动跳过，不会重做教师前向。运行期每
+clip 会打两行进度（§1.3-1.4 完成、样本写完），带耗时与显存高水位 —— 真实骨干上单 clip 是
+十几分钟量级，没有这两行时「很慢」和「卡死」无法区分。
 
 ### 阶段 B — 插件联合训练（§4.1）
 
@@ -158,8 +204,15 @@ python scripts/data/generate_counterfactual_data.py \
 python scripts/train/train_stage_b.py \
     --processed-root ./LCOCF_OpenVid1M_Processed \
     --batch_size 32 --num_epochs 10 --mixed-precision \
+    --device cuda \
     --checkpoint_save ./checkpoints/stage_b_final.pt
 ```
+
+不需要传骨干相关参数：本阶段只在阶段 A 的离线标签上训练插件，**不加载任何 Wan 权重**（显存
+< 3 GiB）。但��件的残差修复网宽度由骨干的 token 维度决定，所以脚本会从
+`metadata/stage_a_env.json` 回读阶段 A 的几何（A14B → `token_dim=64`）。没有该文件时会退回默认
+的 mock 几何（32）并告警 —— 那样存出来的 checkpoint 装不进跑真骨干的阶段 C。旧存储补一次
+`--finalize-only` 即可生成。
 
 采样遵循 §4.1：batch 内**动作均衡 1:1:1:1** + 6 类场景均衡 + 早/中/晚去噪步分层（全部由轻量 `sample_index.csv` 规划，组 batch 不读 payload）。每个 epoch 在 `val` 划分上评估**退化预测 MAE / 证书违规率 / 预算命中率 / 管级动作平滑度**，按 MAE 早停并保存最佳。
 
@@ -173,10 +226,140 @@ python scripts/train/train_stage_c.py \
     --processed-root ./LCOCF_OpenVid1M_Processed \
     --checkpoint_load ./checkpoints/stage_b_final.pt \
     --checkpoint_save ./checkpoints/stage_c_final.pt \
-    --batch_size 4 --num_epochs 3 --use_lora --device cuda
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+    --backbone-dtype bfloat16 \
+    --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 4 \
+    --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+    --batch_size 1 --num_epochs 3 --device cuda
 ```
 
-梯度范围严格遵循 §4.2：像素/语义项经**可微解码**回传到残差修复网与 LoRA；调度正则项回传到强度场与损伤预测器。骨干主体不在优化路径上。
+**骨干参数必传**：与阶段 B 不同，阶段 C 真跑扩散（`L_pixel` 要用加速引擎渲一遍再和 `Y_full`
+比像素，梯度穿过可微解码回到插件），所以 Wan 权重必须在场。`--backbone` 的默认值是 `mock`，
+只用于 CPU 冒烟跑（`--backbone mock --device cpu --num_epochs 1`）；不传就会拿一个 32 维假
+DiT 去拟合 Wan2.2 生成的 `Y_full`，训练不报错但没有意义。`--wan-variant` 默认 `ti2v-5b`，若阶段 A
+用的是 A14B（`stage_a_env.json` 里 `token_dim=64`）必须显式写 `a14b-t2v`。
+
+#### 显存档位与推荐命令（A14B @ 49×384×640）
+
+激活预算 = 卡容量 − 冻结常驻。A14B 双专家 bf16 常驻 **54.1 GiB**，只驻一个约 **27 GiB**
+（umT5 默认停在 CPU）。一次 `engine.generate` 渲染整个 batch，没有梯度累积可换，所以
+**`--batch_size` 恒为 1**；一个 clip 在此几何下需要约 20 GiB 激活余量：
+DiT 检查点栈（40 个 block 边界 × 128 MiB）≈5 GiB + block 内重算 ≈3 GiB + 可微 VAE 解码图
+8–14 GiB。脚本会按 `free ÷ 20 GiB` 钳制 batch 并打印原因，而不是让你在几分钟后撞 OOM。
+
+**① 单卡 80 GB（A100/H100 80G）—— 双专家常驻，可开 LoRA**
+
+```bash
+python scripts/train/train_stage_c.py \
+    --processed-root ./LCOCF_OpenVid1M_Processed \
+    --checkpoint_load ./checkpoints/stage_b_final.pt \
+    --checkpoint_save ./checkpoints/stage_c_final.pt \
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+    --backbone-dtype bfloat16 \
+    --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 2 \
+    --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+    --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
+    --no-offload-idle-expert \
+    --batch_size 1 --num_epochs 3 --use_lora --device cuda
+```
+
+`--no-offload-idle-expert` 是 `--use_lora` 的前提：LoRA 注入每个专家，只常驻一个时，被换出
+专家的 adapter 会在激活还挂在 autograd 图上时跨设备搬运（脚本会告警）。代价是 54.1 GiB 常驻，
+只剩 25.1 GiB 给激活 —— 刚好够一个 clip，所以这里 `--decode-grad-frames` 取 2 而非 4：
+可微解码是最大的一项，且分块解码在 autograd 下**不省显存**（每块中间量都要留到 backward，
+重叠还多留 `(128/96)² ≈ 1.78` 倍）。仍然 OOM 就把它降到 1。
+
+**② 单卡 40 GB（A100 40G / L40S 48G）—— 单专家常驻，不能开 LoRA**
+
+```bash
+python scripts/train/train_stage_c.py \
+    --processed-root ./LCOCF_OpenVid1M_Processed \
+    --checkpoint_load ./checkpoints/stage_b_final.pt \
+    --checkpoint_save ./checkpoints/stage_c_final.pt \
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+    --backbone-dtype bfloat16 \
+    --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 1 \
+    --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+    --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
+    --offload-idle-expert \
+    --batch_size 1 --num_epochs 3 --device cuda
+```
+
+40 GB 上 A14B 只剩约 11 GiB 激活余量，因此**必须**换出空闲专家、**不能**加 `--use_lora`，
+`--decode-grad-frames` 也要降到 1。此时主损失到骨干的唯一通路是残差修复网（见下方 ⚠️），
+多数 batch 实际只训练插件与调度正则 —— 40 GB 上这是能跑与跑不动之间的取舍。
+若阶段 A 用的是 **ti2v-5b**（单专家，常驻约 11 GiB），把 `--wan-variant` 换成 `ti2v-5b`
+即可保留 `--use_lora` 与 `--decode-grad-frames 2`，这是 40 GB 卡上更合理的组合。
+
+**③ 单机 8 卡 × 40 GB**
+
+阶段 C **没有分布式训练路径**（无 DDP/torchrun，一次 `engine.generate` 就是一张卡上的一条
+轨迹）。8 卡的正确用法是：阶段 A 按分片真并行（上文「单机 8×40 GB 的实际跑法」，8 卡近线性
+加速），阶段 B/C 各自单卡运行，多余的卡用来并行跑不同超参 / 不同 split 的阶段 C 实验：
+
+```bash
+# 阶段 A：8 卡分片并行 —— 见上文「阶段 A」小节的 for 循环 + --finalize-only
+
+# 阶段 B：单卡（插件训练，骨干不参与，40 GB 绰绰有余）
+CUDA_VISIBLE_DEVICES=0 python scripts/train/train_stage_b.py \
+    --processed-root ./LCOCF_OpenVid1M_Processed \
+    --checkpoint_save ./checkpoints/stage_b_final.pt \
+    --batch_size 32 --num_epochs 10 --device cuda
+
+# 阶段 C：每张卡一个独立实验（相同数据、不同超参），而不是一个 8 卡任务
+for i in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$i python scripts/train/train_stage_c.py \
+      --processed-root ./LCOCF_OpenVid1M_Processed \
+      --checkpoint_load ./checkpoints/stage_b_final.pt \
+      --checkpoint_save ./checkpoints/stage_c_lr$i.pt \
+      --backbone wan22 --wan-variant a14b-t2v \
+      --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+      --backbone-dtype bfloat16 \
+      --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 1 \
+      --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+      --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
+      --offload-idle-expert --batch_size 1 --num_epochs 3 \
+      --lr $(python3 -c "print([1e-5,2e-5,5e-5,1e-4][$i])") \
+      --device cuda > logs/stage_c.$i.log 2>&1 &
+done
+wait
+```
+
+> ⚠️ 想要真正的 8 卡数据并行，需要自行给 `FinettuneStage.run()` 加 `torchrun` + DDP（梯度只在
+> 7M 可训练参数上 all-reduce，通信量很小），本仓库尚未实现。**不要**用上面的循环去「拼」一次
+> 大 batch —— 各进程之间没有梯度同步，那只是 4 个独立的实验。
+>
+> ⚠️ CPU 内存同样是多进程的实际瓶颈：每个阶段 C 进程稳态约 40 GB（换出的空闲专家 28 GB +
+> umT5 11 GB 都在 CPU 上），4 进程约 160 GB，先 `free -g`。
+
+| 档位 | 常驻 | 激活余量 | LoRA | `--decode-grad-frames` | `--batch_size` |
+|------|------|----------|------|------------------------|----------------|
+| 80 GB | 54.1 GiB（双专家） | ~25 GiB | ✅ | 2 | 1 |
+| 40 GB（A14B） | ~27 GiB（单专家） | ~11 GiB | ❌ | 1 | 1 |
+| 40 GB（ti2v-5b） | ~11 GiB | ~28 GiB | ✅ | 2 | 1 |
+| 8×40 GB | 同 40 GB，逐卡独立 | 同 40 GB | 同上 | 同上 | 1（无 DDP） |
+
+渲染几何不用再传 —— 脚本从 `metadata/stage_a_env.json` 读取阶段 A 的
+`num_frames/height/width` 与 teacher 步数并对齐；显式传 `--height` 等覆盖时会告警，因为几何一
+旦不匹配，`_cached_baseline` 会**静默**放弃缓存并每个 batch 重算基线。
+
+| 开关 | 作用 |
+|------|------|
+| `--grad-window-steps` | 按**已计算步**计数的截断 BPTT 段长。激活峰值与它线性相关：12,480 token 下每保留一个计算步约 5 GiB，40 GB 卡上只能取 1。`0` 表示完整 BPTT，真实骨干必 OOM |
+| `--decode-grad-frames` | 放到 autograd 图上的潜空间时间槽数。分块解码只能限制**前向**瞬时，可微解码会把每块中间激活留到 backward，所以这里必须另外设窗 |
+| `--use_lora` | 在每个专家的最后若干 DiT block 注入 LoRA。需要被注入的专家全部同时常驻，**A14B 在 64 GB 以下不可用**（只有一个专家能常驻，而在激活还挂在图上时搬运模块并不成立）|
+| `--batch_size` | 整个 batch 由一次 `engine.generate` 渲染，激活随之线性增长且没有梯度累积可换。A14B @ 49×384×640 下**任何档位都只能是 1**（一个 clip 约需 20 GiB 激活余量；不足时脚本按 `free ÷ 20 GiB` 自动钳制并打印原因）|
+
+梯度范围严格遵循 §4.2：像素/语义项经**可微解码**回传到残差修复网与 LoRA；调度正则项回传到强度场与损伤预测器。骨干主体不在优化路径上。两个专家现在都会开启激活检查点（此前只对 `backbone.module` 即高噪专家生效，且只在 `--use_lora` 下才调用）。
+
+> ⚠️ **关掉 LoRA 时，主损失到骨干的唯一通路是残差修复网**，而它只在 RAEC 触发修复时才动。
+> 配 `--grad-window-steps 1`，修复恰好落在最后一个计算步的概率不高，多数 batch 实际只有正则
+> 项在训练插件。引擎会打印 `decode_grad=True but the render carries no autograd graph` 提示这
+> 一情况。想拿回这条通路需要 `--grad-window-steps 2`（峰值 +5 GiB，40 GB 放不下）或更低的分
+> 辨率。
 
 > ⚠️ 脚本默认让引擎步数取 `config.teacher.num_inference_steps`，这样 Stage A 持久化的 `Y_full` 才是有效目标。手动传 `--steps` 覆盖成别的值会导致基线缓存失效、每个 batch 额外重跑一条完整轨迹。
 
@@ -238,7 +421,7 @@ cocf/
 ├── data/          §1/§2：OpenVid 清单 · 四级过滤 · 六级存储布局 · LMDB 读写 · 分层 batch 采样 · 指标 · 视频写盘
 └── training/      §7.1：pipeline · stage_a/b/c · teacher_forward · lora · checkpoint
 scripts/           CLI：数据生成 / Stage-B / Stage-C / 推理 / 索引重建
-tests/             165 个单元 + 集成测试（含 P0–P3 回归套件）
+tests/             237 个单元 + 集成测试（含 P0–P4 回归套件）
 ```
 
 ---
@@ -261,51 +444,36 @@ config.save("dump.yaml")
 | 证书系数 κ/λ_res/λ_bnd/λ_age/λ_cmsc | `1.96 / 0.10 / 0.05 / 0.01 / 0.20` | §5.3.1 |
 | 亲和度权重 w_id/flow/iou/txt/pos | `0.40/0.30/0.15/0.10/0.05`，σ_p=16 | §4.3.1 |
 | CMSC 权重 align/id/motion/spatial/ocr/bnd | `0.30/0.20/0.20/0.15/0.10/0.05`，τ=0.07 | §6.3.2 |
-| 动作成本乘子 | `FULL/LOWFREQ/INTERP/ANCHOR = 1.0 / 0.25 / 0.0 / 0.0` | 见下注 |
+| 动作成本乘子 | `FULL/LOWFREQ/INTERP/ANCHOR = 1.0 / 0.25 / 0.02 / 0.0` | 见下注 |
 | 单步预算 b_min/b_max | `0.30 / 1.00` | §7.3 |
+| 截断 BPTT 窗口 / 可微解码槽数 | `4` / `8`（0 = 全部） | §4.2 |
+| 整步跳过阈值 / 未测量步上限 | `0.0`（关闭）/ `3` | §5.3.1 |
 | 帧数 / 分辨率桶 | `49 (4k+1)` / `(480×832)`、`(720×1280)` | §7.1 |
-| 教师步数 / 引擎步数 | `20` / `30` | §1.3 / §7.2 |
+| 教师步数 / 引擎步数 | `20` / `30`（Stage C 自动对齐到教师步数） | §1.3 / §7.2 |
 
-> **动作成本注**：文档 §2.2 给的是 `1.0/0.45/0.15/0.0`。代码改为「该动作真正重算的 token 比例」：LOWFREQ 由 `engine.lowfreq_stride` 推导（stride-2 → 1/4），INTERP/ANCHOR 完全不跑去噪器故为 0。这样成本标签与执行器的实际行为一致，但也带来一个已知副作用，见下节。
+> **动作成本注**：文档 §2.2 给的是 `1.0/0.45/0.15/0.0`。代码里 LOWFREQ 由 `engine.lowfreq_stride` 推导（stride-2 → 1/4），ANCHOR 不动任何 token 故为 0。INTERP 不跑去噪器，但要对 `|g_k|` 个 token 做 gather + 混合，是访存受限的**非零**成本 —— 取 0.02。这个非零值同时是贪心阶梯保持严格全序的前提：若与 ANCHOR 并列，被分层映射判为 LOW 档的管将永远无法升档（详见 `ActionAllocator._warn_if_ladder_collapses`）。
 
 ---
 
 ## 🚧 已知限制
 
-按影响排序，均已定位到具体文件/行为，可直接作为下一轮迭代的输入。
+上一轮 code review 的 10 条问题中，1–7 已修复（见 [`FIX_PLAN.md`](./FIX_PLAN.md) 的批次 1–3 与 `tests/unit/test_p4_*.py` 共 72 个回归用例）。以下是**仍然存在**的部分。
 
-**1. 分配器的动作阶梯在 INTERP/ANCHOR 处并列（`scheduler/allocator.py`）**
-`action_cost` 里 INTERP 与 ANCHOR 同为 `0.0`，贪心背包按成本排序后两者并列最低。后果：
-(a) 被强度场判为 LOW 档、种子动作是 INTERP 的管，**在任何预算下都无法被升档**（`_upgrade_into_budget` 里 `extra <= 0` 直接 `continue`，位置永远停在 0），§2.2 的「预算富余 → 升档」通路对这类管失效；
-(b) MID/HIGH 档管在预算紧张时会降到 ANCHOR 而不是破坏性更小的 INTERP，与 §3.3.3 的严重度顺序相反；
-(c) 一整步全是 INTERP 时 `predicted_cost` 报 0，预算约束对其形同虚设。
-修法：给 INTERP 一个非零成本（如文档的 0.15），或在排序阶梯里合并等成本档位。
+**1. 真实骨干上的端到端加速比仍接近 0（最大的一块）**
+现有视频 DiT 没有任意 token 稀疏注意力，`mask_ratio` 再低也要付一次稠密前向。唯一真实的节省是**整步跳过**，由 `engine.dense_step_skip_below` 控制。它此前因为「促发后被降级的管测不到跳算残差 δ、证书无法定价」而只能关闭；该缺口现已由 `engine.max_unmeasured_steps`（任一管连续未测量步数达到上限即否决促发）**变成有界**，所以打开它是一个有依据的取舍而不是盲赌。默认仍为 0 —— 「一个管最多能有多少步不被证书覆盖」是质量策略，属于运行方的决定。
 
-**2. 真实骨干上的端到端加速比目前接近 0**
-现有视频 DiT 没有任意 token 稀疏注意力，所以 `mask_ratio` 再低也要付一次稠密前向。唯一真实的节省是**整步跳过**，而它由 `engine.dense_step_skip_below`（默认 `0.0`，即关闭）控制，再叠加 `background_refresh_every=4` 每 4 步强制一次全 mask。代码在 `compute_ratio` 上如实反映了这一点（不虚报），但 §10 预期的 20–30% 延迟下降需要先接上 `_run_transformer_sparse` 这个已留好的稀疏 kernel 接口。
+即便打开，只要该步存在任何被强制 FULL 的管（不稳定管、RAEC 回滚钉住），促发就会被否决——这是既有的正确安全规则。§10 预期的 20–30% 延迟下降仍需要先实现 `_run_transformer_sparse` 这个已留好的稀疏 kernel 接口（建议形式：**query 稀疏** —— K/V 保留全部 token，Q 只取活跃子集，注意力 `N²→|active|·N`、MLP `∝|active|`）。
 
-**3. 走 `TrainingPipeline` 时 Stage C 的基线缓存 100% 不命中**
-`TeacherConfig.num_inference_steps=20` 与 `EngineConfig.num_inference_steps=30` 默认不等，而 `_cached_baseline` 要求两者一致才肯复用 Stage A 的 `Y_full`。CLI 脚本 `train_stage_c.py` 已做对齐（`--steps` 缺省即取教师步数），但 `TrainingPipeline._run_stage_c` 没有——该路径下每个训练 step 都要额外跑一条完整 30 步轨迹 + 一次解码，算力与显存直接翻倍。建议把这段对齐逻辑下沉到 `StageCConfig`，让两个入口行为一致。
+**2. §6.3.2 六项里 `L_spatial` / `L_bnd` 仍为零**
+`L_align` / `L_id` / `L_motion` / `L_ocr` 已全部接线并在训练中生效（`L_id` 由每管 DINO 身份特征驱动，可回传到渲染）。另两项是**结构性**为零，原因已写进 `build_cmsc_observation` 的 docstring：`L_spatial` 在两侧共用同一套语义管时恒等（引擎只在加速渲染上分割一次），要让它有信息量必须对全算力渲染单独分割；`L_bnd` 则是框架里根本没有边界描述子可读（§6.3.2 本身也标为可选，权重 0.05）。
 
-**4. §6.3.2 的六项守恒损失只训练了三项**
-`CMSCLoss.forward`（含 spatial / ocr / boundary）与整个 `cocf/training/stage_c_losses.py`（257 行，已实现 `build_cmsc_observation` / `cmsc_quality_loss` / `stage_c_regularizers`）**当前没有任何调用者**。Stage C 实际用的是 `FinettuneStage._semantic_loss` 里手写的 3 项（id / appearance / motion），Stage B 只用 `alignment_conservation` 一项。接上 `stage_c_losses` 即可补齐。
+**3. §7.1.1「相邻时间步标签插值」未实现**
+只在 3 个代表步生成样本，中间步依赖 `step_frac` 的正弦编码泛化；文档预期的「减少 60%+ 推理量」尚未兑现。注意 `DamageLabelInterpolator` 曾被 P3 当死代码删除，重新引入应放在 `finalize_processed_store` 的流式扫描里，并在 `sample_index.csv` 打 `interpolated=1` —— 否则合成标签会流进验证集，早停指标失真。
 
-**5. 证书的 λ_cmsc 项在推理闭环里恒为 0**
-`engine._step` 调 `raec.certify(...)` 时不传 `local_cmsc`（加速循环内没有逐管 CLIP 视觉嵌入），而专为此写的 `CMSCLoss.local_conservation` 无调用者。所以推理期 `E_cert` 六项里实际只有五项生效（Stage B 侧已通过 `_local_cmsc_violation` 给该系数梯度）。
+**4. 其他与文档的出入**
+`tube_refresh_every=0` 默认下语义管整条轨迹只建一次（§7.2 写的是每步更新 `G_t`，代码每步只刷新状态不重分割）；§1.3 要求落盘的 KV cache 与关键帧注意力热力图未持久化；§4.2 的「硬样本优先 / 长度动态采样」与 §4.1 的「多线程异步预读取」未实现（后者需要先让 LMDB 句柄按 worker 惰性打开）；§9 的评测协议（VBench / EvalCrafter / T2V-CompBench、700 prompt × 3 seed、配对 bootstrap）无对应脚本。
 
-**6. 几处省显存工具已实现但未接线**
-`set_gradient_checkpointing()` / `checkpointed()` / `peak_memory()` 零调用；`MemoryConfig.gradient_checkpointing`、`cache_latents` 与整套 `LatentCacheWriter/Dataset` 无使用者；`MemoryConfig.offload_backbone_to_cpu` 传不到 `AnchorStore`（`engine` 调 `new_anchor_store()` 未带 `memory` 参数）。其中最值得接的是 Stage C 解码路径的 checkpointing：VAE 分块只限制了前向峰值，`decode_grad=True` 时每块 tile 的激活仍要留到 backward。
-
-**7. Stage C 的语义损失只覆盖 batch 的第 0 个样本**
-`_semantic_loss(y_accel, y_full, captions[0])` 与 `_to_fchw` 里的 `video[0]`，`batch_size=4` 时另外 3 个渲染只进入了像素项。
-
-**8. §7.1.1「相邻时间步标签插值」未实现**
-只在 3 个代表步生成样本，中间步依赖 `step_frac` 的正弦编码泛化；文档预期的「减少 60%+ 推理量」这一条尚未兑现（配置注释已声明）。
-
-**9. 其他与文档的出入**
-`tube_refresh_every=0` 默认下语义管整条轨迹只建一次（§7.2 写的是每步更新 `G_t`，代码每步只做状态刷新不重分割）；§1.3 要求落盘的 KV cache 与关键帧注意力热力图未持久化；§4.2 的「硬样本优先 / 长度动态采样」与 §4.1 的「多线程异步预读取」未实现；§9 的评测协议（VBench / EvalCrafter / T2V-CompBench、700 prompt × 3 seed、配对 bootstrap）无对应脚本。
-
-**10. `--use-real-video` 改变了教师参照系**
+**5. `--use-real-video` 改变了教师参照系**
 该模式下 `Y_full` 是真实片段的 VAE 往返重建、`z_t` 由前向加噪得到，而非 §1.3 的「完整步数无加速推理」。这是有意的成本权衡（代码已注释），但 run.md 推荐的命令默认带该开关，论文口径需明确说明。
 
 ---
@@ -313,11 +481,11 @@ config.save("dump.yaml")
 ## 🧪 测试
 
 ```bash
-python -m pytest tests/ -q        # 165 passed
+python -m pytest tests/ -q        # 237 passed
 ```
 
 - `tests/unit/` — 骨干适配器、Wan2.2、L-COCF 损伤/预测、模型感知、数据生成、LMDB 存储、引擎
-- `tests/unit/test_p0_regressions.py` … `test_p3_hygiene.py` — 分优先级的回归套件，锁住已修复的具体缺陷
+- `tests/unit/test_p0_regressions.py` … `test_p4_*.py` — 分优先级的回归套件，每条锁住一个已修复的具体缺陷
 - `tests/integration/test_pipeline.py` — mock 骨干上的全流水线端到端冒烟
 
 ---

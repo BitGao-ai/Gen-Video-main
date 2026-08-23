@@ -34,47 +34,45 @@ training the plugins) — add ``--real-models`` (and the Wan variant on the serv
 
     python scripts/data/generate_counterfactual_data.py \
         --openvid-csv datasets/OpenVidHD.csv --data-root datasets --video-subdir videos \
-        --only-existing-videos --use-real-video \
+        --only-existing-videos \
         --backbone wan22 --wan-variant a14b-t2v --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+        --num-frames 49 --height 384 --width 640 \
         --real-models --sam-model facebook/sam-vit-base \
         --device cuda --limit 8
 
-VRAM (40 GB card, ti2v-5b default): the single 5B expert + hi-comp VAE is ~10 GB
-resident, leaving ~30 GB for activations — comfortable on a 40 GB card. The text
-encoder is parked on CPU and VAE tiling (128 px) is on by default.
-For an 80 GB card with the full A14B dual-expert stack, pass ``--wan-variant a14b-t2v``;
-the frozen stack is ~28 GB with idle-expert offload (or ~56 GB without), and the
-default 128 px VAE tile keeps the transient under ~0.4 GB.
-If you still OOM: lower ``--vae-tile`` to 96, or add ``--metric-frame-chunk 2``.
-See §9.1.
+``--use-real-video`` is deliberately absent above. It anchors the teacher trajectory
+on the clip's own pixels, which means there is no sampled ``z_init`` to persist — and
+Stage C's cached-baseline path needs ``z_init`` and ``Y_full`` *together* (a ``Y_full``
+is only a valid reference for a run starting from the same noise). Without it every
+Stage-C batch re-denoises two full trajectories and two decodes. Use it only for a
+store that will not feed Stage C.
+
+**Geometry is a cross-stage contract.** ``--num-frames/--height/--width`` must match
+whatever Stage C renders at, because Stage C's quality loss compares its render
+against the ``Y_full`` written here. The values used are recorded in
+``metadata/stage_a_env.json`` and Stages B/C read them back, so the agreement is a
+property of the store rather than of the command line that ran last.
+
+VRAM, 40 GB card, ``--wan-variant a14b-t2v`` (2×14B MoE): exactly one expert is
+resident at ~26.1 GiB, leaving ~12 GiB. That budget only closes because the text
+encoder is *exclusive* — umT5 (~10 GiB) is swapped in only after the resident expert
+is parked, never on top of it. At 384×640×49 (12,480 tokens) the DiT forward peaks
+around 4 GiB and a 256 px VAE tile around 1.4 GiB, for a ~32.5 GiB high-water mark.
+At 480×832×49 (20,280 tokens) the same run peaks near 34 GiB and is not recommended
+below 48 GB.
+If you OOM: lower ``--vae-tile`` to 128, then ``--metric-frame-chunk 2``, then the
+render height/width. See §9.1.
 """
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
-# The CUDA caching allocator reads this once, at first CUDA use — so it must be set
-# before ``import torch`` initialises anything. Stage A allocates large, *variably
-# sized* transients (VAE decode tiles, RAFT correlation volumes) against a small
-# residual after the frozen backbone's weights, which fragments the default
-# fixed-segment allocator badly: an OOM here typically reports several GB "reserved
-# but unallocated". Expandable segments let those blocks be reused across sizes.
-#
-# Merged rather than ``setdefault``-ed: a launcher that exports the variable for an
-# unrelated key (``max_split_size_mb``, ``garbage_collection_threshold``) would
-# otherwise silently drop expandable segments and reintroduce exactly the
-# fragmentation this guards against. An explicit ``expandable_segments`` in the
-# environment still wins.
-def _merge_alloc_conf(existing: str, key: str = "expandable_segments", value: str = "True") -> str:
-    parts = [p.strip() for p in existing.split(",") if p.strip()]
-    if any(p.split(":", 1)[0].strip() == key for p in parts):
-        return ",".join(parts)
-    return ",".join(parts + [f"{key}:{value}"])
+# Must run before ``import torch``: the CUDA caching allocator reads
+# PYTORCH_CUDA_ALLOC_CONF once, at first CUDA use. See cocf.common.alloc.
+from cocf.common.alloc import configure_cuda_allocator
 
-
-PYTORCH_CUDA_ALLOC_CONF = _merge_alloc_conf(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = PYTORCH_CUDA_ALLOC_CONF
+PYTORCH_CUDA_ALLOC_CONF = configure_cuda_allocator()
 
 import torch
 
@@ -96,44 +94,20 @@ DEFAULT_MODEL_PATH = REPO_ROOT / "checkpoints" / "wan22"
 
 from cocf.common.config import Config
 from cocf.common.logging import get_logger, setup_logging
+from cocf.common.vram import (
+    add_backbone_args,
+    add_geometry_args,
+    add_perception_args,
+    apply_geometry,
+    apply_wan_variant,
+    build_perception_and_metrics,
+    is_real_gpu_backbone,
+    log_vram_policy,
+    resolve_vram_policy,
+)
 from cocf.core.accelerator import Accelerator
 from cocf.data.metrics import DEFAULT_FRAME_CHUNK
 from cocf.training.stage_a_data_gen import DataGenerationStage, StageAConfig
-
-# Wan2.2 variant → BackboneConfig.extra (§9.1; mirrors cocf/backbones/wan22.py:24-31).
-# a14b-t2v is the documented primary (dual-expert MoE + Wan2.1 VAE, nothing to set);
-# ti2v-5b is single-expert with the high-compression VAE. Selected by --wan-variant.
-_WAN_VARIANT_EXTRA = {
-    "a14b-t2v": {},
-    "a14b-i2v": {"boundary_ratio": 0.900},
-    "ti2v-5b": {"boundary_ratio": None, "vae_compress": [4, 16, 16], "latent_channels": 48},
-}
-
-
-def resolve_vram_policy(config, args, real_gpu_backbone: bool) -> None:
-    """Apply the §9.1 VRAM residency flags to ``config.backbone`` in place.
-
-    Split out of :func:`main` so the CLI→config contract is unit-testable without
-    building an accelerator. The contract that matters: **text-encoder offload and
-    VAE tiling are independent**. They were once coupled behind a single ``--offload``,
-    which meant asking to keep the text encoder resident (a ~11 GB steady-state
-    choice) silently also unbounded the VAE decode (a 7.71 GiB *transient*, taken
-    ~90x per clip) — the more dangerous of the two, because it OOMs mid-run rather
-    than at load. See :meth:`cocf.backbones.diffusers_base.
-    DiffusersVideoBackbone._configure_vae_memory`.
-
-    Config defaults are now ON (40 GB-card safe); the CLI --no-* flags explicitly
-    disable them for larger cards that want the speed trade-off.
-    """
-    if not real_gpu_backbone:
-        return
-    # Explicitly set from CLI so --no-offload / --no-vae-tiling override the
-    # config defaults (which are now True for 40 GB safety).
-    config.backbone.offload_text_encoder = args.offload
-    config.backbone.vae_tiling = args.vae_tiling
-    if args.vae_tiling:
-        config.backbone.vae_tile_size = args.vae_tile
-    config.backbone.offload_idle_expert = args.offload_idle_expert
 
 
 def main():
@@ -155,84 +129,31 @@ def main():
     parser.add_argument("--use-real-video", action="store_true",
                         help="Anchor the teacher trajectory on the real mp4 pixels (VAE-encode "
                              "the clip) instead of caption-only text-to-video; implies "
-                             "--only-existing-videos and needs decord or torchvision installed")
+                             "--only-existing-videos and needs decord or torchvision installed. "
+                             "NOTE: this path samples no z_init, and Stage C can only reuse "
+                             "Y_full when z_init was persisted with it — so a store built this "
+                             "way makes every Stage-C batch re-denoise the baseline.")
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT,
                         help="Output root of the six-level processed store (§3)")
-    parser.add_argument("--backbone", type=str, default="wan22",
-                        help="Backbone registry key: wan22 (primary) | wan21 | hunyuanvideo | mock")
-    parser.add_argument("--model-path", type=str, default=str(DEFAULT_MODEL_PATH),
-                        help="Frozen-backbone weights dir (§9.1); only used by a non-mock "
-                             f"backbone. Defaults to {DEFAULT_MODEL_PATH}.")
-    # -- real perception / metric backends (§1.4/§7.1.1) ---------------------- #
+    # Backbone selection + §9.1 residency, geometry, and the real perception/metric
+    # stack all come from cocf.common.vram so Stage A and Stage C cannot drift: Stage
+    # C's target is the Y_full rendered here, and a flag that exists on only one side
+    # produces a comparison between differently-shaped videos.
+    add_backbone_args(
+        parser,
+        default_backbone="wan22",
+        default_model_path=str(DEFAULT_MODEL_PATH),
+        # Stage A's decode is label-only, so it takes the largest tile its headroom
+        # allows: peak scales with tile², tile *count* with 1/tile². At 384x640 that
+        # is 8 tiles at 256 px against 28 at 128 px, for ~1.4 GiB of transient.
+        default_vae_tile=256,
+    )
+    add_geometry_args(parser)
     # By default perception (tube segmentation) and the damage/CMSC metric extractor
     # are MOCK even when --backbone is real, so the labels are only structurally valid.
-    # These flags swap in the real SAM/DINOv2/CLIP/RAFT stack for data that is actually
-    # usable to train the plugins. Weights auto-download from HF (or point each --*-model
-    # at a local dir on an air-gapped server). Ignored under --finalize-only.
-    parser.add_argument("--real-models", action="store_true",
-                        help="Shorthand for --real-perception AND --real-metrics.")
-    parser.add_argument("--real-perception", action="store_true",
-                        help="Use the real SAM+DINOv2+CLIP+RAFT tube segmentation "
-                             "(cocf.tubes.ModelPerception) instead of the mock blobs.")
-    parser.add_argument("--real-metrics", action="store_true",
-                        help="Use the real DINOv2+CLIP+RAFT damage/CMSC metric extractor "
-                             "(cocf.data.ModelMetricExtractor) instead of the mock.")
-    parser.add_argument("--sam-model", type=str, default="facebook/sam-vit-base",
-                        help="SAM checkpoint for mask generation (or a local dir). "
-                             "Override with facebook/sam-vit-large|huge for finer masks.")
-    parser.add_argument("--dino-model", type=str, default="facebook/dinov2-base",
-                        help="DINOv2 checkpoint for identity/damage features (or a local dir).")
-    parser.add_argument("--clip-model", type=str, default="openai/clip-vit-base-patch32",
-                        help="CLIP checkpoint for text-alignment/appearance features (or a local dir).")
-    parser.add_argument("--enable-ocr", action="store_true",
-                        help="Add the easyocr OCR-fidelity term to the real metric extractor.")
-    parser.add_argument("--metric-frame-chunk", type=int, default=DEFAULT_FRAME_CHUNK,
-                        help="Frames (and frame pairs) per forward in the real metric "
-                             "extractor. Bounds the RAFT correlation volume, which at "
-                             "the default chunk is ~0.6 GB — safe on 40 GB cards. "
-                             f"Default {DEFAULT_FRAME_CHUNK}; lower to 2 if the damage "
-                             "pass still OOMs.")
-    # -- VRAM residency policy for the frozen backbone (§9.1) ----------------- #
-    # A real Wan2.2-A14B stack is ~67 GB resident (2×14B experts + 5.5B umT5),
-    # which is the whole budget of an 80 GB card before a single activation.
-    # These two switches are independent on purpose: --no-offload trades ~11 GB of
-    # *steady-state* residency for prompt-encode speed, while VAE tiling bounds the
-    # largest *transient*. Conflating them (as this script once did) meant
-    # --no-offload silently unbounded the decode, which is the more dangerous of the
-    # two — it OOMs mid-run rather than at load.
-    parser.add_argument("--no-offload", dest="offload", action="store_false",
-                        help="Keep the frozen text encoder resident. By default a real "
-                             "backbone on CUDA parks it on CPU between prompts "
-                             "(~11 GB on Wan2.2). Does NOT affect VAE tiling — see "
-                             "--no-vae-tiling.")
-    parser.add_argument("--no-vae-tiling", dest="vae_tiling", action="store_false",
-                        help="Decode/encode the VAE in one un-tiled call. NOT "
-                             "recommended: an untiled 480x832x49 Wan decode needs a "
-                             "single ~7.7 GiB block and Stage A runs ~24 decodes per "
-                             "clip. Only safe with >10 GB free after the weights load.")
-    parser.add_argument("--vae-tile", type=int, default=128,
-                        help="Tile edge in output pixels when VAE tiling is on. Peak "
-                             "decode memory scales with the square of this, so 128 "
-                             "bounds a 480x832 decode at ~0.4 GB (safe on 40 GB cards). "
-                             "Raise to 256 (~1.4 GB) only if you have >16 GB free.")
-    parser.add_argument("--offload-idle-expert", action="store_true",
-                        help="Keep only the active Wan2.2 MoE expert resident (~28 GB "
-                             "saved). Costs two ~28 GB transfers per noise-boundary "
-                             "crossing — with the default representative steps every "
-                             "rollout crosses, so this is throughput-expensive. Prefer "
-                             "--wan-variant ti2v-5b when the run is time-bound.")
-    parser.add_argument("--no-offload-idle-expert", dest="offload_idle_expert",
-                        action="store_false",
-                        help="Keep BOTH MoE experts resident (needs 56+ GB free). "
-                             "Faster on 80 GB cards — no expert-swap transfers.")
-    parser.set_defaults(offload=True, vae_tiling=True, offload_idle_expert=True)
-    parser.add_argument("--wan-variant", type=str, default="ti2v-5b",
-                        choices=sorted(_WAN_VARIANT_EXTRA),
-                        help="Wan2.2 variant → backbone geometry/MoE (§9.1). ti2v-5b (default) "
-                             "is single-expert + hi-comp VAE (~10 GB, 40GB-card safe); "
-                             "a14b-t2v and a14b-i2v are dual-expert (need 40GB+ with offload).")
-    parser.add_argument("--backbone-dtype", type=str, default="bfloat16",
-                        help="Compute dtype for the frozen backbone (bfloat16|float16|float32).")
+    # --real-models swaps in the real SAM/DINOv2/CLIP/RAFT stack for data that is
+    # actually usable to train the plugins. Ignored under --finalize-only.
+    add_perception_args(parser, default_frame_chunk=DEFAULT_FRAME_CHUNK)
     parser.add_argument("--limit", type=int, default=None,
                         help="Cap rows read per CSV (debug / smoke)")
     parser.add_argument("--samples-per-video", type=int, default=None,
@@ -241,9 +162,10 @@ def main():
                         help="Skip BOTH §3 level-3/level-4 per-video buckets (alias for "
                              "--no-baseline --no-tube-features)")
     parser.add_argument("--no-baseline", action="store_true",
-                        help="Skip the §3 level-3 full_baseline bucket — the ~1TB-at-scale "
-                             "Y_full/z_t store that Stages B/C do NOT read. Recommended for "
-                             "full-scale runs to save disk without affecting training.")
+                        help="Skip the §3 level-3 full_baseline bucket (Y_full + z_t + z_init). "
+                             "Saves ~72 MB/clip at 384x640x49 but disables Stage C's cached "
+                             "baseline, so every Stage-C batch re-denoises two full "
+                             "trajectories. Only for a store that will not feed Stage C.")
     parser.add_argument("--no-tube-features", action="store_true",
                         help="Skip the §3 level-4 tube_causal_features bucket (small)")
     # -- shard-parallel + resume (§1 embarrassingly parallel over clips) ------- #
@@ -259,6 +181,12 @@ def main():
                              "merged manifest.json + splits + sample_index + norm_stats. Run "
                              "this ONCE after all shards finish. Forces --backbone mock (no "
                              "teacher forward runs, so real weights aren't loaded).")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="Abort on the first clip that raises. By default a failing "
+                             "clip is logged (with traceback) to _failed.sNN.jsonl in the "
+                             "store and the shard moves on — a days-long run must not be "
+                             "forfeited by one corrupt mp4 or transient OOM. Failed clips "
+                             "get no progress line, so re-running retries them.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
@@ -291,39 +219,14 @@ def main():
     # across cpu/cuda (else patch_embed/denoise raise a device-mismatch error).
     config.backbone.device = args.device
     config.backbone.dtype = args.backbone_dtype
-    # VRAM residency (§9.1). Only meaningful for a real backbone actually on a GPU:
-    # the mock holds no weights, and on CPU an "offload" would be a no-op move that
-    # still pays the transfer bookkeeping. --finalize-only forces the mock backbone.
-    real_gpu_backbone = (
-        not args.finalize_only
-        and args.backbone != "mock"
-        and str(args.device).startswith("cuda")
-    )
+    # VRAM residency (§9.1) + variant geometry + render geometry, all via the shared
+    # helpers so Stage C resolves them identically (cocf/common/vram.py).
+    real_gpu_backbone = is_real_gpu_backbone(args)
     resolve_vram_policy(config, args, real_gpu_backbone)
+    apply_wan_variant(config, args)
+    apply_geometry(config, args)
     if real_gpu_backbone:
-        # State the *resolved* policy, not the requested one, so a run's actual VRAM
-        # behaviour is readable from the first lines of its log. The backbone logs
-        # its measured resident footprint against this once the weights land.
-        log.info(
-            "VRAM policy: text_encoder=%s, vae_tiling=%s, idle_expert=%s; "
-            "PYTORCH_CUDA_ALLOC_CONF=%s",
-            "cpu between prompts" if config.backbone.offload_text_encoder else "RESIDENT",
-            f"on (tile {config.backbone.vae_tile_size}px)"
-            if config.backbone.vae_tiling else "OFF (unbounded decode)",
-            "cpu when idle" if config.backbone.offload_idle_expert else "both resident",
-            PYTORCH_CUDA_ALLOC_CONF,
-        )
-        if not config.backbone.vae_tiling:
-            log.warning(
-                "--no-vae-tiling: a 480x832x49 Wan decode will request a single "
-                "~7.7 GiB block, once per rollout seed (~24x per clip). Expect an "
-                "OOM unless this card has >10 GB free after the frozen weights load."
-            )
-    # Wan2.2 variant geometry (§9.1). Only a wan* backbone reads these keys; mock/other
-    # adapters ignore ``extra``, so this is a no-op for a mock smoke run. Skipped under
-    # --finalize-only (backbone is forced to mock and no teacher forward runs).
-    if not args.finalize_only and args.backbone.startswith("wan"):
-        config.backbone.extra = dict(_WAN_VARIANT_EXTRA[args.wan_variant])
+        log_vram_policy(config, log, PYTORCH_CUDA_ALLOC_CONF)
     config.data.video_subdir = args.video_subdir
     config.seed = args.seed
 
@@ -331,30 +234,7 @@ def main():
     # as None otherwise, so Accelerator.from_config falls back to the mocks — the
     # historical, fully-backward-compatible path. --finalize-only skips both (it forces
     # the mock backbone and runs no teacher forward, so loading SAM/DINO/CLIP is waste).
-    perception = None
-    metric_extractor = None
-    want_perception = (args.real_perception or args.real_models) and not args.finalize_only
-    want_metrics = (args.real_metrics or args.real_models) and not args.finalize_only
-    if want_perception:
-        from cocf.tubes import ModelPerception
-        log.info("Loading real perception (SAM=%s, DINOv2=%s, CLIP=%s) on %s",
-                 args.sam_model, args.dino_model, args.clip_model, args.device)
-        perception = ModelPerception.from_pretrained(
-            device=args.device, sam_model=args.sam_model,
-            dino_name=args.dino_model, clip_name=args.clip_model,
-        )
-    if want_metrics:
-        from cocf.data import ModelMetricExtractor
-        log.info("Loading real metric extractor (DINOv2+CLIP+RAFT%s) on %s, frame-chunk %d",
-                 " +OCR" if args.enable_ocr else "", args.device, args.metric_frame_chunk)
-        metric_extractor = ModelMetricExtractor.from_pretrained(
-            device=args.device, dino_name=args.dino_model,
-            clip_name=args.clip_model, enable_ocr=args.enable_ocr,
-            frame_chunk=args.metric_frame_chunk,
-            # Reuse the perception backend's DINOv2/CLIP rather than loading a second
-            # ~1 GB copy of the same frozen weights (§P2-7).
-            share_from=perception,
-        )
+    perception, metric_extractor = build_perception_and_metrics(args, log)
 
     log.info("Building accelerator with backbone '%s' (perception=%s, metrics=%s)",
              args.backbone, "real" if perception else "mock",
@@ -377,6 +257,7 @@ def main():
         num_shards=args.num_shards,
         shard_index=args.shard_index,
         finalize_only=args.finalize_only,
+        fail_fast=args.fail_fast,
         seed=args.seed,
         video_subdir=args.video_subdir,
         require_file=args.only_existing_videos or args.use_real_video,

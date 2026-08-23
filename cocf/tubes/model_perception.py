@@ -32,14 +32,20 @@ device even though the models are pinned to ``device`` at load time.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Callable, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
+from cocf.common.logging import get_logger
+from cocf.common.memory import free_memory, freeze
 from cocf.tubes.regions import PerceptionProvider
 
 Tensor = torch.Tensor
+_log = get_logger(__name__)
 
 
 def raft_to_framework_flow(flow: Tensor) -> Tensor:
@@ -57,6 +63,116 @@ def raft_to_framework_flow(flow: Tensor) -> Tensor:
     if flow.shape[0] != 2:
         raise ValueError(f"expected a [2, H, W] flow field, got {tuple(flow.shape)}")
     return flow.flip(0)
+
+
+# --------------------------------------------------------------------------- #
+# SAM (mask-generation) plumbing — half-precision safety
+# --------------------------------------------------------------------------- #
+
+
+def _sam_dtype_kwargs(pipeline_fn, dtype) -> dict:
+    """``{"dtype": …}`` or ``{"torch_dtype": …}`` — whichever this transformers wants.
+
+    ``transformers`` 4.56 renamed the pipeline's weight-dtype argument and now emits
+    ```torch_dtype` is deprecated! Use `dtype` instead!`` for the old spelling,
+    while releases before it only accept ``torch_dtype``. Read the parameter name off
+    the function instead of pinning a version, so both sides of the rename work.
+    """
+    if dtype is None:
+        return {}
+    import inspect
+
+    try:
+        params = inspect.signature(pipeline_fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins have no signature
+        params = {}
+    return {"dtype" if "dtype" in params else "torch_dtype": dtype}
+
+
+def _fp32_mask_postprocess(original: Callable) -> Callable:
+    """``post_process_for_mask_generation`` with its NMS operands cast to fp32."""
+
+    def wrapped(all_masks, all_scores, all_boxes, *args, **kwargs):
+        if torch.is_tensor(all_scores):
+            all_scores = all_scores.float()
+        if torch.is_tensor(all_boxes):
+            all_boxes = all_boxes.float()
+        return original(all_masks, all_scores, all_boxes, *args, **kwargs)
+
+    return wrapped
+
+
+def _patch_sam_mask_postprocess(mask_gen) -> bool:
+    """Force SAM's automatic-mask post-processing into fp32 on ``mask_gen``.
+
+    ``MaskGenerationPipeline.postprocess`` hands the per-crop masks, the model's own
+    IoU scores and the predicted boxes to
+    ``SamImageProcessor.post_process_for_mask_generation``, which NMS-merges them
+    with::
+
+        batched_nms(boxes=all_boxes.float(), scores=all_scores, …)
+
+    — boxes cast to fp32, scores left in the *model's* dtype. Under
+    ``--perception-dtype bfloat16`` that is a dtype mismatch torchvision rejects
+    outright::
+
+        RuntimeError: dets should have the same type as scores
+
+    and it only fires once a frame yields at least one surviving mask (torchvision
+    short-circuits empty inputs before the dtype check), i.e. never at load and never
+    on a black test frame — it took down a 2600-clip Stage-A run on its 12th clip.
+    Casting both operands at this seam keeps the *weights* in bf16, which is where the
+    speed is; NMS over ≤a few hundred boxes in fp32 costs nothing measurable.
+
+    Returns whether the patch was applied (False ⇒ a transformers whose seam moved;
+    :meth:`ModelPerception.from_pretrained` then falls back to fp32 weights).
+    """
+    for owner in (getattr(mask_gen, "image_processor", None),
+                  getattr(getattr(mask_gen, "processor", None), "image_processor", None)):
+        original = getattr(owner, "post_process_for_mask_generation", None)
+        if original is None:
+            continue
+        # Instance attribute: shadows the class method for this pipeline only, so a
+        # co-resident SamImageProcessor elsewhere in the process is untouched.
+        owner.post_process_for_mask_generation = _fp32_mask_postprocess(original)
+        return True
+    return False
+
+
+def _build_mask_generator(sam_model: str, device, dtype):  # pragma: no cover - needs weights
+    """The ``mask-generation`` pipeline for ``sam_model``, dtype-safe (see above)."""
+    from transformers import pipeline
+
+    mask_gen = pipeline("mask-generation", model=sam_model, device=device,
+                        **_sam_dtype_kwargs(pipeline, dtype))
+    # SAM only ever runs under ``no_grad`` (tube segmentation on a preview decode), so
+    # this costs nothing today — but it is the same class of latent waste as the DINO/
+    # CLIP/RAFT freezes above, and leaving one tower trainable is how the next caller
+    # reintroduces a 94M-parameter gradient buffer by accident.
+    sam = getattr(mask_gen, "model", None)
+    if isinstance(sam, nn.Module):
+        freeze(sam)
+    if dtype is not None and not _patch_sam_mask_postprocess(mask_gen):
+        _log.warning(
+            "could not reach SamImageProcessor.post_process_for_mask_generation on this "
+            "transformers; half-precision SAM may fail in NMS (the load-time probe will "
+            "catch it and fall back to fp32)"
+        )
+    return mask_gen
+
+
+def _sam_probe_frame() -> Tensor:
+    """A tiny high-contrast frame SAM reliably returns *surviving* masks for.
+
+    The mask path's dtype trap is only reachable when NMS actually runs, so the
+    load-time probe needs a frame that clears ``pred_iou_thresh`` /
+    ``stability_score_thresh`` — flat noise or a black frame gets filtered to nothing
+    and would pass the probe vacuously.
+    """
+    frame = torch.full((3, 128, 128), 0.08)
+    frame[:, :, 64:] = 0.92          # hard vertical split
+    frame[:, 40:88, 40:88] = 0.5     # a centred square straddling it
+    return frame
 
 
 Tensor = torch.Tensor
@@ -133,7 +249,9 @@ class ModelPerception(PerceptionProvider):
         """
         if not self._nonempty(mask):
             return torch.zeros(self.d_id, device=frame.device)
-        return self._identity_fn(frame, mask).detach().float().to(frame.device)
+        return self._as_vector(
+            self._identity_fn(frame, mask), self.d_id, frame.device, "identity_fn"
+        )
 
     def clip_score(self, frame: Tensor, mask: Tensor, prompt: str) -> float:
         """CLIP image-text match in ``[0, 1]`` for the region vs the prompt.
@@ -141,19 +259,29 @@ class ModelPerception(PerceptionProvider):
         ``cosine(clip_img, clip_txt)·0.5 + 0.5`` — the same ``[-1,1]→[0,1]`` map
         :class:`~cocf.data.metrics.ModelMetricExtractor` uses for CLIPScore. Feeds
         the §4.3.1 semantic filter (drop regions below ``TubeConfig.min_clip_score``).
+
+        Both operands are validated to be the pooled ``[d_clip]`` embedding first: the
+        cosine is only meaningful in CLIP's *joint* space, so an un-projected tower
+        output must not reach the dot product (see :meth:`_as_vector`).
         """
         if not self._nonempty(mask):
             return 0.0
-        img = F.normalize(self._clip_image_fn(frame, mask).float().flatten(), dim=0)
-        txt = self._clip_text_fn(prompt).float().flatten().to(img.device)
-        txt = F.normalize(txt, dim=0)
+        img = self._as_vector(
+            self._clip_image_fn(frame, mask), self.d_clip, frame.device, "clip_image_fn"
+        )
+        txt = self._as_vector(
+            self._clip_text_fn(prompt), self.d_clip, img.device, "clip_text_fn"
+        )
+        img, txt = F.normalize(img, dim=0), F.normalize(txt, dim=0)
         return float((img @ txt).clamp(-1.0, 1.0) * 0.5 + 0.5)
 
     def clip_feature(self, frame: Tensor, mask: Tensor) -> Tensor:
         """CLIP visual embedding ``[d_clip]`` of the region (for text-tube alignment)."""
         if not self._nonempty(mask):
             return torch.zeros(self.d_clip, device=frame.device)
-        return self._clip_image_fn(frame, mask).detach().float().to(frame.device)
+        return self._as_vector(
+            self._clip_image_fn(frame, mask), self.d_clip, frame.device, "clip_image_fn"
+        )
 
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
         """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``."""
@@ -177,11 +305,43 @@ class ModelPerception(PerceptionProvider):
             return ident, textf
         d_feats, c_feats = self._batch_fn(frame, [masks[i] for i in keep])
         for j, i in enumerate(keep):
-            ident[i] = d_feats[j].detach().float().to(frame.device)
-            textf[i] = c_feats[j].detach().float().to(frame.device)
+            ident[i] = self._as_vector(d_feats[j], self.d_id, frame.device, "batch_fn identity")
+            textf[i] = self._as_vector(c_feats[j], self.d_clip, frame.device, "batch_fn clip")
         return ident, textf
 
     # -- helpers -------------------------------------------------------- #
+
+    def _as_vector(self, feat: Tensor, width: int, device, what: str) -> Tensor:
+        """Coerce a callable's output to the contracted 1-D ``[width]`` feature vector.
+
+        A leading batch axis of 1 is unwrapped (``[1, d]`` → ``[d]``); anything else is
+        a contract violation and is rejected **here**, naming the offending shape,
+        instead of being ``flatten()``-ed into a longer vector that only fails much
+        later as an unreadable size error deep in the tube path. That is precisely how
+        a ``transformers`` upgrade reached this code: ``get_image_features`` /
+        ``get_text_features`` started returning the towers' *token sequences* rather
+        than the pooled, projected embeddings, and the first symptom was
+
+            RuntimeError: inconsistent tensor size, expected tensor [38400] and
+            src [39424]
+
+        from :meth:`clip_score` — 50·768 vision tokens against 77·512 text tokens, four
+        call frames below the actual mistake. The same silent widening would otherwise
+        have written un-projected 768-d "CLIP embeds" into every Stage-A
+        ``tube_visual_embed`` (:func:`cocf.lcocf.data.tube_clip_embed`) and into CMSC's
+        probed ``visual_dim``. See :mod:`cocf.common.hf_clip` for the fix at the source.
+        """
+        feat = feat.detach().float().to(device)
+        if feat.ndim > 1 and feat.shape[0] == 1:
+            feat = feat[0]
+        if feat.ndim != 1 or feat.shape[0] != width:
+            raise ValueError(
+                f"{what} must return a [{width}] vector, got {tuple(feat.shape)}. "
+                "A 2-D shape here is a token sequence (e.g. [50, 768] vision / "
+                "[77, 512] text), i.e. the pooled + projected embedding was never "
+                "taken — build the CLIP callables via cocf.common.hf_clip."
+            )
+        return feat
 
     @staticmethod
     def _nonempty(mask: Tensor) -> bool:
@@ -200,11 +360,12 @@ class ModelPerception(PerceptionProvider):
         sam_model: str = "facebook/sam-vit-base",
         dino_name: str = "facebook/dinov2-base",
         clip_name: str = "openai/clip-vit-base-patch32",
-        points_per_side: int = 16,
+        points_per_crop: int = 16,
         points_per_batch: int = 64,
         pred_iou_thresh: float = 0.88,
         stability_score_thresh: float = 0.95,
         max_masks: int = 24,
+        dtype: Optional[torch.dtype] = None,
     ) -> "ModelPerception":  # pragma: no cover - needs model downloads
         """Wire SAM(mask-generation) + DINOv2 + CLIP + RAFT into the five callables.
 
@@ -214,8 +375,22 @@ class ModelPerception(PerceptionProvider):
         (e.g. ``sam-vit-huge``, ``dinov2-large``) needs no other change.
 
         Any model name may instead be a **local directory** for an air-gapped server.
-        ``points_per_side`` and ``max_masks`` are the throughput knobs — SAM runs once
-        per decoded frame and is the dominant cost of a real Stage-A pass.
+        ``points_per_crop`` and ``max_masks`` are the throughput knobs — SAM runs once
+        per decoded frame and is the dominant cost of a real Stage-A pass. The name
+        matches the HuggingFace ``mask-generation`` pipeline's parameter deliberately:
+        the original ``segment_anything`` repo calls it ``points_per_side``, and
+        :meth:`MaskGenerationPipeline._sanitize_parameters` **silently drops** kwargs it
+        does not recognise — so passing the segment-anything spelling left the default
+        ``points_per_crop=32`` in force and ran 1024 point prompts per frame instead of
+        the intended 256, at 4× the time and 4× the mask-postprocessing transient.
+
+        ``dtype`` narrows DINOv2/CLIP/SAM (RAFT is deliberately left in fp32 — its
+        all-pairs correlation volume is numerically fragile at half precision). ``None``
+        keeps the checkpoints' own dtype, which is the historical behaviour. SAM's
+        *weights* narrow, but its mask post-processing is pinned back to fp32
+        (:func:`_patch_sam_mask_postprocess`) and the whole mask path is probed here at
+        load — half precision otherwise dies inside torchvision NMS on the first
+        textured frame, not at load.
         """
         import numpy as _np
         import torch as _t
@@ -226,16 +401,38 @@ class ModelPerception(PerceptionProvider):
             AutoModel,
             CLIPModel,
             CLIPProcessor,
-            pipeline,
         )
 
-        mask_gen = pipeline("mask-generation", model=sam_model, device=device)
-        dino = AutoModel.from_pretrained(dino_name).to(device).eval()
+        mask_gen = _build_mask_generator(sam_model, device, dtype)
+        # ``freeze``, not just ``.eval()``: Stage C runs CLIP (and, through the metric
+        # extractor, DINOv2/RAFT) on the *accelerated* branch with the autograd graph
+        # on, so a tower whose parameters still say ``requires_grad=True`` makes
+        # autograd (a) retain each layer's input for a **weight** gradient nothing will
+        # ever use, and (b) materialise a full fp32 ``.grad`` for every parameter on
+        # the first backward — ~0.97 GiB across DINOv2-base + CLIP + RAFT, which no
+        # optimiser touches and ``zero_grad`` never clears (Stage C's optimiser only
+        # knows the 7M plugin/LoRA params). The gradient the §6.3.2 loss actually needs
+        # is w.r.t. the *input pixels*, and that path is unaffected by freezing.
+        dino = freeze(AutoModel.from_pretrained(dino_name).to(device))
         dino_proc = AutoImageProcessor.from_pretrained(dino_name)
-        clip = CLIPModel.from_pretrained(clip_name).to(device).eval()
+        clip = freeze(CLIPModel.from_pretrained(clip_name).to(device))
         clip_proc = CLIPProcessor.from_pretrained(clip_name)
+        if dtype is not None:
+            dino = dino.to(dtype)
+            clip = clip.to(dtype)
         d_id = int(dino.config.hidden_size)
         d_clip = int(clip.config.projection_dim)
+        # Pixel values must match the towers' weight dtype; ``_as_vector`` casts every
+        # feature back to fp32 on the way out, so nothing downstream sees half precision.
+        # Resolved **per tower, off the module** rather than as ``dtype or float32``:
+        # ``dtype=None`` keeps each checkpoint's own precision (see above), which is not
+        # necessarily fp32, and DINOv2/CLIP are separate modules that a future loader
+        # need not narrow together. Reading the weights is correct under every path.
+        # For CLIP that means the *vision* tower — the submodule these pixels reach via
+        # ``clip_image_embed`` — not ``next(clip.parameters())``, which reports whichever
+        # submodule CLIPModel happens to register first.
+        dino_dtype = next(dino.parameters()).dtype
+        clip_dtype = next(getattr(clip, "vision_model", clip).parameters()).dtype
 
         def _to_pil(frame: Tensor) -> "Image.Image":
             arr = (frame.detach().clamp(0, 1).permute(1, 2, 0) * 255).to(_t.uint8).cpu().numpy()
@@ -256,7 +453,7 @@ class ModelPerception(PerceptionProvider):
             hp, wp = frame.shape[-2], frame.shape[-1]
             out = mask_gen(
                 _to_pil(frame),
-                points_per_side=points_per_side,
+                points_per_crop=points_per_crop,
                 points_per_batch=points_per_batch,
                 pred_iou_thresh=pred_iou_thresh,
                 stability_score_thresh=stability_score_thresh,
@@ -271,11 +468,43 @@ class ModelPerception(PerceptionProvider):
             order = _t.argsort(areas, descending=True)[:max_masks]
             return stacked[order].to(frame.device)
 
+        # Prove the mask path end-to-end *at load* rather than discovering a dtype or
+        # checkpoint problem an hour into a shard: one SAM forward over a 128 px
+        # synthetic frame chosen to actually yield masks, so the run reaches the NMS
+        # merge that half precision breaks (see ``_patch_sam_mask_postprocess``). If it
+        # still fails, drop SAM to fp32 — slower per frame, but with no dtype seam left
+        # — instead of letting the shard die on its first textured clip.
+        def _probe_segmentation() -> int:
+            return int(segment_fn(_sam_probe_frame()).shape[0])
+
+        try:
+            n_probe = _probe_segmentation()
+        except Exception as exc:
+            if dtype is None:
+                raise
+            _log.warning(
+                "SAM mask generation failed at dtype=%s (%s: %s); reloading SAM in "
+                "float32 — slower per frame, but dtype-safe", dtype, type(exc).__name__, exc,
+            )
+            mask_gen = None          # release the half-precision copy before reloading
+            free_memory()
+            mask_gen = _build_mask_generator(sam_model, device, None)
+            n_probe = _probe_segmentation()
+        if n_probe:
+            _log.info("SAM mask path verified at load (%d masks on the probe frame)", n_probe)
+        else:
+            _log.warning(
+                "SAM returned no masks for the load-time probe frame, so the mask "
+                "post-processing path is unverified — a dtype/NMS failure would only "
+                "surface on a real clip. Check pred_iou_thresh/stability_score_thresh."
+            )
+
         def identity_fn(frame: Tensor, mask: Tensor) -> Tensor:
             crop = _masked_crop(frame, mask)
             if crop is None or crop.numel() == 0:
                 return _t.zeros(d_id, device=frame.device)
-            px = dino_proc(images=[_to_pil(crop)], return_tensors="pt")["pixel_values"].to(device)
+            px = dino_proc(images=[_to_pil(crop)], return_tensors="pt")["pixel_values"].to(
+                device=device, dtype=dino_dtype)
             with _t.no_grad():
                 feat = dino(px).last_hidden_state.mean(dim=1)[0]  # CLS+patch mean-pool → [d_id]
             return feat
@@ -284,9 +513,10 @@ class ModelPerception(PerceptionProvider):
             crop = _masked_crop(frame, mask)
             if crop is None or crop.numel() == 0:
                 return _t.zeros(d_clip, device=frame.device)
-            px = clip_proc(images=[_to_pil(crop)], return_tensors="pt")["pixel_values"].to(device)
+            px = clip_proc(images=[_to_pil(crop)], return_tensors="pt")["pixel_values"].to(
+                device=device, dtype=clip_dtype)
             with _t.no_grad():
-                feat = clip.get_image_features(px)[0]  # [d_clip]
+                feat = clip_image_embed(clip, px)[0]  # [d_clip]
             return feat
 
         def batch_fn(frame: Tensor, masks):
@@ -297,24 +527,47 @@ class ModelPerception(PerceptionProvider):
                 z_d = [_t.zeros(d_id, device=frame.device)] * len(masks)
                 z_c = [_t.zeros(d_clip, device=frame.device)] * len(masks)
                 return z_d, z_c
-            d_px = dino_proc(images=pil, return_tensors="pt")["pixel_values"].to(device)
-            c_px = clip_proc(images=pil, return_tensors="pt")["pixel_values"].to(device)
+            d_px = dino_proc(images=pil, return_tensors="pt")["pixel_values"].to(
+                device=device, dtype=dino_dtype)
+            c_px = clip_proc(images=pil, return_tensors="pt")["pixel_values"].to(
+                device=device, dtype=clip_dtype)
             with _t.no_grad():
                 d_feat = dino(d_px).last_hidden_state.mean(dim=1)   # [n, d_id]
-                c_feat = clip.get_image_features(c_px)              # [n, d_clip]
+                c_feat = clip_image_embed(clip, c_px)               # [n, d_clip]
             return list(d_feat), list(c_feat)
 
+        # One clip = one prompt, but ``RegionExtractor.extract_frame`` calls
+        # ``clip_score`` once per *region* (regions.py) and each call re-encodes the
+        # caption — ~300 redundant text-tower forwards per clip, each preceded by a
+        # host sync. The cache is keyed by prompt and holds a handful of entries
+        # because the access pattern is one hot key with rare changes.
+        _text_cache: "OrderedDict[str, Tensor]" = OrderedDict()
+
         def clip_text_fn(prompt: str) -> Tensor:
-            tin = clip_proc(
-                text=[prompt or " "], return_tensors="pt", padding=True, truncation=True
-            ).to(device)
+            hit = _text_cache.get(prompt)
+            if hit is not None:
+                _text_cache.move_to_end(prompt)
+                return hit
+            tin = clip_text_inputs(clip, clip_proc, [prompt], device=device)
             with _t.no_grad():
-                return clip.get_text_features(**tin)[0]  # [d_clip]
+                emb = clip_text_embed(clip, **tin)[0]  # [d_clip]
+            _text_cache[prompt] = emb
+            if len(_text_cache) > 4:
+                _text_cache.popitem(last=False)
+            return emb
 
         try:
             from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
 
-            raft = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
+            raft = freeze(raft_large(weights=Raft_Large_Weights.DEFAULT).to(device))
+            # RAFT's weights stay in whatever dtype the checkpoint loads as (fp32).
+            # The frames handed to us come from the teacher's VAE decode and are
+            # therefore often bf16/fp16, which conv2d rejects outright:
+            #   RuntimeError: Input type (c10::BFloat16) and bias type (float)
+            #   should be the same
+            # Feed RAFT its own dtype rather than casting the module, so a caller
+            # running an autocast pipeline never dictates the flow net's precision.
+            raft_dtype = next(raft.parameters()).dtype
 
             def flow_fn(frame_a: Tensor, frame_b: Tensor) -> Tensor:
                 out_dev = frame_a.device
@@ -323,14 +576,15 @@ class ModelPerception(PerceptionProvider):
                     _, h, w = x.shape
                     ph, pw = (8 - h % 8) % 8, (8 - w % 8) % 8
                     # RAFT wants [N,3,H,W] in [-1,1], H/W divisible by 8.
-                    xp = _F.pad((x[None].to(device) * 2 - 1), (0, pw, 0, ph), mode="reflect")
+                    x = x[None].to(device=device, dtype=raft_dtype)
+                    xp = _F.pad((x * 2 - 1), (0, pw, 0, ph), mode="reflect")
                     return xp, h, w
 
                 ap, h, w = _pad8(frame_a)
                 bp, _, _ = _pad8(frame_b)
                 with _t.no_grad():
                     fl = raft(ap, bp)[-1][0]  # [2, H+pad, W+pad] in RAFT's (dx, dy)
-                return raft_to_framework_flow(fl[:, :h, :w]).to(out_dev)
+                return raft_to_framework_flow(fl[:, :h, :w]).to(device=out_dev, dtype=_t.float32)
         except Exception:  # torchvision RAFT unavailable → zero flow (motion_phase=0)
             def flow_fn(frame_a: Tensor, frame_b: Tensor) -> Tensor:
                 _, h, w = frame_a.shape

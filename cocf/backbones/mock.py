@@ -139,6 +139,15 @@ class MockBackbone(BackboneAdapter):
             return up[:, :3]
         return up.repeat(1, 3, 1, 1, 1)[:, :3]
 
+    def pixel_span(self, lo: int, hi: int):
+        """Uniform mapping: nearest-neighbour upsampling expands *every* slot equally.
+
+        This is deliberately not the causal-VAE formula the real adapters use — the
+        mock's decoder genuinely has a uniform layout, and pretending otherwise would
+        make the contract test pass against the wrong arithmetic.
+        """
+        return (lo * self._patch_t, hi * self._patch_t)
+
     # -- text ----------------------------------------------------------- #
 
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:

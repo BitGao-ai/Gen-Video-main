@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -72,6 +74,13 @@ _log = get_logger(__name__)
 # norm-stat groups (§1.6 min-max over strength / tube-state / cost labels)
 _NORM_GROUPS = ("strength_features", "tube_features", "cost_label")
 
+# Consecutive per-clip failures that make the generate loop give up. A single clip can
+# fail for reasons that are its own (an unlucky frame, a transient OOM) and skipping it
+# is right; a *run* of failures means the cause is the environment (disk full, weights
+# gone, card wedged) and continuing would burn thousands of teacher forwards to write
+# nothing. Absorb the former, still stop loudly on the latter.
+_MAX_CONSECUTIVE_CLIP_FAILURES = 5
+
 
 @dataclass
 class StageAConfig:
@@ -102,6 +111,10 @@ class StageAConfig:
     num_shards: int = 1                      # total parallel workers over the clip set
     shard_index: int = 0                     # this worker's 0-based shard id
     finalize_only: bool = False              # skip generation; only build manifest/splits/index
+    # Abort the shard on the first clip that raises, instead of logging it to
+    # ``_failed.sNN.jsonl`` and moving on. Off by default: a days-long run must not be
+    # forfeited by one bad clip. Turn it on to debug a failure with a live traceback.
+    fail_fast: bool = False
 
 
 class DataGenerationStage:
@@ -203,6 +216,12 @@ class DataGenerationStage:
         if self.config.finalize_only:
             return finalize_processed_store(layout, result.split_by_video)
 
+        # Record the geometry/schedule this store is being built with, before any
+        # sample is written, so an interrupted run still leaves Stages B/C a readable
+        # contract. Shard 0 owns it for the same reason it owns the global CSVs.
+        if si == 0:
+            self._write_stage_a_env(layout)
+
         # §1.3–§1.5 — generate this shard's counterfactual samples (resumable).
         self._generate(layout, result, ns, si)
 
@@ -218,6 +237,62 @@ class DataGenerationStage:
     # ------------------------------------------------------------------ #
     # §1.1/§1.2 ingest + filter
     # ------------------------------------------------------------------ #
+
+    def _write_stage_a_env(self, layout: ProcessedLayout) -> None:
+        """Persist the backbone geometry + schedule into ``metadata/stage_a_env.json``.
+
+        Stages B and C size the residual-repair net from the backbone's token width but
+        neither loads a backbone (Stage B trains on cached labels; both default to the
+        mock adapter, whose width is 32 against Wan2.2-A14B's 64). Reading the width
+        back off the *store* is what keeps the three stages' checkpoints compatible
+        without threading identical CLI flags through all of them.
+
+        ``ensure_loaded`` first: a lazily-built adapter corrects ``hidden_dim`` from the
+        checkpoint's own VAE/transformer config during load, so reading it beforehand
+        records the pre-load guess (this is exactly how a variant/weights mismatch used
+        to write ``token_dim=192`` for a 16-channel checkpoint).
+        """
+        bb = self.backbone
+        try:
+            bb.ensure_loaded()
+        except Exception as exc:  # pragma: no cover - mock adapters have nothing to load
+            _log.debug("ensure_loaded() before env write: %s", exc)
+        d = self.config.config.data
+        env = {
+            "backbone": self.config.config.backbone.name,
+            "model_path": self.config.config.backbone.model_path,
+            "backbone_extra": dict(self.config.config.backbone.extra or {}),
+            "dtype": self.config.config.backbone.dtype,
+            "token_dim": int(bb.hidden_dim),
+            "latent_channels": int(bb.latent_channels),
+            "patch": list(getattr(bb, "patch", (1, 1, 1))),
+            "vae_compress": list(getattr(bb, "vae_compress", (1, 1, 1))),
+            "num_frames": int(d.num_frames),
+            "height": int(d.height),
+            "width": int(d.width),
+            "teacher_steps": int(self.config.config.teacher.num_inference_steps),
+            "representative_step_fracs": list(
+                self.config.config.teacher.representative_step_fracs
+            ),
+            "use_real_video": bool(self.config.use_real_video),
+        }
+        layout.write_stage_a_env(env)
+        _log.info(
+            "Stage A env → %s (token_dim=%d, %dx%dx%d, %d teacher steps)",
+            layout.stage_a_env, env["token_dim"], env["num_frames"],
+            env["height"], env["width"], env["teacher_steps"],
+        )
+        if not env["use_real_video"]:
+            return
+        # ``--use-real-video`` never samples z_init (the trajectory is anchored on the
+        # clip's own pixels), and Stage C's cached-baseline path needs z_init and
+        # Y_full together — without it every Stage-C batch re-denoises two full
+        # trajectories. Say so here rather than let Stage C discover it silently.
+        _log.warning(
+            "Stage A is running with --use-real-video, so z_init is NOT persisted. "
+            "Stage C will be unable to reuse Y_full and will recompute the full-compute "
+            "baseline for every batch. Drop --use-real-video if this store feeds Stage C."
+        )
 
     def _ingest_and_filter(self, layout: ProcessedLayout, *, write_global: bool):
         """Read OpenVid metadata and run the four-level quality filter (§1.1/§1.2).
@@ -265,6 +340,11 @@ class DataGenerationStage:
         Holds no per-sample state: samples stream straight to the writer, per-tube meta
         streams to a sidecar, and one ``_progress`` line per clip records what is done so
         a restart resumes. All §1.6 statistics are recomputed from the shards in finalize.
+
+        A clip that raises is logged to ``_failed.sNN.jsonl`` and skipped rather than
+        taking the shard down with it (``--fail-fast`` restores the old behaviour), but
+        ``_MAX_CONSECUTIVE_CLIP_FAILURES`` in a row still aborts — see there for why the
+        two cases must be treated differently.
         """
         cfg = self.config.config
         max_samples = self.config.samples_per_video or cfg.teacher.samples_per_video
@@ -288,47 +368,140 @@ class DataGenerationStage:
             force_fallback=sharded,
         )
 
-        n_new = 0
+        n_new = n_failed = n_consecutive = 0
+        fail_path = layout.lmdb_dir / f"_failed.s{shard_index:02d}.jsonl"
         with writer, open(prog_path, "a", encoding="utf-8") as pf, \
-                open(tube_path, "a", encoding="utf-8") as tf:
+                open(tube_path, "a", encoding="utf-8") as tf, \
+                open(fail_path, "a", encoding="utf-8") as ff:
             for rec in self._scene_interleaved(result.kept):
                 if not _belongs_to_shard(rec.video_id, num_shards, shard_index):
                     continue
                 if rec.video_id in done:
                     continue
                 split = result.split_by_video.get(rec.video_id, "train")
-                video_frames = self._decode_clip(rec) if self.config.use_real_video else None
-                traj = self.teacher_runner.run(
-                    rec.video_id, rec.caption, rec.scene_type, video_frames=video_frames
-                )
-                if traj is None:
-                    # Degenerate clip (no tube). Record it done so a restart won't retry.
-                    self._log_progress(pf, rec.video_id, 0, split)
-                    continue
-                if self._do_baseline:
-                    self._persist_baseline(traj)
-                if self._do_features:
-                    self._persist_features(traj)
-                for row in self._tube_meta(traj):
-                    tf.write(json.dumps(row, ensure_ascii=False) + "\n")
-                tf.flush()
-                self._persist_text_embed(traj)
-
-                samples = self.data_generator.generate(
-                    traj, self.backbone, self.transition,
-                    max_tubes=cfg.teacher.max_tubes_per_prompt,
-                    max_samples=max_samples,
-                )
-                n = 0
-                for s in samples:
-                    writer.put(self._sample_id(s), s)
-                    n += 1
-                self._log_progress(pf, rec.video_id, n, split)
-                n_new += 1
-                _log.info("  [shard %d | +%d] %s → %d samples", shard_index, n_new, rec.video_id, n)
-                free_memory()
+                # One clip must not forfeit the shard. A shard is thousands of clips and
+                # days of teacher forward; a single corrupt mp4, a transient OOM or an
+                # unlucky frame in a third-party model used to abort the whole process
+                # (recoverable only by hand, at whatever hour it happened). Failures are
+                # logged with their traceback, appended to ``_failed.sNN.jsonl``, and —
+                # deliberately — *not* written to ``_progress``, so the clip is retried
+                # on the next run rather than silently dropped from the store. Sample ids
+                # are deterministic and the writer de-duplicates on close, so a clip that
+                # died half-way through writing is overwritten, not double-counted.
+                # ``--fail-fast`` restores the old abort-on-first-error for debugging.
+                try:
+                    n = self._process_clip(
+                        rec, split, writer=writer, pf=pf, tf=tf,
+                        shard_index=shard_index, max_samples=max_samples,
+                        clip_no=n_new + 1,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    if self.config.fail_fast:
+                        raise
+                    n_failed += 1
+                    n_consecutive += 1
+                    _log.exception("  [shard %d] %s FAILED; skipping (%d failed so far)",
+                                   shard_index, rec.video_id, n_failed)
+                    ff.write(json.dumps({
+                        "video_id": rec.video_id,
+                        "error": traceback.format_exc(limit=12),
+                    }, ensure_ascii=False) + "\n")
+                    ff.flush()
+                    if n_consecutive >= _MAX_CONSECUTIVE_CLIP_FAILURES:
+                        raise RuntimeError(
+                            f"{n_consecutive} clips failed in a row in shard {shard_index}; "
+                            "that is an environment failure (disk, VRAM, weights), not a "
+                            "clip-specific one, so aborting rather than burning the rest of "
+                            f"the shard. Tracebacks: {fail_path}"
+                        ) from exc
+                else:
+                    n_consecutive = 0
+                    if n is not None:
+                        n_new += 1
+                finally:
+                    free_memory()
         _log.info("shard %d: generated samples for %d new clips → %s",
                   shard_index, n_new, layout.lmdb_dir)
+        if n_failed:
+            _log.warning(
+                "shard %d: %d clip(s) failed and were skipped; ids + tracebacks in %s. "
+                "They carry no _progress line, so re-running this shard retries them.",
+                shard_index, n_failed, fail_path,
+            )
+
+    def _process_clip(
+        self, rec: OpenVidRecord, split: str, *, writer, pf, tf,
+        shard_index: int, max_samples: Optional[int], clip_no: int,
+    ) -> Optional[int]:
+        """Teacher forward + counterfactuals for one clip → number of samples written.
+
+        Returns ``None`` for a degenerate clip (no tube survived §4.3.1), which is a
+        normal outcome and is recorded as done. Split out of :meth:`_generate` so the
+        loop can absorb a per-clip failure without unwinding the shard.
+        """
+        cfg = self.config.config
+        t_clip = time.perf_counter()
+        video_frames = self._decode_clip(rec) if self.config.use_real_video else None
+        traj = self.teacher_runner.run(
+            rec.video_id, rec.caption, rec.scene_type, video_frames=video_frames
+        )
+        if traj is None:
+            # Degenerate clip (no tube). Record it done so a restart won't retry.
+            self._log_progress(pf, rec.video_id, 0, split)
+            return None
+        # The teacher forward and the counterfactual rollouts are each tens of
+        # minutes on a real backbone, and until this line the stage emitted
+        # nothing between "resuming shard" and the finished clip — so a run that
+        # was merely slow was indistinguishable from one that had hung. One line
+        # per phase, with the VRAM high-water mark, is what makes the difference
+        # visible without trawling py-spy.
+        _log.info(
+            "  [shard %d] %s §1.3-1.4 done in %.1fs: %d tubes%s",
+            shard_index, rec.video_id, time.perf_counter() - t_clip,
+            len(traj.tubes), self._vram_note(),
+        )
+        if self._do_baseline:
+            self._persist_baseline(traj)
+        if self._do_features:
+            self._persist_features(traj)
+        for row in self._tube_meta(traj):
+            tf.write(json.dumps(row, ensure_ascii=False) + "\n")
+        tf.flush()
+        self._persist_text_embed(traj)
+
+        samples = self.data_generator.generate(
+            traj, self.backbone, self.transition,
+            max_tubes=cfg.teacher.max_tubes_per_prompt,
+            max_samples=max_samples,
+        )
+        n = 0
+        for s in samples:
+            writer.put(self._sample_id(s), s)
+            n += 1
+        self._log_progress(pf, rec.video_id, n, split)
+        _log.info(
+            "  [shard %d | +%d] %s → %d samples in %.1fs%s",
+            shard_index, clip_no, rec.video_id, n,
+            time.perf_counter() - t_clip, self._vram_note(),
+        )
+        return n
+
+    @staticmethod
+    def _vram_note() -> str:
+        """`` (vram 31.8/40.0 GiB peak)`` on CUDA, empty string elsewhere.
+
+        Reports the allocator's *peak reserved* — the figure ``nvidia-smi`` shows and
+        the one that decides whether the run fits — and resets the counter, so each
+        line describes the clip it is attached to rather than the whole run.
+        """
+        if not torch.cuda.is_available():
+            return ""
+        peak = torch.cuda.max_memory_reserved() / 1024 ** 3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        torch.cuda.reset_peak_memory_stats()
+        return f" (vram {peak:.1f}/{total:.1f} GiB peak)"
 
     @staticmethod
     def _log_progress(fh, video_id: str, n_samples: int, split: str) -> None:

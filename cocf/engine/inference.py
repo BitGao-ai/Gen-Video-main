@@ -34,6 +34,7 @@ from cocf.common.config import (
     TriggerConfig,
 )
 from cocf.common.logging import get_logger
+from cocf.common.memory import peak_memory
 from cocf.common.types import (
     Action,
     TriggerLevel,
@@ -46,6 +47,7 @@ from cocf.common.types import (
 )
 from cocf.core.accelerator import Accelerator
 from cocf.engine.state import EngineState, GenerationResult, StepTrace
+from cocf.lcocf.data import tube_clip_embed
 from cocf.lcocf.module import LCOCFModule
 from cocf.raec.anchor_store import AnchorStore
 from cocf.raec.module import RAECModule
@@ -101,6 +103,13 @@ class InferenceEngine(nn.Module):
         # Tube builder (only called at specific steps)
         self.tube_builder = accelerator.tube_builder
 
+        # One-shot flags: an adapter with no temporal-layout description disables the
+        # windowed differentiable decode, and one that only describes prefix windows
+        # pins the loss to the head of the clip. Both are worth saying once, not once
+        # per batch.
+        self._warned_no_pixel_span = False
+        self._warned_prefix_window = False
+
     def generate(
         self,
         prompts: List[str],
@@ -138,11 +147,18 @@ class InferenceEngine(nn.Module):
         # autograd graph, which is why Stage C used to train nothing despite asking for
         # a differentiable decode. Opening the backbone's grad mode for the whole span
         # is what makes ``decode_grad`` mean anything (§4.2).
-        with backbone.grad_mode(decode_grad):
-            return self._generate(
-                prompts, z_init, grid, cond, backbone,
-                record_sink=record_sink, decode_grad=decode_grad,
-            )
+        #
+        # The peak-memory probe wraps the whole trajectory because §9.4 asks for 峰值显存
+        # alongside the latency/FLOPs figures, and a saving that is really a
+        # memory-for-time trade should be visible as one. It is a no-op off CUDA.
+        with peak_memory("engine.generate") as mem:
+            with backbone.grad_mode(decode_grad):
+                result = self._generate(
+                    prompts, z_init, grid, cond, backbone,
+                    record_sink=record_sink, decode_grad=decode_grad,
+                )
+        result.peak_gib = mem["peak_gib"]  # filled on context exit
+        return result
 
     def _generate(
         self,
@@ -171,7 +187,12 @@ class InferenceEngine(nn.Module):
             cond=cond,
             subgraph=None,  # Built on-demand
             # AnchorStore's only ctor arg is offload_to_cpu; RAEC owns the factory.
-            anchor_store=self.accelerator.raec.new_anchor_store(),
+            # The memory policy has to be *handed* to it — the engine used to call the
+            # factory bare, so ``MemoryConfig.offload_backbone_to_cpu`` could never
+            # reach the store and its CPU-offload path was unreachable config.
+            anchor_store=self.accelerator.raec.new_anchor_store(
+                self.accelerator.config.memory
+            ),
             cache=None,
         )
 
@@ -226,8 +247,10 @@ class InferenceEngine(nn.Module):
         # fine-tuning needs the decode on the autograd graph (the §4.2 pixel-loss path to
         # the LoRA / repair params), so it passes ``decode_grad=True``; inference keeps the
         # cheaper no_grad decode.
+        frame_span: Optional[Tuple[int, int]] = None
         if decode_grad:
-            video = backbone.decode_latent(z0_grid)  # [B, 3, F, H, W] (grad-enabled)
+            lo, hi, frame_span = self._grad_decode_window(state.grid, backbone)
+            video = backbone.decode_latent(z0_grid[:, :, lo:hi])  # grad-enabled
             self._warn_if_no_graph(video, state, window)
         else:
             with torch.no_grad():
@@ -237,6 +260,76 @@ class InferenceEngine(nn.Module):
             video=video,
             z0=state.z,
             traces=state.traces,
+            tubes=state.tubes,
+            grid=state.grid,
+            frame_span=frame_span,
+        )
+
+    def _grad_decode_window(
+        self, grid: TokenGrid, backbone: BackboneAdapter
+    ) -> Tuple[int, int, Optional[Tuple[int, int]]]:
+        """Latent slots ``[lo, hi)`` to decode on the graph, and the pixel range they cover.
+
+        Returns the whole clip (and ``frame_span=None``) when windowing is off, when the
+        window would cover everything anyway, or when the backbone can describe no window
+        at all — see :meth:`BackboneAdapter.pixel_span` for why guessing that layout is
+        not an option.
+
+        The offset is drawn uniformly so the subsampled loss stays an unbiased estimator
+        of the full-clip one across steps (it follows the global RNG, so a seeded run is
+        reproducible) — but the draw is *offered* to the backbone rather than imposed on
+        it. A causal-temporal VAE can only reproduce a sub-range of its own full decode
+        when the slice starts at slot 0: given any later offset it has no feature cache
+        of the preceding slots and re-anchors, returning a differently-sized window of
+        different pixels. Such an adapter declines the random offset (``None``), and this
+        falls back to the prefix ``[0, k)``, which it can honour exactly. Adapters with a
+        uniform temporal layout (the mock) accept the random offset and keep the
+        unbiasedness.
+        """
+        k = int(getattr(self.engine_cfg, "decode_grad_frames", 0))
+        if k <= 0 or k >= grid.t:
+            return 0, grid.t, None
+        span_fn = getattr(backbone, "pixel_span", None)
+        if callable(span_fn):
+            lo = int(torch.randint(0, grid.t - k + 1, (1,)).item())
+            # The random draw first, then the prefix — never the prefix twice.
+            for cand in ((lo, 0) if lo > 0 else (0,)):
+                span = span_fn(cand, cand + k)
+                if span is not None:
+                    if cand == 0 and lo > 0:
+                        self._warn_prefix_window(k, backbone, span)
+                    return cand, cand + k, span
+        if not self._warned_no_pixel_span:
+            self._warned_no_pixel_span = True
+            _log.warning(
+                "engine.decode_grad_frames=%d requested, but %s describes no decodable "
+                "window (pixel_span() is absent or declined both the random offset and "
+                "the prefix), so it cannot be aligned against the full-compute "
+                "reference. Decoding the whole clip instead — expect the differentiable "
+                "decode to dominate peak memory.",
+                k, type(backbone).__name__,
+            )
+        return 0, grid.t, None
+
+    def _warn_prefix_window(
+        self, k: int, backbone: BackboneAdapter, span: Tuple[int, int]
+    ) -> None:
+        """Say once that the windowed decode is pinned to the head of every clip.
+
+        Not an error — a prefix window is the only one a causal decoder can align — but
+        it does change the training signal: the §4.2 pixel / §6.3.2 semantic gradients
+        then only ever reach frames ``[start, stop)``, so the tail of the clip trains on
+        the schedule regularisers alone.
+        """
+        if self._warned_prefix_window:
+            return
+        self._warned_prefix_window = True
+        _log.info(
+            "%s decodes causally, so the differentiable window is pinned to the clip "
+            "prefix: engine.decode_grad_frames=%d ⇒ pixel frames [%d, %d) carry the "
+            "§4.2 pixel/semantic gradient on every step, and later frames carry none. "
+            "Raise engine.decode_grad_frames to widen it (memory permitting).",
+            type(backbone).__name__, k, span[0], span[1],
         )
 
     @staticmethod
@@ -298,6 +391,16 @@ class InferenceEngine(nn.Module):
         ):
             frames_rgb = self._decode_preview_frames(state, backbone)
             state.tubes = self.tube_builder.build(frames_rgb, state.grid, state.prompt)
+            # Pool each tube's CLIP visual embed off the *same* preview frames while
+            # they are still in hand (§P4-4). These feed the certificate's local-CMSC
+            # term every step; recomputing them per step would cost a perception
+            # forward per tube per step, and they only change when tubes are rebuilt.
+            state.tube_embeds = {
+                tube.tube_id: tube_clip_embed(
+                    frames_rgb, tube, state.grid, self.accelerator.perception
+                )
+                for tube in state.tubes
+            }
             # Re-segmentation mints fresh tube ids (they are monotonic, so nothing
             # inherits a previous tube's anchor — §P1-10). Retire the anchors of tubes
             # that no longer exist so the store does not grow for the whole run.
@@ -377,6 +480,16 @@ class InferenceEngine(nn.Module):
         # sat unused, so the two could (and did) drift apart (§P1-7).
         trigger = self.accelerator.raec.trigger
         forced_full = trigger.forced_full_tubes()
+        # §6.3.1's local conservation proxy ``1 − align(tube, prompt)``: a tube the
+        # prompt barely describes is one whose skip risks a semantic violation, so it
+        # raises that tube's certificate through λ_cmsc (§5.3.1). One projection over
+        # the cached tube embeds — no perception forward — so it is affordable every
+        # step. This term used to be a hard zero at inference: the engine never passed
+        # it and ``CMSCLoss.local_conservation``, written for exactly this, had no
+        # caller anywhere (§P4-4).
+        local_cmsc = self.accelerator.cmsc_loss.local_conservation(
+            state.cond.embeds[0], state.tube_embeds
+        ) if state.tube_embeds else {}
         # §2.2's hard risk constraint ``E_cert_k(a_k) ≤ τ_r``, evaluated *before* the
         # action is chosen. The allocator has always accepted this argument; nobody
         # ever passed it, so the constraint existed only in the docstring.
@@ -386,6 +499,7 @@ class InferenceEngine(nn.Module):
                 boundary=float(tube_states[tube.tube_id].boundary_uncertainty)
                 if tube.tube_id in tube_states else 0.0,
                 anchor_age=float(state.anchor_store.age(tube.tube_id, step_idx)),
+                local_cmsc=local_cmsc.get(tube.tube_id, 0.0),
             )
             for tube in state.tubes
             if tube.tube_id in damage_preds
@@ -456,14 +570,12 @@ class InferenceEngine(nn.Module):
             )
 
         # --- Step 4 (post-transition): error certificates (RAEC), keyed by tube_id
-        # Certify the action that was *actually executed* and feed it the §5.3.1 terms
-        # available in the loop: the real skip residual δ_k = ‖z_full − z_action‖
-        # measured by the transition, the tube's boundary uncertainty (from the tube
-        # state) and its anchor age. The local-CMSC term needs a per-tube CLIP visual
-        # embed that is not extracted in the accelerated loop, so it stays 0 here (it is
-        # trained on the Stage-B/CMSC path). This must run after the transition: a
-        # pre-transition guess (prior action, zero residual) decouples the risk trigger
-        # from the error it exists to catch.
+        # Certify the action that was *actually executed* and feed it every §5.3.1 term
+        # the loop can supply: the real skip residual δ_k = ‖z_full − z_action‖ measured
+        # by the transition, the tube's boundary uncertainty (from the tube state), its
+        # anchor age, and the local cross-modal violation computed above. This must run
+        # after the transition: a pre-transition guess (prior action, zero residual)
+        # decouples the risk trigger from the error it exists to catch.
         certificates: Dict[int, float] = {}
         for tube in state.tubes:
             tid = tube.tube_id
@@ -476,6 +588,7 @@ class InferenceEngine(nn.Module):
                 boundary=float(tube_states[tid].boundary_uncertainty)
                 if tid in tube_states else 0.0,
                 anchor_age=float(state.anchor_store.age(tid, step_idx)),
+                local_cmsc=local_cmsc.get(tid, 0.0),
             )
             certificates[tid] = cert.value
 
@@ -534,6 +647,12 @@ class InferenceEngine(nn.Module):
 
         trace.rollbacks = rollbacks_this_step
         trace.repairs = repairs_this_step
+
+        # ``z_full`` was the last consumer of a second full-size latent: it is needed by
+        # the residual measurement, the §3.3.4 check and RAEC's boundary fusion, all of
+        # which are done by here. Dropping the reference now means the anchor update and
+        # the next step's forward do not run with it still resident (§P4-B4).
+        result.z_full = None
 
         # --- Step 8: Update anchor library (snapshot low-risk tubes) -----
         # The gate is ``tau_anchor``, *not* ``tau_low``: sharing the trigger's lower
@@ -680,8 +799,18 @@ class InferenceEngine(nn.Module):
         *and* the tube skipped this step, capped at ``max_checks_per_step`` — the
         executed (skip) tube latent is compared against the compute-everywhere
         reference ``z_full``. When the residual exceeds ``η`` the residual-repair net
-        corrects that tube's tokens (do(¬skip) causal-omission repair, §3.3.4), spliced
-        back out-of-place so the autograd graph (Stage-C repair-net training) is intact.
+        corrects that tube's tokens (do(¬skip) causal-omission repair, §3.3.4).
+
+        The corrections are written into a **single** working copy of the latent, cloned
+        lazily on the first actual repair: cloning per repaired tube allocated and threw
+        away a full latent up to ``max_checks_per_step`` times a step, the same churn
+        :meth:`_assemble_anchor_latent` was fixed for (§P2-2). Each tube still *reads*
+        the running copy, so a later tube overlapping an earlier one sees the earlier
+        correction exactly as before. The writes are in-place on the clone, which keeps
+        the autograd graph intact (Stage-C repair-net training) because nothing in the
+        chain — ``clone`` / ``index_select`` / ``index_put_`` — saves the mutated values
+        for backward.
+
         Returns ``(num_checks, num_repairs)``.
         """
         verifier = self.accelerator.lcocf.verifier
@@ -694,6 +823,7 @@ class InferenceEngine(nn.Module):
             return 0, 0
         tubes_by_id = {t.tube_id: t for t in state.tubes}
         checks = repairs = 0
+        z_work: Optional[Tensor] = None  # cloned on the first repair, not before
         for tid in triggered:
             tube = tubes_by_id.get(tid)
             if tube is None:
@@ -702,10 +832,11 @@ class InferenceEngine(nn.Module):
             if idx.numel() == 0:
                 continue
             checks += 1
+            src = z_work if z_work is not None else state.z
             rows: List[Tensor] = []
             changed = False
-            for b in range(state.z.shape[0]):
-                z_skip = state.z[b].index_select(0, idx)       # [n_tok, d]
+            for b in range(src.shape[0]):
+                z_skip = src[b].index_select(0, idx)           # [n_tok, d]
                 z_ref = z_full[b].index_select(0, idx)         # [n_tok, d]
                 vr = verifier.verify_and_repair(tube, z_skip, z_ref)
                 if vr.repaired and vr.z_corrected is not None:
@@ -714,9 +845,10 @@ class InferenceEngine(nn.Module):
                 else:
                     rows.append(z_skip)
             if changed:
-                corrected = torch.stack(rows, dim=0).to(state.z.dtype)   # [B, n_tok, d]
-                z_new = state.z.clone()
-                z_new[:, idx] = corrected
-                state.z = z_new
+                if z_work is None:
+                    z_work = state.z.clone()
+                z_work[:, idx] = torch.stack(rows, dim=0).to(z_work.dtype)  # [B, n_tok, d]
                 repairs += 1
+        if z_work is not None:
+            state.z = z_work
         return checks, repairs

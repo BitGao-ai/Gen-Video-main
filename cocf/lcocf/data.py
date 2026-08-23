@@ -57,11 +57,12 @@ from cocf.lcocf.strength import CausalStrengthFeatureBuilder, StrengthFeatures
 Tensor = torch.Tensor
 _log = logging.getLogger(__name__)
 
-# Per-action relative compute cost C(a) ∝ |g_k| — the fraction of a tube's tokens the
-# denoiser actually recomputes, matching AllocatorConfig.action_cost and the executor's
-# FULL/LOWFREQ/INTERP/ANCHOR tiers. FULL=1; LOWFREQ=1/stride² (the executor is
-# authoritative, see ``_cost_label``); INTERP/ANCHOR run no denoiser at all, so 0.
-ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.25, 0.0, 0.0)
+# Per-action relative compute cost C(a) ∝ |g_k| — mirrors AllocatorConfig.action_cost
+# and the executor's FULL/LOWFREQ/INTERP/ANCHOR tiers. FULL=1; LOWFREQ=1/stride² (the
+# executor is authoritative, see ``_cost_label``); INTERP runs no denoiser but does
+# gather+blend the tube's tokens in latent space, so it is small-but-nonzero (§P4-1);
+# ANCHOR touches nothing, so 0.
+ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.25, 0.02, 0.0)
 
 
 def _to_np(x: Optional[Tensor]) -> Optional[np.ndarray]:
@@ -792,17 +793,26 @@ class COCFDataGenerator:
     def _cost_label(self, action: Action, transition: TransitionExecutor) -> Tensor:
         """``[relative compute cost, active-token fraction]`` of the action (§1.5).
 
-        Both entries are derived from the executor's own stride, so the label cannot
-        contradict itself: the store used to carry ``action_cost[LOWFREQ] = 0.45``
-        beside an active fraction of ``1/stride² = 0.25`` for the same sample, and a
-        cost head trained on that learns an average of two incompatible claims
-        (§P1-6). Under the corrected model the compute cost *is* the fraction of the
-        tube's tokens the denoiser recomputes, so the two agree by construction — kept
-        as two fields only because the on-disk schema is shared with older stores.
+        The two fields are *distinct measurements* and were collapsed into one for a
+        while, which is how the store came to carry ``action_cost[LOWFREQ] = 0.45``
+        beside an active fraction of ``1/stride² = 0.25`` for the same sample — a cost
+        head trained on that learns an average of two incompatible claims (§P1-6).
+        They are kept distinct here and both sourced from the executor's own stride, so
+        neither can drift from what the engine performs:
+
+        * **relative compute cost** — what the allocator's knapsack prices the action
+          at (``ACTION_COST``, LOWFREQ overridden by the real stride). INTERP is
+          non-zero because it does latent-space work even though no denoiser runs
+          (§P4-1), so this field is *not* identical to the active fraction.
+        * **active-token fraction** — the share of the tube's tokens the denoiser
+          freshly computes: 1 for FULL, ``1/stride²`` for LOWFREQ, 0 for both skips.
         """
         stride = max(1, transition.lowfreq_stride)
-        active = (1.0, 1.0 / (stride * stride), 0.0, 0.0)[int(action)]
-        return torch.tensor([active, active], dtype=torch.float32)
+        lowfreq_frac = 1.0 / float(stride * stride)
+        active = (1.0, lowfreq_frac, 0.0, 0.0)[int(action)]
+        cost = list(self.action_cost)
+        cost[int(Action.LOWFREQ)] = lowfreq_frac
+        return torch.tensor([cost[int(action)], active], dtype=torch.float32)
 
     # ------------------------------------------------------------------ #
     # feature extraction (real, no placeholders)

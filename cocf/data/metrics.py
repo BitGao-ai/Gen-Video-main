@@ -33,7 +33,9 @@ from typing import Callable, Dict, Optional
 import torch
 import torch.nn.functional as F
 
+from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
 from cocf.common.logging import get_logger
+from cocf.common.memory import freeze
 from cocf.lcocf.damage import MetricExtractor, VideoFeatures, crop_to_tube
 
 Tensor = torch.Tensor
@@ -114,6 +116,7 @@ class MockMetricExtractor(MetricExtractor):
         self, video: Tensor, prompt: str, *,
         differentiable: bool = False,
         tube_masks: Optional[Dict[int, Tensor]] = None,
+        offload: bool = True,
     ) -> VideoFeatures:
         # The fixed projection matrices live on CPU; follow the video's device so a
         # GPU render (Stage C runs the full pipeline on GPU) does not hit a CPU×GPU
@@ -211,11 +214,13 @@ class ModelMetricExtractor(MetricExtractor):
         self, video: Tensor, prompt: str, *,
         differentiable: bool = False,
         tube_masks: Optional[Dict[int, Tensor]] = None,
+        offload: bool = True,
     ) -> VideoFeatures:
-        # Label/metric path: no grad + offload to CPU (cheap, features are detached
-        # references). Stage-C accelerated branch (differentiable=True): keep the graph
-        # so the §6.3.2 quality loss reaches the render, and keep the input device so it
-        # composes with the on-device pixel loss without a CPU×GPU mismatch.
+        # Label/metric path: no grad, and — when the caller will consume the features
+        # off-device — offload to CPU (cheap, features are detached references).
+        # Stage-C accelerated branch (differentiable=True): keep the graph so the §6.3.2
+        # quality loss reaches the render, and keep the input device so it composes with
+        # the on-device pixel loss without a CPU×GPU mismatch.
         grad_ctx = torch.enable_grad() if differentiable else torch.no_grad()
         with grad_ctx:
             dino = self.dino_fn(video).float()
@@ -232,7 +237,12 @@ class ModelMetricExtractor(MetricExtractor):
                 tid: self.dino_fn(crop_to_tube(video, m)).float()
                 for tid, m in (tube_masks or {}).items()
             }
-            if not differentiable:
+            # Offload only when asked *and* when there is no graph to keep on-device.
+            # This used to key off ``differentiable`` alone, which silently broke every
+            # consumer that wants the no-grad path but compares the result on the GPU —
+            # Stage C's §6.3.2 reference observation being the one that matters (see the
+            # ``offload`` contract on :meth:`MetricExtractor.extract`).
+            if offload and not differentiable:
                 dino, clip, flow = dino.cpu(), clip.cpu(), flow.cpu()
                 tube_dino = {tid: v.cpu() for tid, v in tube_dino.items()}
             return VideoFeatures(
@@ -258,6 +268,7 @@ class ModelMetricExtractor(MetricExtractor):
         enable_ocr: bool = False,
         frame_chunk: int = DEFAULT_FRAME_CHUNK,
         share_from: Optional[object] = None,
+        dtype: Optional["torch.dtype"] = None,
     ) -> "ModelMetricExtractor":  # pragma: no cover - needs model downloads
         """Wire DINOv2 + CLIP + torchvision-RAFT (+ optional OCR) into callables.
 
@@ -286,15 +297,40 @@ class ModelMetricExtractor(MetricExtractor):
         )
 
         shared = getattr(share_from, "models", None) or {}
-        dino = shared.get("dino") or AutoModel.from_pretrained(dino_name).to(device).eval()
+        # Frozen, not merely ``.eval()`` — see the note in
+        # :func:`cocf.tubes.model_perception.ModelPerception.from_pretrained`. This
+        # extractor's *differentiable* branch (Stage C's accelerated render) is exactly
+        # where an unfrozen tower costs both retained activations and a permanent fp32
+        # gradient buffer. ``freeze`` is applied to shared modules too: it is idempotent
+        # and the sharing path must not be the one that leaves them trainable.
+        dino = freeze(shared.get("dino") or AutoModel.from_pretrained(dino_name).to(device))
         dino_proc = shared.get("dino_proc") or AutoImageProcessor.from_pretrained(dino_name)
-        clip = shared.get("clip") or CLIPModel.from_pretrained(clip_name).to(device).eval()
+        clip = freeze(shared.get("clip") or CLIPModel.from_pretrained(clip_name).to(device))
         clip_proc = shared.get("clip_proc") or CLIPProcessor.from_pretrained(clip_name)
         if shared:
             _log.info("ModelMetricExtractor: reusing the perception backend's "
                       "DINOv2/CLIP weights (no second copy loaded)")
+        elif dtype is not None:
+            # Only narrow weights we own: a shared backend already applied its own
+            # dtype, and re-casting it in place would silently change the perception
+            # provider's precision from under it.
+            dino = dino.to(dtype)
+            clip = clip.to(dtype)
+        # The dtype ``_prep`` must produce, resolved **per tower**. DINOv2 and CLIP
+        # are narrowed together above, but ``share_from`` hands them over as two
+        # independently-built modules, so nothing guarantees they agree — and feeding
+        # one tower the other's precision is the same rejection RAFT hits below
+        # ("Input type (c10::BFloat16) and bias type (float) should be the same").
+        # Read off the module rather than from ``dtype`` so the shared-backend path
+        # is covered too, and for CLIP off the *vision* tower specifically: that is
+        # the submodule these pixels reach (via ``clip_image_embed``), whereas
+        # ``next(clip.parameters())`` reports whichever submodule CLIPModel happens
+        # to register first. Falling back to ``clip`` matches ``clip_image_embed``,
+        # which trusts ``get_image_features`` when there is no ``vision_model``.
+        dino_dtype = next(dino.parameters()).dtype
+        clip_dtype = next(getattr(clip, "vision_model", clip).parameters()).dtype
 
-        def _prep(video: Tensor, proc) -> Tensor:
+        def _prep(video: Tensor, proc, enc_dtype: torch.dtype) -> Tensor:
             """``[F,3,H,W]`` in [0,1] → the encoder's pixel values, on device.
 
             Resize + normalise **in torch**, using the processor's own constants,
@@ -313,7 +349,10 @@ class ModelMetricExtractor(MetricExtractor):
             ip = getattr(proc, "image_processor", proc)
             mean = _t.tensor(getattr(ip, "image_mean", [0.5, 0.5, 0.5]), device=device)
             std = _t.tensor(getattr(ip, "image_std", [0.5, 0.5, 0.5]), device=device)
-            return (v - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)
+            # Cast last, and with ``.to`` rather than a dtype-typed literal, so the
+            # normalisation itself still happens in the wider of the two dtypes and the
+            # §6.3.2 autograd path through this branch stays intact.
+            return ((v - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)).to(enc_dtype)
 
         def _per_frame(video: Tensor, fn) -> Tensor:
             """Apply a per-frame encoder over ``video`` in ``frame_chunk`` slices."""
@@ -324,26 +363,47 @@ class ModelMetricExtractor(MetricExtractor):
 
         def dino_fn(video: Tensor) -> Tensor:
             def _run(chunk: Tensor) -> Tensor:
-                out = dino(_prep(chunk, dino_proc)).last_hidden_state  # [f,T,d]
+                out = dino(_prep(chunk, dino_proc, dino_dtype)).last_hidden_state  # [f,T,d]
                 return out.mean(1)  # CLS-pooled identity per frame
             return _per_frame(video, _run)
 
         def clip_fn(video: Tensor) -> Tensor:
-            return _per_frame(video, lambda c: clip.get_image_features(_prep(c, clip_proc)))
+            # clip_image_embed, not clip.get_image_features: the latter returns the
+            # vision tower's token sequence [f,50,768] on newer transformers instead of
+            # the pooled, projected [f,d_clip] embedding CLIP similarity is defined on
+            # (see cocf.common.hf_clip). Stays differentiable for the §6.3.2 loss.
+            return _per_frame(video, lambda c: clip_image_embed(clip, _prep(c, clip_proc, clip_dtype)))
 
         def clip_text_fn(clip_feats: Tensor, prompt: str) -> float:
-            img = F.normalize(clip_feats.to(device).mean(0, keepdim=True), dim=-1)
-            txt_in = clip_proc(text=[prompt], return_tensors="pt",
-                               padding=True).to(device)
-            txt = F.normalize(clip.get_text_features(**txt_in), dim=-1)
+            # Both operands to fp32 before the cosine. ``extract`` hands us image
+            # features it has already ``.float()``-ed (§P2-7 stopped re-encoding the
+            # video here), while the text tower still answers in the *weights'*
+            # dtype — under ``--perception-dtype bfloat16`` that pair is a matmul
+            # torch rejects outright:
+            #     RuntimeError: expected mat1 and mat2 to have the same dtype,
+            #                   but got: float != c10::BFloat16
+            # Casting the two vectors, not the tower, keeps the weights in bf16
+            # where the speed is; a [1,d_clip] dot in fp32 costs nothing measurable
+            # (same seam as the RAFT cast below).
+            img = F.normalize(clip_feats.to(device).float().mean(0, keepdim=True), dim=-1)
+            # clip_text_inputs, not a bare clip_proc(...): the text tower has a
+            # 77-token position table and rejects anything longer, so an untruncated
+            # OpenVid-1M caption crashed Stage A on its first clip (see hf_clip).
+            txt_in = clip_text_inputs(clip, clip_proc, [prompt], device=device)
+            txt = F.normalize(clip_text_embed(clip, **txt_in).float(), dim=-1)
             return float((img @ txt.T).clamp(-1, 1).item() * 0.5 + 0.5)
 
         try:
             from torchvision.models.optical_flow import Raft_Small_Weights, raft_small
-            raft = raft_small(weights=Raft_Small_Weights.DEFAULT).to(device).eval()
+            raft = freeze(raft_small(weights=Raft_Small_Weights.DEFAULT).to(device))
+            # Videos decoded by a bf16/fp16 backbone must be cast to RAFT's own
+            # weight dtype, or conv2d rejects the pair outright ("Input type
+            # (c10::BFloat16) and bias type (float) should be the same"). Cast the
+            # frames, not the module, so the caller's precision never leaks in.
+            raft_dtype = next(raft.parameters()).dtype
 
             def flow_fn(video: Tensor) -> Tensor:
-                v = (video.clamp(0, 1) * 2 - 1).to(device)
+                v = (video.clamp(0, 1) * 2 - 1).to(device=device, dtype=raft_dtype)
                 a, b = v[:-1], v[1:]
                 if a.shape[0] == 0:
                     return _t.zeros(0, device=device)

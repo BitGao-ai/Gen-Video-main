@@ -11,11 +11,11 @@ backbone (user requirement #2). The mapping from action → which tokens are
 (user requirement #1):
 
     FULL     all of the tube's tokens are active            cost ∝ 1.00·|g_k|
-    LOWFREQ  a strided spatial subset is active, the rest    cost ∝ 0.45·|g_k|
-             are upsampled from the computed neighbours
-    INTERP   no token is active; the tube's tokens are       cost ∝ 0.15·|g_k|
-             temporally interpolated from the frames
-             around them (``interp_rows``)
+    LOWFREQ  a strided spatial subset is active, the rest    cost ∝ 1/stride²·|g_k|
+             are upsampled from the computed neighbours      (0.25 at the default 2)
+    INTERP   no token is active; the tube's tokens are       cost ∝ 0.02·|g_k|
+             temporally interpolated from the frames         (no denoiser, but a
+             around them (``interp_rows``)                    latent gather+blend)
     ANCHOR   no token is active; the latent is frozen to     cost ∝ 0.00
              the last verified-safe anchor verbatim (or to
              the pre-step latent when none exists yet)
@@ -113,6 +113,7 @@ class TransitionExecutor:
         lowfreq_stride: int = 2,
         dense_step_skip_below: float = 0.0,
         background_refresh_every: int = 0,
+        max_unmeasured_steps: int = 0,
     ) -> None:
         self.adapter = adapter
         # Recompute the un-tubed background every N steps (0 = never, the old
@@ -125,6 +126,13 @@ class TransitionExecutor:
         # Promoting such a step to a *whole-step skip* converts the plan into an
         # actual saving. 0 disables the promotion (always pay for the dense forward).
         self.dense_step_skip_below = max(0.0, float(dense_step_skip_below))
+        # Ceiling on how many consecutive steps a tube may go without a measured skip
+        # residual. This is what makes the promotion safe enough to enable by default
+        # (§P4-A2): see :meth:`_maybe_promote_to_step_skip`. 0 = no bound.
+        self.max_unmeasured_steps = max(0, int(max_unmeasured_steps))
+        # Set by the engine so the executor can consult (and update) the per-tube
+        # certificate-coverage counters. ``None`` ⇒ the invariant is inactive.
+        self.risk_trigger = None
 
     # ------------------------------------------------------------------ #
     # Active-mask construction (the FLOPs lever)
@@ -199,13 +207,15 @@ class TransitionExecutor:
         be tiny would quietly cancel the safety mechanism that asked for it — the
         opposite of what a cheap throughput heuristic is allowed to do.
 
-        **Known limitation — why this is opt-in.** A promotion downgrades every
-        LOWFREQ tube to plain cache reuse, and since nothing was computed there is no
-        reference to measure those tubes' skip residual against: the certificate sees
-        δ=0 and cannot price the extra error. The downgrade is reported back through
-        :attr:`TransitionResult.downgraded` so traces and logs do not claim LOWFREQ
-        ran, but the risk layer's *coverage* of those tubes is genuinely reduced.
-        Hence ``dense_step_skip_below`` defaults to 0.
+        **Certificate coverage bounds it.** A promotion downgrades every LOWFREQ tube
+        to plain cache reuse, and since nothing was computed there is no reference to
+        measure those tubes' skip residual against: the certificate sees δ=0 and cannot
+        price the extra error. That used to make the whole heuristic opt-in. It is now
+        bounded instead: :class:`~cocf.raec.trigger.RiskTrigger` counts how many
+        consecutive steps each tube has gone without a measured δ, and once any tube
+        reaches ``max_unmeasured_steps`` the promotion is vetoed so the forward runs and
+        every residual is re-grounded. The downgrade is still reported through
+        :attr:`TransitionResult.downgraded` so traces never claim LOWFREQ ran.
 
         No-op when the adapter *is* sparse (the mask is already proportional to cost),
         when the threshold is 0, when the mask is empty or full, or when there is no
@@ -220,6 +230,15 @@ class TransitionExecutor:
             for t in tubes
         ):
             return active_mask  # a tube demanded full compute; honour it
+        if self.risk_trigger is not None and self.risk_trigger.coverage_exhausted(
+            self.max_unmeasured_steps
+        ):
+            _log.debug(
+                "transition: a tube has gone %d steps without a measured skip residual "
+                "— running the forward so RAEC's certificate is re-grounded",
+                self.max_unmeasured_steps,
+            )
+            return active_mask
         occupancy = float(active_mask.float().mean().item())
         if 0.0 < occupancy <= self.dense_step_skip_below:
             _log.debug(
@@ -323,14 +342,28 @@ class TransitionExecutor:
         computed = float(getattr(out, "compute_fraction", 1.0)) > 0.0
 
         # 3) Per-action latent reconstruction for the skipped tubes.
-        z_next = z_full.clone()
+        skips = sorted(
+            (t for t in tubes
+             if decision.action_for(t.tube_id, default=Action.FULL).is_skip),
+            key=lambda t: -int(decision.action_for(t.tube_id, default=Action.FULL)),
+        )
+        lowfreq = [
+            t for t in tubes
+            if decision.action_for(t.tube_id, default=Action.FULL) == Action.LOWFREQ
+        ]
+        # Nothing to write back ⇒ ``z_next`` *is* the compute-everywhere latent, and
+        # cloning it would allocate a second full latent per step for an exact copy
+        # (§P4-B4). The clone is only needed once a skip or a LOWFREQ fill is about to
+        # mutate it — z_full has to survive intact for the certificate's residual, the
+        # §3.3.4 check and RAEC's boundary fusion.
+        needs_write = bool(skips) or bool(
+            lowfreq and self.lowfreq_stride > 1 and computed
+        )
+        z_next = z_full.clone() if needs_write else z_full
         tube_residual: Dict[int, float] = {}
-        for tube in tubes:
-            action = decision.action_for(tube.tube_id, default=Action.FULL)
-            if action in (Action.FULL, Action.LOWFREQ):
-                if action == Action.LOWFREQ and self.lowfreq_stride > 1 and computed:
-                    self._fill_lowfreq(z_next, z_full, tube, grid)
-                continue  # already in z_full
+        if computed and self.lowfreq_stride > 1:
+            for tube in lowfreq:
+                self._fill_lowfreq(z_next, z_full, tube, grid)
 
         # Skip write-backs are applied *after* every computed tube and in a fixed
         # severity order, so an overlap does not resolve by list position (§P1-6).
@@ -339,11 +372,6 @@ class TransitionExecutor:
         # skips overlap the less destructive one (INTERP, which still moves with the
         # trajectory) is written last and wins over ANCHOR's freeze.
         active_now = active_mask.to(device)
-        skips = sorted(
-            (t for t in tubes
-             if decision.action_for(t.tube_id, default=Action.FULL).is_skip),
-            key=lambda t: -int(decision.action_for(t.tube_id, default=Action.FULL)),
-        )
         for tube in skips:
             action = decision.action_for(tube.tube_id, default=Action.FULL)
             idx = tube.all_token_indices().to(device)
@@ -379,6 +407,28 @@ class TransitionExecutor:
                 )
 
         active_ratio = float(active_mask.float().mean().item())
+        # Certificate coverage (§P4-A2). A tube counts as *certified* this step when its
+        # error can actually be priced: either the denoiser recomputed it (FULL, or a
+        # LOWFREQ whose lattice really ran) or the transition measured its skip residual
+        # δ. Everything else went a step unpriced.
+        #
+        # The executed action is what matters, not the allocated one — a promoted
+        # whole-step skip turns LOWFREQ tubes into plain cache reuse, and those are
+        # precisely the tubes the invariant exists to bound. Reading ``decision`` alone
+        # would have missed every one of them.
+        if self.risk_trigger is not None:
+            certified, blind = [], []
+            for tube in tubes:
+                tid = tube.tube_id
+                executed = downgraded.get(tid, decision.action_for(tid, default=Action.FULL))
+                if executed == Action.FULL or (executed == Action.LOWFREQ and computed):
+                    certified.append(tid)
+                elif tid in tube_residual:
+                    certified.append(tid)
+                else:
+                    blind.append(tid)
+            self.risk_trigger.note_measured(certified)
+            self.risk_trigger.note_unmeasured(blind)
         return TransitionResult(
             z_next=z_next,
             cache=out.cache,

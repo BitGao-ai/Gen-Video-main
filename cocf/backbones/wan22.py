@@ -33,7 +33,8 @@ Configuring a variant (all via ``BackboneConfig.extra``)::
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,7 +43,7 @@ from cocf.backbones.base import TextConditioning
 from cocf.backbones.wan21 import Wan21Backbone
 from cocf.common.config import BackboneConfig
 from cocf.common.logging import get_logger
-from cocf.common.memory import free_memory
+from cocf.common.memory import free_memory, normal_mode
 from cocf.common.registry import register_backbone
 
 Tensor = torch.Tensor
@@ -52,6 +53,20 @@ _log = get_logger(__name__)
 # well-behaved run (one crossing per trajectory) never trips it, while Stage A's
 # per-rollout re-entry above the boundary does so within the first clip.
 _SWAP_WARN_AFTER = 32
+
+#: Wan2.2 variant → :attr:`BackboneConfig.extra` (§9.1).
+#:
+#: Lives here rather than in an entry script because *every* stage must map the same
+#: ``--wan-variant`` string to the same geometry: Stage C's target is the ``Y_full``
+#: Stage A rendered, so a variant that drifts between the two silently compares videos
+#: of different token geometry. ``a14b-t2v`` is the documented primary (dual-expert MoE
+#: + the Wan2.1 VAE, nothing to set); ``ti2v-5b`` is single-expert with the
+#: high-compression VAE.
+WAN22_VARIANTS: Dict[str, Dict[str, Any]] = {
+    "a14b-t2v": {},
+    "a14b-i2v": {"boundary_ratio": 0.900},
+    "ti2v-5b": {"boundary_ratio": None, "vae_compress": [4, 16, 16], "latent_channels": 48},
+}
 
 
 @register_backbone("wan22")
@@ -147,7 +162,15 @@ class Wan22Backbone(Wan21Backbone):
 
         path = self.config.model_path
         extra = self.config.extra or {}
-        self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae")
+        self._check_variant_against_checkpoint(path)
+        # ``torch_dtype`` + ``low_cpu_mem_usage`` on *every* component: without them
+        # ``from_pretrained`` materialises fp32 on the CPU and only the subsequent
+        # ``.to(device, dtype)`` narrows it, so an A14B expert costs 56 GB of host RAM
+        # (and umT5 22 GB) during load. Stage A runs one process per GPU, so that
+        # transient is multiplied by the shard count and is what actually OOMs an
+        # 8-way node — see the load-time budget in the §9.1 notes.
+        hf = {"torch_dtype": self.dtype, "low_cpu_mem_usage": True}
+        self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", **hf)
         # Adapt to the *actual* checkpoint's geometry where its config states it, so
         # A14B / TI2V-5B need no per-variant hardcoding. Each half is independent and
         # only applied when genuinely found — an unstated value leaves the declared
@@ -169,7 +192,7 @@ class Wan22Backbone(Wan21Backbone):
             )
             self.vae_compress = detected
         # High-noise expert (always present).
-        self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer")
+        self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", **hf)
         # Cross-check transformer in_channels — should already match from the VAE
         # detection above, but guard against mismatched checkpoints.
         ckpt_channels = getattr(self.transformer.config, "in_channels", None)
@@ -188,7 +211,7 @@ class Wan22Backbone(Wan21Backbone):
         if self.boundary_ratio is not None:
             sub = extra.get("transformer_2_subfolder", "transformer_2")
             try:
-                self.transformer_2 = WanTransformer3DModel.from_pretrained(path, subfolder=sub)
+                self.transformer_2 = WanTransformer3DModel.from_pretrained(path, subfolder=sub, **hf)
             except (OSError, ValueError) as e:  # subfolder absent ⇒ single-expert ckpt
                 # Only a genuine "not found" (HF raises OSError / a ValueError subclass)
                 # degrades to single-expert; OOM / CUDA / other RuntimeErrors propagate
@@ -201,9 +224,49 @@ class Wan22Backbone(Wan21Backbone):
                 )
                 self.transformer_2 = None
                 self.boundary_ratio = None
-        self.text_encoder = UMT5EncoderModel.from_pretrained(path, subfolder="text_encoder")
+        self.text_encoder = UMT5EncoderModel.from_pretrained(path, subfolder="text_encoder", **hf)
         self.tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
         self._max_len = int(extra.get("max_text_len", 512))
+
+    # -- variant ⇄ checkpoint agreement --------------------------------- #
+
+    def _check_variant_against_checkpoint(self, path: Optional[str]) -> None:
+        """Fail *at load* when ``--wan-variant`` disagrees with the weights on disk.
+
+        The dangerous direction is a dual-expert A14B checkpoint opened under a
+        single-expert variant (``ti2v-5b``): ``boundary_ratio`` is then ``None``, so
+        :meth:`_load` never reads ``transformer_2`` and :meth:`_expert_for` routes
+        *every* noise level to the high-noise expert. Nothing downstream notices — the
+        run proceeds at full speed and produces counterfactual labels drawn from the
+        wrong denoiser below σ = ``boundary_ratio``. Failing here, with the fix in the
+        message, is the only cheap place to catch it.
+
+        Skipped for a non-local ``path`` (an HF repo id has no directory to inspect);
+        the ``transformer_2`` load in :meth:`_load` still degrades gracefully there.
+        """
+        if not path:
+            return
+        root = Path(path)
+        if not root.is_dir():
+            return
+        sub = (self.config.extra or {}).get("transformer_2_subfolder", "transformer_2")
+        has_second = (root / str(sub)).is_dir()
+        if has_second and self.boundary_ratio is None:
+            raise RuntimeError(
+                f"Wan2.2 variant mismatch: '{root}' ships a '{sub}' expert (a "
+                f"dual-expert A14B checkpoint), but this run configured a "
+                f"single-expert variant (boundary_ratio=None), so the low-noise "
+                f"expert would never load and every σ would be routed to the "
+                f"high-noise one.\n"
+                f"  Fix:  --wan-variant a14b-t2v   (or a14b-i2v for image-to-video)"
+            )
+        if not has_second and self.boundary_ratio is not None:
+            raise RuntimeError(
+                f"Wan2.2 variant mismatch: this run configured the dual-expert MoE "
+                f"(boundary_ratio={self.boundary_ratio}), but '{root}' has no '{sub}' "
+                f"subfolder — it is a single-expert checkpoint.\n"
+                f"  Fix:  --wan-variant ti2v-5b"
+            )
 
     def _place_auxiliary_modules(self) -> None:
         """Freeze/device-place the *second* expert (:class:`DiffusersVideoBackbone` hook).
@@ -247,6 +310,20 @@ class Wan22Backbone(Wan21Backbone):
                     return self.device if module is resident else self.offload_device
         return super()._home_device(module)
 
+    def _resident_denoisers(self) -> List[nn.Module]:
+        """The expert(s) currently occupying the compute device (§9.1).
+
+        Overridden because the base class only knows about ``transformer``: under
+        ``offload_idle_expert`` the resident denoiser is whichever expert
+        :meth:`_make_resident` last swapped in, and parking the *wrong* one during a
+        text encode would leave 26 GB on the card and evict weights that are about to
+        be used. Consumed by :meth:`DiffusersVideoBackbone._module_active`.
+        """
+        if not self.config.offload_idle_expert:
+            return [m for m in (self.transformer, self.transformer_2) if isinstance(m, nn.Module)]
+        resident = self._resident_expert or self.transformer
+        return [resident] if isinstance(resident, nn.Module) else []
+
     def _make_resident(self, want: nn.Module) -> None:
         """Swap ``want`` onto the compute device, evicting the other expert.
 
@@ -258,9 +335,14 @@ class Wan22Backbone(Wan21Backbone):
         rather than letting the run silently become transfer-bound.
         """
         other = self.transformer_2 if want is self.transformer else self.transformer
-        if isinstance(other, nn.Module):
-            other.to(self.offload_device)
-        want.to(self.device)
+        # Outside any ambient ``inference_mode``: these moves reallocate the experts'
+        # parameters, and an inference tensor can never carry a gradient afterwards
+        # (:func:`cocf.common.memory.normal_mode`). Routing is called from label-only
+        # passes too, so the guard belongs here rather than at the call sites.
+        with normal_mode():
+            if isinstance(other, nn.Module):
+                other.to(self.offload_device)
+            want.to(self.device)
         self._resident_expert = want
         self._expert_swaps += 1
         free_memory()

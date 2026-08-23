@@ -1,0 +1,28 @@
+# COCF-SS-DCA runtime dependencies
+# Generated from pyproject.toml + full import scan of cocf/, scripts/, tests/
+# Python >= 3.9
+
+# ---- Core (hard dependencies) ----
+torch>=2.0
+numpy
+PyYAML
+
+# ---- Data pipeline ----
+lmdb                # counterfactual LMDB store
+decord              # mp4 decoding (primary reader)
+imageio             # video writing (imageio.v2)
+opencv-python       # video writing fallback (cv2)
+Pillow              # frame I/O
+
+# ---- Matching / metrics ----
+scipy               # linear_sum_assignment (tube matching)
+easyocr             # OCR-based text metrics
+
+# ---- Diffusion backbones (Wan2.1/2.2, HunyuanVideo) ----
+diffusers>=0.34     # AutoencoderKLWan.enable_tiling() requires >=0.34
+transformers
+accelerate
+torchvision         # video fallback reader + perception metric backends
+
+# ---- Testing ----
+pytest

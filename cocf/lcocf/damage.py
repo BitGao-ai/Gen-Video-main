@@ -63,7 +63,11 @@ DEFAULT_DAMAGE_WEIGHTS: Dict[str, float] = {
 class VideoFeatures:
     """Per-video statistics needed to score every damage axis (no raw frames kept).
 
-    All tensors are CPU/float and small, so a teacher record stays light on disk.
+    All tensors are float and small, so a teacher record stays light on disk. They are
+    *not* guaranteed to be on CPU: the extractor keeps them on the render's device
+    whenever the caller passes ``offload=False`` (Stage C compares two observations on
+    the GPU). Any binary reduction over two of these must co-locate them first — see
+    :meth:`to`.
     """
 
     dino_per_frame: Tensor          # [F, d_dino] subject identity features
@@ -76,6 +80,45 @@ class VideoFeatures:
 
     def num_frames(self) -> int:
         return int(self.dino_per_frame.shape[0])
+
+    def detached(self) -> "VideoFeatures":
+        """A graph-free copy of these features.
+
+        :class:`MultiDimDamageComputer` reduces every axis to a Python ``float``, which
+        on a tensor still attached to the graph both warns and needlessly keeps that
+        graph alive. Callers that extracted features with ``differentiable=True`` (the
+        Stage-C accelerated branch) but want a *label* out of them — e.g. the realised
+        damage the §4.2 certificate regulariser calibrates against — detach first.
+        """
+        return VideoFeatures(
+            dino_per_frame=self.dino_per_frame.detach(),
+            clip_per_frame=self.clip_per_frame.detach(),
+            clip_text_score=self.clip_text_score,
+            flow_mag_per_pair=self.flow_mag_per_pair.detach(),
+            ocr_accuracy=self.ocr_accuracy,
+            tube_dino={k: v.detach() for k, v in self.tube_dino.items()},
+        )
+
+    def to(self, device) -> "VideoFeatures":
+        """These features on ``device`` (``None`` ⇒ unchanged; a no-op if already there).
+
+        Every :class:`MultiDimDamageComputer` axis is a binary reduction over *two*
+        observations, and it has no device logic of its own — so the two must already
+        agree. They do not agree automatically: extraction may park a detached result on
+        CPU (the ``offload`` contract on :meth:`MetricExtractor.extract`) while its
+        counterpart stays on the render's device. Co-locating a detached reference is
+        lossless, so the comparing caller does it rather than each axis guessing.
+        """
+        if device is None:
+            return self
+        return VideoFeatures(
+            dino_per_frame=self.dino_per_frame.to(device),
+            clip_per_frame=self.clip_per_frame.to(device),
+            clip_text_score=self.clip_text_score,
+            flow_mag_per_pair=self.flow_mag_per_pair.to(device),
+            ocr_accuracy=self.ocr_accuracy,
+            tube_dino={k: v.to(device) for k, v in self.tube_dino.items()},
+        )
 
 
 def crop_to_tube(video: Tensor, mask: Tensor) -> Tensor:
@@ -114,14 +157,30 @@ class MetricExtractor(abc.ABC):
         self, video: Tensor, prompt: str, *,
         differentiable: bool = False,
         tube_masks: Optional[Dict[int, Tensor]] = None,
+        offload: bool = True,
     ) -> VideoFeatures:
         """``video`` is ``[F, 3, H, W]`` in [0,1]; returns its quality features.
 
-        ``differentiable=False`` (default) extracts under ``no_grad`` and may offload
-        the features to CPU — the cheap path for label generation / metric reporting,
-        where the features are detached references. ``differentiable=True`` keeps the
-        autograd graph **and** the input device, so the accelerated branch of the §6.3.2
-        Stage-C semantic loss can back-propagate into the render (repair net / LoRA).
+        ``differentiable=False`` (default) extracts under ``no_grad``.
+        ``differentiable=True`` keeps the autograd graph **and** the input device, so the
+        accelerated branch of the §6.3.2 Stage-C semantic loss can back-propagate into
+        the render (repair net / LoRA).
+
+        ``offload=True`` (default) lets the implementation park the returned features on
+        CPU — the cheap path for label generation, where they are detached references
+        headed for disk. It is ignored when ``differentiable=True`` (moving the features
+        off the render's device would sever the graph's device consistency).
+
+        Offloading is a **separate** decision from differentiability, and conflating the
+        two is a real bug rather than a hypothetical: Stage C's §6.3.2 loss builds its
+        *reference* observation with ``differentiable=False`` — it genuinely wants the
+        no-grad path — but then compares it element-wise, on the GPU, against the
+        accelerated observation. With the offload welded to ``differentiable`` the
+        reference came back on CPU and every such comparison
+        (:meth:`CMSCLoss._id_term`, :meth:`CMSCLoss._motion_term`,
+        :meth:`MultiDimDamageComputer.compute`) raised a cuda-vs-cpu device error. A
+        caller that will *consume* the features on the render's device therefore passes
+        ``offload=False``.
 
         ``tube_masks`` maps ``tube_id → [F, H, W]`` bool; each one adds a *localised*
         identity feature to :attr:`VideoFeatures.tube_dino`, which is what lets the

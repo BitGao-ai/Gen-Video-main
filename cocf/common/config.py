@@ -201,15 +201,25 @@ class BudgetConfig:
 class AllocatorConfig:
     """Budget-constrained action allocation (§2.2)."""
 
-    # Per-action relative cost multipliers C(a, |g_k|) ∝ |g_k| (§2.2): the fraction of
-    # a tube's tokens the action actually recomputes. These must agree with what the
-    # transition executor really does, or the knapsack optimises a fiction — the old
-    # (1.0, 0.45, 0.15, 0.0) priced LOWFREQ at 0.45 while a stride-2 lattice computes
-    # 1/4 of the tokens, and INTERP at 0.15 though it runs no denoiser at all, so the
-    # solver believed a downgrade bought savings that never materialised (§P1-6).
-    # The LOWFREQ entry is *derived* from ``EngineConfig.lowfreq_stride`` at
-    # construction (1/stride²); the value here is the stride-2 default.
-    action_cost: Tuple[float, float, float, float] = (1.0, 0.25, 0.0, 0.0)
+    # Per-action relative cost multipliers C(a, |g_k|) ∝ |g_k| (§2.2). These must agree
+    # with what the transition executor really does, or the knapsack optimises a
+    # fiction — the original (1.0, 0.45, 0.15, 0.0) priced LOWFREQ at 0.45 while a
+    # stride-2 lattice computes 1/4 of the tokens (§P1-6). The LOWFREQ entry is
+    # *derived* from ``EngineConfig.lowfreq_stride`` at construction (1/stride²); the
+    # value here is the stride-2 default.
+    #
+    # -- why INTERP is small-but-nonzero, not zero (§P4-1) -------------------- #
+    # This vector serves two roles: the budget denominator *and* the ordering of the
+    # greedy's action ladder. Pricing INTERP at exactly 0.0 — "it runs no denoiser" —
+    # is right for the first role and fatal for the second: it ties INTERP with ANCHOR,
+    # and the solver moves along the ladder only where the cost delta is non-zero. A
+    # tube seeded at INTERP (every LOW-tier tube, §3.3.3) could then never be upgraded
+    # at *any* budget, while a tube under budget pressure fell straight past INTERP to
+    # ANCHOR — the more destructive of the two. INTERP is not actually free: it gathers
+    # and blends |g_k| tokens in latent space, memory-bound work roughly two orders of
+    # magnitude under a DiT forward on the same tokens. 0.02 states that honestly and
+    # keeps the ladder strict. See ``ActionAllocator._warn_if_ladder_collapses``.
+    action_cost: Tuple[float, float, float, float] = (1.0, 0.25, 0.02, 0.0)
     risk_threshold: float = 0.80  # τ_r hard risk constraint (== TriggerConfig.tau_high)
     greedy_fallback: bool = True  # use greedy knapsack if LP solver unavailable
 
@@ -229,16 +239,30 @@ class EngineConfig:
     tube_build_step: int = 1  # build after 1 warm-up FULL step so structure exists
     tube_refresh_every: int = 0  # re-segment every N steps (0 = never re-segment)
     lowfreq_stride: int = 2  # LOW FREQ spatial stride (2 ⇒ ~1/4 tokens computed)
-    # Opt-in throughput heuristic, **off by default**. On a backbone without
-    # token-sparse attention a mask this sparse costs a full dense forward anyway, so
-    # the transition executor can promote it to a whole-step cache reuse — a real
-    # saving. The catch is that a promoted step silently downgrades any LOWFREQ tube
-    # to "reuse cached ε", and there is then no computed reference to measure that
-    # tube's skip residual against, so RAEC's certificate sees δ=0 and cannot price
-    # the extra error (§5.3.1). Enable it only when throughput matters more than the
-    # risk layer's coverage. A step where *every* tube skips is still skipped for free
-    # without this — that path needs no heuristic and keeps the certificate honest.
+    # Throughput heuristic, **still off by default**. On a backbone without token-sparse
+    # attention a mask this sparse costs a full dense forward anyway, so the transition
+    # executor can promote it to a whole-step cache reuse — the one saving that is real
+    # on *every* backbone, and the only reason an accelerated run on a real DiT would
+    # report compute_ratio < 1 today.
+    #
+    # The reason it was off is that a promoted step downgrades any LOWFREQ tube to
+    # "reuse cached ε", leaving no computed reference for that tube's skip residual —
+    # RAEC's certificate then sees δ=0 and cannot price the extra error (§5.3.1). That
+    # gap is now **bounded** by ``max_unmeasured_steps`` rather than merely warned
+    # about, so raising this to e.g. 0.10 is a supported trade rather than a blind one.
+    # It stays 0 by default because the trade is a quality policy — how many steps a
+    # tube may go uncertified — and that is the operator's call, not a default.
     dense_step_skip_below: float = 0.0
+    # Ceiling on consecutive steps a tube may go without a measured skip residual. Once
+    # any tube reaches it, the next whole-step-skip promotion is vetoed so the forward
+    # runs and every certificate is re-grounded against a real δ. This is what makes
+    # ``dense_step_skip_below`` safe to enable (§P4-A2). 0 removes the bound.
+    max_unmeasured_steps: int = 3
+    # Ceiling on consecutive steps a tube may go without a measured skip residual. Once
+    # any tube reaches it, the next whole-step-skip promotion is vetoed so the forward
+    # runs and every certificate is re-grounded against a real δ. This is what makes
+    # ``dense_step_skip_below`` safe to enable by default (§P4-A2). 0 removes the bound.
+    max_unmeasured_steps: int = 3
     # Recompute the tokens no tube covers every N steps (0 = never). The background
     # is ~3/4 of the grid and is outside every RAEC guarantee — certificates, rollback
     # and repair are all tube-scoped — so leaving it on the warm-up step's ε for the
@@ -260,6 +284,21 @@ class EngineConfig:
     # where the last cut landed. Peak activation memory is what the bound buys.
     # 0 = full BPTT (real backbones will OOM). Ignored at inference (decode_grad=False).
     grad_window_steps: int = 4
+    # Latent temporal slots decoded **on the autograd graph** during Stage C (§4.2).
+    # 0 = the whole clip.
+    #
+    # VAE tiling bounds the *forward* transient of a decode, but with ``decode_grad``
+    # every tile's intermediate activations are retained for backward, so the peak
+    # climbs back to — and past — the untiled figure. Nothing in the loss requires all
+    # F frames: an L1 (and the §6.3.2 feature distances) over a uniformly-drawn
+    # contiguous window is an unbiased estimator of the same quantity, so decoding a
+    # window bounds the retained graph by ``F/K`` at no cost in expectation.
+    #
+    # Applied only when the backbone can describe its temporal layout
+    # (:meth:`BackboneAdapter.pixel_span`) — otherwise the engine decodes in full and
+    # says so, rather than risk comparing misaligned frames. Never applied at
+    # inference: a windowed render is a training signal, not a video.
+    decode_grad_frames: int = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +323,13 @@ class BackboneConfig:
     # than the transfers, so the safe setting is the default and the CLI's --no-*
     # flags buy the speed back on cards with room to spare.
     offload_text_encoder: bool = True  # park the text encoder on CPU between prompts (saves ~11 GB)
+    # Park the resident denoiser while an offloaded component (the text encoder) is on
+    # the card, so the two are never co-resident. Independent of the flag above: that
+    # one decides *where the text encoder sleeps*, this one decides *what else may be
+    # awake while it runs*. On a 40 GB device with Wan2.2-A14B the difference is
+    # feasibility, not speed — 26 GiB (expert) + 10 GiB (umT5) + activations does not
+    # fit, and the failure lands on the very first prompt.
+    text_encoder_exclusive: bool = True
     offload_idle_expert: bool = True   # keep only the active MoE expert resident (saves ~28 GB)
     vae_tiling: bool = True            # tiled/sliced VAE encode+decode (bounded peak)
     # Tile edge (output pixels) when vae_tiling is on. The decoder's peak transient
@@ -299,9 +345,11 @@ class MemoryConfig:
     """Training memory-saving switches (user requirement #1, realised in §7.1)."""
 
     amp_dtype: str = "bfloat16"  # autocast dtype; "none" disables AMP
-    gradient_checkpointing: bool = True  # checkpoint trainable blocks
-    offload_backbone_to_cpu: bool = False  # keep frozen backbone on CPU until needed
-    cache_latents: bool = True  # pre-encode videos → latents on disk (no VAE in RAM)
+    gradient_checkpointing: bool = True  # checkpoint the LoRA-bearing DiT blocks (Stage C)
+    # Keep anchor snapshots (and, where wired, frozen weights) off the compute device
+    # while idle. Reaches :class:`~cocf.raec.anchor_store.AnchorStore` via
+    # ``RAECModule.new_anchor_store``, which the engine hands this config to.
+    offload_backbone_to_cpu: bool = False
     max_grad_norm: float = 1.0
 
 
@@ -316,9 +364,10 @@ class DataConfig:
 
     Frame sampling / resolution bucketing mirror the HunyuanVideo & Wan2.1 data
     pipelines (a ``4k+1`` frame count for the 4× causal-temporal VAE, fixed
-    resolution buckets, ``[-1, 1]`` normalization). The latent/text cache is the
-    dominant *training* memory saving (user requirement #1): the VAE and text
-    encoder run once offline so neither occupies VRAM during plugin training.
+    resolution buckets, ``[-1, 1]`` normalization). The dominant *training* memory
+    saving is architectural rather than a cache: the backbone is frozen and Stages
+    B/C train on Stage-A's offline labels, so the VAE and text encoder never hold
+    optimiser state or activations.
     """
 
     data_root: str = ""
@@ -340,8 +389,6 @@ class DataConfig:
     height: int = 480  # default bucket when aspect-ratio routing is off
     width: int = 832
     normalize_to_unit: bool = True  # videos returned in [-1, 1] (VAE convention)
-    # --- caching (the dominant training memory saving, user requirement #1) ---
-    cache_dir: str = "cache/latents"
     num_workers: int = 4
     pin_memory: bool = True
     seed: int = 1234

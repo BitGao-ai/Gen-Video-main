@@ -138,7 +138,12 @@ class Accelerator(nn.Module):
             lowfreq_stride=config.engine.lowfreq_stride,
             dense_step_skip_below=config.engine.dense_step_skip_below,
             background_refresh_every=config.engine.background_refresh_every,
+            max_unmeasured_steps=config.engine.max_unmeasured_steps,
         )
+        # The executor consults RAEC's per-tube certificate-coverage counters before
+        # promoting a step to a whole-step skip, and updates them after each transition
+        # (§P4-A2). Wired here because this is the one place that owns both objects.
+        self.transition.risk_trigger = self.raec.trigger
 
         self.freeze_backbone()
         trainable, total = count_parameters(self)
@@ -203,7 +208,13 @@ class Accelerator(nn.Module):
         true width.
         """
         try:
-            with torch.inference_mode():
+            # ``no_grad``, never ``inference_mode``: this probe is usually the *first*
+            # call into the adapter, so it is what triggers the lazy weight load — and
+            # weights built under inference_mode are inference tensors for the rest of
+            # the process, which breaks every grad-enabled Stage-C forward
+            # (:func:`cocf.common.memory.normal_mode`). The adapters guard the load too;
+            # this keeps the probe itself from needing that guard.
+            with torch.no_grad():
                 return int(backbone.encode_text(["probe"]).embeds.shape[-1])
         except Exception as exc:  # pragma: no cover - real backbone without weights
             extra = getattr(backbone.config, "extra", {}) or {}

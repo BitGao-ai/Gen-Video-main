@@ -165,7 +165,14 @@ class TeacherForwardRunner:
         T = self.cfg.num_inference_steps
         want = set(cache_steps)
         z_by_step: Dict[int, Tensor] = {}
-        with teacher_forward():
+        # ``inference_mode`` only while the backbone is in label-only mode. Stage C
+        # calls this for its Y_full reference *inside* ``grad_mode(True)``, and an
+        # inference tensor is viral: the returned z0 would decode to an inference
+        # video that the §6.3.2 semantic loss cannot multiply against the accelerated
+        # render ("Inference tensors cannot be saved for backward"). ``no_grad`` there
+        # is just as graph-free and costs only the version-counter bookkeeping.
+        ctx = teacher_forward() if not bb.grad_enabled else torch.no_grad()
+        with ctx:
             z = z_init
             cache = None
             for step_idx in range(T):

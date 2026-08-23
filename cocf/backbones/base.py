@@ -294,6 +294,36 @@ class BackboneAdapter(abc.ABC):
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
         """``[B, C, T, H, W] -> [B, C_pix, F, H_pix, W_pix]`` video."""
 
+    def pixel_span(self, lo: int, hi: int) -> Optional[Tuple[int, int]]:
+        """Pixel-frame range ``[start, stop)`` that latent slots ``[lo, hi)`` decode to.
+
+        Returning ``None`` — the default — means "I cannot describe *this* window", and
+        every caller must then fall back to a window the adapter does accept, or to
+        decoding the whole clip. That default is deliberately conservative: the mapping
+        is *not* uniform across backbones (a causal-temporal VAE expands slot 0 into one
+        frame and every later slot into ``c_t``, while a plain upsampling decoder expands
+        all of them equally), and a caller that guessed wrong would silently compare
+        misaligned frames — a wrong training objective that still looks healthy.
+
+        The decision is per-window, not once per adapter: a causal decoder can reproduce
+        its own full decode only for a *prefix*, because any later offset leaves it
+        without the feature cache of the preceding slots and it re-anchors. Such an
+        adapter answers for ``lo == 0`` and returns ``None`` for everything else
+        (:meth:`~cocf.backbones.diffusers_base.DiffusersBackbone.pixel_span`), and
+        :meth:`~cocf.engine.inference.InferenceEngine._grad_decode_window` retries at the
+        prefix rather than dropping the window entirely.
+
+        The contract an override must satisfy is exactly, for every window it answers::
+
+            decode_latent(z[:, :, lo:hi]) == decode_latent(z)[:, :, start:stop]
+
+        which is what ``tests/unit/test_p4_batch3_decode_memory.py`` asserts, so a new
+        adapter's implementation is checkable rather than assumed. Note that it
+        constrains the frame *count* as much as the content: ``stop - start`` must equal
+        the number of frames ``decode_latent`` actually emits for that slice.
+        """
+        return None
+
     # -- text ------------------------------------------------------------- #
 
     @abc.abstractmethod

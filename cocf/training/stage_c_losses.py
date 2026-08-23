@@ -45,7 +45,7 @@ from cocf.cmsc.losses import CMSCObservation
 from cocf.common.config import TrainingConfig
 from cocf.common.types import TUBE_STATE_FIELDS, Action, SemanticTube, TokenGrid
 from cocf.lcocf.damage import MetricExtractor
-from cocf.lcocf.data import tube_clip_embed
+from cocf.lcocf.data import tube_clip_embed, tube_pixel_mask
 from cocf.lcocf.predictor import build_predictor_input_batch
 from cocf.training.stage_b_losses import (
     action_probs,
@@ -80,6 +80,22 @@ def pixel_quality_loss(y_acc: Tensor, y_full: Tensor) -> Tensor:
     return F.l1_loss(y_acc[:f].float(), y_full[:f].float().to(y_acc.device))
 
 
+def _tube_centroid(tube: SemanticTube) -> Tuple[float, float]:
+    """Mean ``(y, x)`` of a tube's latent masks, averaged over the frames it spans."""
+    ys = xs = 0.0
+    n = 0
+    for mask in tube.masks_by_frame.values():
+        if mask is None:
+            continue
+        idx = mask.nonzero()
+        if idx.numel() == 0:
+            continue
+        ys += float(idx[:, 0].float().mean())
+        xs += float(idx[:, 1].float().mean())
+        n += 1
+    return (ys / n, xs / n) if n else (0.0, 0.0)
+
+
 def build_cmsc_observation(
     metric_extractor: MetricExtractor,
     perception,
@@ -88,20 +104,67 @@ def build_cmsc_observation(
     tubes: Sequence[SemanticTube],
     grid: TokenGrid,
     text_embed: Tensor,
+    *,
+    differentiable: bool = False,
 ) -> CMSCObservation:
     """Assemble a :class:`CMSCObservation` from a rendered clip (§6 features).
 
-    Bundles the global DINO/CLIP/RAFT/OCR :class:`VideoFeatures` (from the injected
-    :class:`MetricExtractor`) with the prompt token sequence and the per-tube CLIP
-    visual embeds (via the shared :func:`~cocf.lcocf.data.tube_clip_embed`, so the
-    embeds match what Stage A/serve produce). The perceptual features are detached
-    references by construction; only the alignment projection is differentiable.
+    Populates, per §6.3.2:
+
+    ``video``          global DINO/CLIP/RAFT/OCR :class:`VideoFeatures` → ``L_motion``,
+                       ``L_ocr``.
+    ``tube_embeds``    per-tube CLIP visual embeds via the shared
+                       :func:`~cocf.lcocf.data.tube_clip_embed`, so they match what
+                       Stage A and inference produce → ``L_align``.
+    ``tube_identity``  per-tube DINO identity, obtained by handing the extractor each
+                       tube's pixel mask → ``L_id``. This is the term §6.3.2 defines as
+                       ``Σ_k [1 − cos(DINO(Y_full, g_k), DINO(Y_fast, g_k))]``, i.e.
+                       explicitly *per tube* — a global feature cannot stand in for it,
+                       and leaving the field empty made ``L_id`` structurally zero. It
+                       costs one identity pass per tube per observation, which is the
+                       documented price of a localised label (§7.1.1).
+    ``tube_centroid``  latent-mask centroids → ``L_spatial``.
+
+    ``tube_boundary`` is left empty: no boundary descriptor is extracted anywhere in
+    the framework, so ``L_bnd`` (weight 0.05, marked optional in §6.3.2) stays zero
+    until one exists. ``L_spatial`` is likewise inert whenever the caller passes the
+    *same* tube set for both observations — the engine segments once, off the
+    accelerated render — and becomes informative only if the full render is segmented
+    separately. Both are stated here rather than silently contributing nothing.
+
+    ``differentiable`` **must** be set on the accelerated branch. The extractor
+    defaults to a ``no_grad`` path — the right one for the detached reference — and a
+    caller that forgets the flag gets an ``accel`` observation with no autograd graph,
+    so the §6.3.2 loss trains nothing while every log line looks healthy. That is the
+    exact failure :meth:`ModelMetricExtractor._prep` and
+    :meth:`InferenceEngine._warn_if_no_graph` exist to warn about, so it is a
+    parameter here rather than an assumption. Both branches are extracted with
+    ``offload=False``: the reference is detached but still has to sit on the render's
+    device to be compared against it.
     """
-    feats = metric_extractor.extract(video_fchw, prompt)
+    tube_masks = {t.tube_id: tube_pixel_mask(video_fchw, t) for t in tubes}
+    feats = metric_extractor.extract(
+        video_fchw, prompt, differentiable=differentiable, tube_masks=tube_masks,
+        # Both observations this builds are compared element-wise on the render's
+        # device — by ``CMSCLoss`` and by ``MultiDimDamageComputer`` — so neither may
+        # be parked on CPU. The reference branch still runs ``no_grad``; only the
+        # offload is declined. See the ``offload`` contract on
+        # :meth:`~cocf.lcocf.damage.MetricExtractor.extract`.
+        offload=False,
+    )
     tube_embeds = {
         t.tube_id: tube_clip_embed(video_fchw, t, grid, perception) for t in tubes
     }
-    return CMSCObservation(video=feats, text_embeds=text_embed, tube_embeds=tube_embeds)
+    tube_identity = {
+        tid: f.mean(0) for tid, f in feats.tube_dino.items() if f.numel()
+    }
+    return CMSCObservation(
+        video=feats,
+        text_embeds=text_embed,
+        tube_embeds=tube_embeds,
+        tube_identity=tube_identity,
+        tube_centroid={t.tube_id: _tube_centroid(t) for t in tubes},
+    )
 
 
 def cmsc_quality_loss(

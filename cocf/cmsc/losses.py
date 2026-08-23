@@ -43,6 +43,19 @@ from cocf.lcocf.damage import VideoFeatures
 Tensor = torch.Tensor
 
 
+def _stack_on(feats: Dict[int, Tensor], ids: List[int], dev=None) -> Tensor:
+    """Stack ``feats[i] for i in ids`` as float32 on ``dev`` (``None`` = leave alone).
+
+    The two observations a CMSC term compares are produced by two separate extractor
+    calls, and the extractor is free to park a detached, non-differentiable result on
+    CPU (its ``offload`` contract). Co-locating here keeps every term device-agnostic
+    without the caller having to know which branch offloaded. ``Tensor.to`` is an
+    autograd op, so the accelerated branch's graph survives the move.
+    """
+    out = torch.stack([feats[i].float() for i in ids])
+    return out if dev is None else out.to(dev)
+
+
 @dataclass
 class CMSCObservation:
     """Everything the conservation loss needs from one rendered video.
@@ -148,20 +161,47 @@ class CMSCLoss(nn.Module):
     def local_conservation(
         self, text_embeds: Tensor, tube_embeds: Dict[int, Tensor]
     ) -> Dict[int, float]:
-        """Inference-time proxy: ``1 − alignment(tube)`` per tube ∈ [0, 1].
+        """Inference-time risk proxy per tube ∈ [0, 1]: how far *below neutral* a tube's
+        prompt alignment sits.
 
-        High when a tube is poorly aligned to the prompt — i.e. skipping it risks
-        a semantic-conservation violation — so it raises that tube's certificate.
-        Needs no ``Y_full`` reference, only the prompt and the tube's current embed.
+        High when a tube is poorly aligned to the prompt — i.e. skipping it risks a
+        semantic-conservation violation — so it raises that tube's certificate. Needs no
+        ``Y_full`` reference, only the prompt and the tube's current embed, which is the
+        whole point: it is the one §6 signal available inside the accelerated loop, and
+        the certificate's ``λ_cmsc`` term sat at a hard zero at inference for want of a
+        caller (§P4-A4).
+
+        **Why not simply ``1 − alignment``.** :meth:`TextTubeAlignment.tube_scores` maps
+        cosine ``[-1, 1]`` onto ``[0, 1]``, so an *uninformative* projection — a randomly
+        initialised head, or one Stage B barely moved — scores every tube at ≈0.5 and
+        ``1 − score`` becomes a constant ≈0.5 on every tube. Multiplied by λ_cmsc=0.2
+        that is a flat +0.1 added to every certificate: not a risk signal, a bias. It
+        pushed a mean ``E_cert`` of 0.35 to 0.41, straight across ``τ_low = 0.40``, and
+        turned 8 repairs into 132 — each of which pins its tube to FULL, so the
+        accelerator *lost* efficiency (compute_ratio 0.25 → 0.40) for no quality reason.
+        This is the same cold-start miscalibration :class:`~cocf.common.config.PredictorConfig`
+        documents for the damage head.
+
+        Measuring from the neutral point instead — ``relu(0.5 − score) · 2``, i.e.
+        ``relu(−cos)`` — makes an uninformative head contribute exactly 0 and reserves
+        the term for tubes whose embedding genuinely points *away* from every prompt
+        token. The signal survives; the bias does not.
+
+        Inputs are aligned to the projection's device here rather than at the call site:
+        the tube embeds come from the perception provider (input-device) and the prompt
+        tokens from the backbone, while the projections live wherever the accelerator was
+        moved — three devices this method is the natural place to reconcile.
         """
         ids = list(tube_embeds)
         if not ids:
             return {}
+        dev = self.alignment.vis_proj.weight.device
         dim = next(iter(tube_embeds.values())).shape[-1]
-        v = TextTubeAlignment.stack_tube_embeds(tube_embeds, ids, dim)
+        v = TextTubeAlignment.stack_tube_embeds(tube_embeds, ids, dim, device=dev)
         with torch.no_grad():
-            scores = self.alignment.tube_scores(text_embeds, v)  # [K] ∈ [0,1]
-        return {i: float(1.0 - scores[j]) for j, i in enumerate(ids)}
+            scores = self.alignment.tube_scores(text_embeds.to(dev), v)  # [K] ∈ [0,1]
+            violation = ((0.5 - scores) * 2.0).clamp(0.0, 1.0)           # [K] ∈ [0,1]
+        return {i: float(violation[j]) for j, i in enumerate(ids)}
 
     # ------------------------------------------------------------------ #
     # individual terms
@@ -186,8 +226,15 @@ class CMSCLoss(nn.Module):
         common = [i for i in ids if i in full and i in accel]
         if not common:
             return torch.zeros((), device=dev)
-        fa = F.normalize(torch.stack([full[i].float() for i in common]), dim=-1)
-        ac = F.normalize(torch.stack([accel[i].float() for i in common]), dim=-1)
+        # Land both sides on ``dev`` before the product. ``dev`` used to guard only the
+        # empty fallback above, which left the populated path assuming the two
+        # observations were already co-located — an assumption the extractor's optional
+        # CPU offload breaks (a detached reference on CPU against an on-GPU render).
+        # Moving a detached reference onto the comparison device is lossless and
+        # unambiguous, unlike guessing at a frame alignment, so it is done rather than
+        # rejected.
+        fa = F.normalize(_stack_on(full, common, dev), dim=-1)
+        ac = F.normalize(_stack_on(accel, common, dev), dim=-1)
         cos = (fa * ac).sum(-1).clamp(-1, 1)
         return (1.0 - cos).mean()
 
@@ -197,6 +244,8 @@ class CMSCLoss(nn.Module):
         n = min(mf.numel(), ma.numel())
         if n == 0:
             return torch.zeros((), device=dev)
+        if dev is not None:  # co-locate: see _id_term
+            mf, ma = mf.to(dev), ma.to(dev)
         denom = mf[:n].abs().mean().clamp_min(1e-6)
         return ((ma[:n] - mf[:n]).abs().mean() / denom).clamp(0.0, 4.0)
 

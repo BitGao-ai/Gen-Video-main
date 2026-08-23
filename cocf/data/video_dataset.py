@@ -20,8 +20,10 @@ with the synthetic reader bundled here; a production run injects a ``decord``/
 ``torchvision`` reader without touching the sampling logic. This keeps the data
 code decoupled from any particular codec backend (user requirement #3).
 
-This module yields *pixels*; turning them into cached latents+embeds (the actual
-training memory saving) is :mod:`cocf.data.latent_cache`'s job.
+This module yields *pixels*. It has one consumer today — Stage A's ``--use-real-video``
+anchor (:meth:`cocf.training.stage_a_data_gen.DataGenerationStage._decode_clip`), which
+reuses this sampler and normalisation verbatim so the frames the teacher encodes match
+what a training loader would read.
 """
 
 from __future__ import annotations

@@ -61,6 +61,45 @@ def is_two_part(ckpt: Any) -> bool:
     return isinstance(ckpt, Mapping) and ACCELERATOR_KEY in ckpt
 
 
+def _filter_shape_mismatch(accelerator, state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Drop checkpoint tensors whose shape disagrees with the live module.
+
+    The case this exists for is ``cmsc_alignment.vis_proj`` (and its twin inside
+    ``cmsc_loss.alignment``): Stage B sizes that projection from the *store's*
+    ``tube_visual_embed_full`` width, while Stage C sizes it from the *live* perception
+    provider's ``d_clip``. A store written before the :mod:`cocf.common.hf_clip` fix
+    holds un-projected CLIP features (ViT-B/32 ⇒ 768) where the fixed code now yields
+    the projected joint-space vector (512), so the two disagree and
+    ``load_state_dict`` aborts the whole load over one layer.
+
+    Dropping the offender is the right resolution rather than reshaping it: a
+    projection trained on a different feature space carries no usable signal into the
+    new one, so Stage C re-learns that single 256×d layer from scratch and keeps every
+    other plugin weight Stage B produced. Loudly logged — a silent skip here would be
+    indistinguishable from a successful resume.
+    """
+    live = accelerator.state_dict()
+    kept, dropped = {}, []
+    for k, v in state.items():
+        ref = live.get(k)
+        if ref is not None and hasattr(v, "shape") and tuple(v.shape) != tuple(ref.shape):
+            dropped.append(f"{k}: checkpoint {tuple(v.shape)} vs model {tuple(ref.shape)}")
+            continue
+        kept[k] = v
+    if dropped:
+        _log.warning(
+            "checkpoint: %d tensor(s) skipped on shape mismatch — these keep their "
+            "freshly-initialised values and are trained from scratch:\n  %s\n"
+            "If this names cmsc_*alignment.vis_proj, the processed store's tube visual "
+            "embeds are a different width than this run's CLIP produces (d_clip = "
+            "projection_dim: ViT-B/32 => 512, ViT-L/14 => 768). Point --clip-model at "
+            "the encoder Stage A used, or regenerate the store, to reuse Stage B's "
+            "alignment head instead of relearning it.",
+            len(dropped), "\n  ".join(dropped),
+        )
+    return kept
+
+
 def load_checkpoint(
     accelerator,
     ckpt: Any,
@@ -68,6 +107,7 @@ def load_checkpoint(
     training_config: Any = None,
     attach: bool = True,
     strict_lora: bool = False,
+    allow_shape_mismatch: bool = True,
 ) -> int:
     """Restore plugin weights from **either** checkpoint layout; return LoRA count.
 
@@ -82,9 +122,21 @@ def load_checkpoint(
     attach
         Set False to load the plugins alone (e.g. when the caller injects LoRA itself
         with a different geometry, as Stage C does before training).
+    allow_shape_mismatch
+        Drop (rather than crash on) checkpoint tensors whose shape disagrees with the
+        model's — see :func:`_filter_shape_mismatch`. Set False to demand an exact
+        match.
     """
     state = ckpt[ACCELERATOR_KEY] if is_two_part(ckpt) else ckpt
-    accelerator.load_state_dict(state)
+    if allow_shape_mismatch:
+        state = _filter_shape_mismatch(accelerator, state)
+    accelerator.load_state_dict(state, strict=False)
+    missing = [k for k in accelerator.state_dict() if k not in state]
+    if missing:
+        # Includes anything _filter_shape_mismatch just dropped (already detailed
+        # above); a key that appears only here was never in the checkpoint at all.
+        _log.warning("checkpoint: %d plugin tensor(s) not restored: %s",
+                     len(missing), ", ".join(missing[:8]))
 
     lora = ckpt.get(LORA_KEY) if isinstance(ckpt, Mapping) else None
     if not lora or not attach:

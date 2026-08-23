@@ -46,7 +46,12 @@ def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
     text_dim = None
     visual_dim = None
     try:
-        ds = CounterfactualLMDBDataset(layout.lmdb_dir)
+        # Must join the out-of-store prompt embeddings exactly as the Stage-B
+        # loader does (stage_b_joint.py) — without ``text_embed_dir`` the payload
+        # has no ``text_embed`` at all, text_dim silently falls back to the
+        # backbone probe (16 on mock), and the alignment projection is built too
+        # narrow for the 4096-d embeds the real loader then feeds it.
+        ds = CounterfactualLMDBDataset(layout.lmdb_dir, text_embed_dir=layout.text_embed_dir)
         if len(ds) > 0:
             sample = ds[0]
             te = sample.get("text_embed")
@@ -63,6 +68,15 @@ def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
                     visual_dim = int(arr.shape[-1])
     except Exception as e:
         log.warning("Could not infer dims from store (will probe backbone): %s", e)
+    if text_dim is None:
+        # Last resort: read the width straight off any stored prompt embedding.
+        try:
+            import torch
+            for p in sorted(layout.text_embed_dir.glob("*.pt"))[:1]:
+                emb = torch.load(p, map_location="cpu")
+                text_dim = int(getattr(emb, "shape", [0])[-1]) or None
+        except Exception as e:
+            log.warning("Could not read text_embeds/: %s", e)
     if text_dim is not None:
         log.info("Inferred text_dim=%s from processed store", text_dim)
     if visual_dim is not None:
@@ -96,6 +110,49 @@ def _preflight(layout: ProcessedLayout, log: logging.Logger) -> None:
             + "\nRe-run scripts/data/generate_counterfactual_data.py to completion "
             "(its §1.6 step writes the index / splits / norm_stats), or repair the store."
         )
+
+
+def _apply_stage_a_geometry(config, layout, log) -> None:
+    """Rebuild Stage A's backbone geometry into ``config`` from the store's env file.
+
+    Stage B never loads a backbone — it trains the plugins on Stage A's cached labels —
+    so it defaults to the mock adapter, whose ``hidden_dim`` is 32. But the L-COCF
+    residual-repair net is sized from that number, and Stage A's Wan2.2-A14B reports 64.
+    The result was a Stage-B checkpoint that could not be loaded into a Stage C running
+    the real backbone, with nothing to hint at why until the shapes collided.
+
+    Reading it back off ``metadata/stage_a_env.json`` keeps Stage B free of any weight
+    loading (the mock still holds no parameters) while making it agree with the store it
+    is training on. A store written before this file existed simply keeps the old
+    behaviour, with a warning naming the risk.
+    """
+    env = layout.read_stage_a_env()
+    if not env:
+        log.warning(
+            "No metadata/stage_a_env.json in this store (written by Stage A). Falling "
+            "back to the default backbone geometry — if Stage A ran on a real backbone, "
+            "the repair net will be sized wrong and this checkpoint will not load into "
+            "Stage C. Re-run Stage A's --finalize-only pass to write it."
+        )
+        return
+    # The mock adapter reads its widths straight from ``extra``, so Stage A's real
+    # geometry is reproduced without materialising a single weight.
+    config.backbone.name = "mock"
+    config.backbone.extra = {
+        "hidden_dim": int(env["token_dim"]),
+        "latent_channels": int(env.get("latent_channels", 4)),
+    }
+    for key in ("num_frames", "height", "width"):
+        if key in env:
+            setattr(config.data, key, int(env[key]))
+    log.info(
+        "Stage A env: backbone=%s variant-geometry token_dim=%d, %dx%dx%d, %d steps",
+        env.get("backbone", "?"), int(env["token_dim"]),
+        int(env.get("num_frames", config.data.num_frames)),
+        int(env.get("height", config.data.height)),
+        int(env.get("width", config.data.width)),
+        int(env.get("teacher_steps", 0)),
+    )
 
 
 def main():
@@ -142,6 +199,9 @@ def main():
     config.seed = args.seed
     if args.lr is not None:
         config.training.optim.lr = args.lr
+    # Size the plugins from the geometry the *store* was generated with, not from
+    # whatever backbone default this process happens to construct.
+    _apply_stage_a_geometry(config, layout, log)
 
     # Infer text/visual embedding dims from the data store so the CMSC alignment
     # projection matches what Stage A actually wrote — avoids the silent fallback

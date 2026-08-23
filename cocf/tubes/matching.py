@@ -32,6 +32,12 @@ def solve_assignment(affinity: Tensor, threshold: float) -> List[tuple]:
 
     Uses the Hungarian algorithm when SciPy is available; otherwise a greedy
     descending-affinity matcher (optimal for the common near-diagonal case).
+
+    ``.float()`` before ``.numpy()``: numpy has no bfloat16, so a provider whose
+    affinity arrives in half precision raises ``TypeError: Got unsupported ScalarType
+    BFloat16`` — which the ``except`` below would absorb as "no SciPy" and silently
+    downgrade *every* frame pair to the greedy matcher. A quality regression that
+    reports itself nowhere is worse than the crash.
     """
     ra, rb = affinity.shape
     if ra == 0 or rb == 0:
@@ -39,7 +45,8 @@ def solve_assignment(affinity: Tensor, threshold: float) -> List[tuple]:
     try:
         from scipy.optimize import linear_sum_assignment
 
-        rows, cols = linear_sum_assignment(affinity.cpu().numpy(), maximize=True)
+        rows, cols = linear_sum_assignment(affinity.detach().float().cpu().numpy(),
+                                           maximize=True)
         pairs = [(int(i), int(j)) for i, j in zip(rows, cols)]
     except Exception:  # greedy fallback (no SciPy)
         pairs = []

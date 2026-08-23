@@ -30,6 +30,45 @@ class RiskTrigger:
         self.cfg = config
         # tube_id -> remaining steps it must stay FULL after a rollback
         self._force_full: Dict[int, int] = {}
+        # tube_id -> consecutive steps whose skip residual δ went unmeasured (§P4-A2)
+        self._unmeasured: Dict[int, int] = {}
+
+    # ------------------------------------------------------------------ #
+    # certificate-coverage bookkeeping (what gates the whole-step skip)
+    # ------------------------------------------------------------------ #
+
+    def note_measured(self, tube_ids) -> None:
+        """Clear the unmeasured counter for tubes whose δ the transition just measured."""
+        for tid in tube_ids:
+            self._unmeasured.pop(tid, None)
+
+    def note_unmeasured(self, tube_ids) -> None:
+        """Charge a step to tubes whose skip produced no residual to certify against.
+
+        A whole-step skip computes nothing, so there is no reference to measure a
+        skipped tube's δ against and the certificate's λ_res term sees 0 — it cannot
+        price the error the skip introduced. That is exactly why the promotion is
+        opt-in. Counting how long each tube has gone uncertified turns "we might be
+        flying blind" into a bounded, checkable quantity (see
+        :meth:`coverage_exhausted`).
+        """
+        for tid in tube_ids:
+            self._unmeasured[tid] = self._unmeasured.get(tid, 0) + 1
+
+    def coverage_exhausted(self, max_unmeasured: int) -> bool:
+        """Whether any tube has gone ``max_unmeasured`` steps without a measured δ.
+
+        The transition executor consults this before promoting a step to a whole-step
+        skip: once a tube hits the bound, the step must run so its residual can be
+        measured and its certificate re-grounded. ``max_unmeasured <= 0`` disables the
+        invariant (unbounded skipping, the pre-§P4 behaviour).
+        """
+        if max_unmeasured <= 0:
+            return False
+        return any(n >= max_unmeasured for n in self._unmeasured.values())
+
+    def unmeasured_steps(self, tube_id: int) -> int:
+        return self._unmeasured.get(tube_id, 0)
 
     # ------------------------------------------------------------------ #
     # classification
@@ -85,3 +124,4 @@ class RiskTrigger:
 
     def reset(self) -> None:
         self._force_full.clear()
+        self._unmeasured.clear()

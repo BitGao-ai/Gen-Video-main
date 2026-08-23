@@ -30,6 +30,7 @@ from typing import Dict, Iterable, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint  # noqa: F401 — submodule access below is not implicit
 
 _DTYPES: Dict[str, Optional[torch.dtype]] = {
     "bfloat16": torch.bfloat16,
@@ -70,18 +71,42 @@ def autocast(device: str, dtype_name: str) -> Iterator[None]:
 def set_gradient_checkpointing(module: nn.Module, enabled: bool = True) -> int:
     """Enable gradient checkpointing on every submodule that supports it.
 
-    Recognises both the HuggingFace convention (``gradient_checkpointing_enable``)
-    and a plain ``gradient_checkpointing`` boolean attribute. Returns the number
-    of modules toggled so callers can log/verify it took effect.
+    Two library conventions have to be covered, and getting it wrong fails silently:
+
+    * **transformers** — ``gradient_checkpointing_enable`` / ``..._disable``;
+    * **diffusers** — ``enable_gradient_checkpointing`` / ``disable_...``, which also
+      installs a ``_gradient_checkpointing_func`` on every checkpointable submodule.
+
+    Only the transformers spelling used to be recognised, so on a diffusers
+    ``*Transformer3DModel`` — every real backbone here — the first branch was a no-op
+    and only the bare ``gradient_checkpointing`` flag got flipped. Recent diffusers
+    blocks call ``self._gradient_checkpointing_func(...)`` unconditionally once that
+    flag is set, so the flag alone either bought nothing or raised ``AttributeError``
+    mid-forward. Hence both spellings, plus a fallback that installs the standard
+    checkpoint function for any module the official API did not reach.
+
+    Returns the number of modules toggled so callers can log/verify it took effect: a
+    zero on a real backbone means Stage C is about to retain every block's activations
+    for the whole BPTT window, which is an OOM rather than a slowdown.
     """
     count = 0
-    if hasattr(module, "gradient_checkpointing_enable") and enabled:
-        module.gradient_checkpointing_enable()  # type: ignore[attr-defined]
-        count += 1
+    for on_name, off_name in (
+        ("enable_gradient_checkpointing", "disable_gradient_checkpointing"),  # diffusers
+        ("gradient_checkpointing_enable", "gradient_checkpointing_disable"),  # transformers
+    ):
+        fn = getattr(module, on_name if enabled else off_name, None)
+        if callable(fn):
+            fn()
+            count += 1
+            break
     for sub in module.modules():
         if hasattr(sub, "gradient_checkpointing") and isinstance(
             getattr(sub, "gradient_checkpointing"), bool
         ):
+            if enabled and getattr(sub, "_gradient_checkpointing_func", None) is None:
+                sub._gradient_checkpointing_func = functools.partial(
+                    torch.utils.checkpoint.checkpoint, use_reentrant=False
+                )
             setattr(sub, "gradient_checkpointing", enabled)
             count += 1
     return count
@@ -166,6 +191,32 @@ def free_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@contextlib.contextmanager
+def normal_mode() -> Iterator[None]:
+    """Suspend any ambient ``inference_mode`` for the duration of the block.
+
+    ``inference_mode`` taints *every tensor allocated inside it*, permanently: an
+    inference tensor can never take part in autograd, not even after the block ends.
+    That is harmless for activations (they are re-created per forward) and fatal for
+    **weights** — a ``module.to(device, dtype)`` executed under ``inference_mode``
+    rebuilds each parameter's storage, so the whole backbone comes back as inference
+    tensors and the first grad-enabled forward dies deep inside the model with
+
+        RuntimeError: Inference tensors do not track version counter.
+        RuntimeError: Inference tensors cannot be saved for backward.
+
+    (which of the two depends on the torch version). Stage A and B never notice —
+    they only ever run label-only passes — so the damage surfaces one stage later,
+    in Stage C's §4.2 loss path, pointing at a conv three libraries away from the
+    ``.to()`` that caused it.
+
+    Every site that *allocates or moves weights* therefore wraps itself in this, so
+    it is correct regardless of the context its caller happens to be in.
+    """
+    with torch.inference_mode(False):
+        yield
 
 
 @contextlib.contextmanager

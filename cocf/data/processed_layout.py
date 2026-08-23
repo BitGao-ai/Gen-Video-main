@@ -130,6 +130,12 @@ class ProcessedLayout:
         return self.metadata_dir / "norm_stats.json"
 
     @property
+    def stage_a_env(self) -> Path:
+        """Backbone geometry / schedule the store was generated with (see
+        :meth:`write_stage_a_env`)."""
+        return self.metadata_dir / "stage_a_env.json"
+
+    @property
     def train_list(self) -> Path:
         return self.splits_dir / "train_list.txt"
 
@@ -184,14 +190,24 @@ class ProcessedLayout:
         y_full: Tensor,
         z_init: Optional[Tensor] = None,
         kv_cache: Optional[Mapping[str, Tensor]] = None,
+        y_full_dtype: Optional[np.dtype] = np.float16,
     ) -> Path:
-        """Write the §3 level-3 ``full_baseline/vid_XXXXXX/`` bucket for one video."""
+        """Write the §3 level-3 ``full_baseline/vid_XXXXXX/`` bucket for one video.
+
+        ``Y_full`` dominates the bucket — 49×384×640 is 144 MB in fp32 and this is the
+        per-clip cost of the whole ~TB-scale level-3 store — so it is stored in fp16 by
+        default. It is only ever read as a *reference video* (Stage C's L1 and §6.3.2
+        feature distances, both of which upcast), never re-entered into a trajectory, so
+        the half-precision round trip is below the noise floor of the comparison. The
+        latents (``z_t``, ``z_init``) stay fp32: those *are* re-entered, and Stage C's
+        cached-baseline path is only valid if the noise it replays is bit-comparable.
+        """
         bucket = self.baseline_bucket(video_id)
         (bucket / "z_t_sampled").mkdir(parents=True, exist_ok=True)
         _save_npy(bucket / "text_emb.npy", text_emb)
         for step, z in z_t_by_step.items():
             _save_npy(bucket / "z_t_sampled" / f"t_{int(step):02d}.npy", z)
-        _save_npy(bucket / "Y_full.npy", y_full)
+        _save_npy(bucket / "Y_full.npy", y_full, dtype=y_full_dtype)
         if z_init is not None:
             # Y_full is only a usable reference for a run that starts from the same
             # noise, so the two are stored together (§P2-4).
@@ -219,18 +235,42 @@ class ProcessedLayout:
             return None
         return _load_npy(path, device)
 
-    def load_y_full(self, video_id, device=None) -> Optional[Tensor]:
+    def has_y_full(self, video_id) -> bool:
+        """Whether this video's ``Y_full`` was persisted — without reading it.
+
+        Lets a caller validate a whole batch's baselines before committing to the
+        render, then read only the frames it turns out to need (see ``frames`` below).
+        """
+        return (self.baseline_bucket(video_id) / "Y_full.npy").exists()
+
+    def load_y_full(self, video_id, device=None, *, frames=None) -> Optional[Tensor]:
         """Load the §3 level-3 reference video ``Y_full`` [F,3,H,W] for Stage C.
 
         Stage C's main quality loss compares the accelerated render against this
         full-compute baseline (§4.2 主损失). Returns ``None`` when the video's
         baseline bucket was not persisted (the sample is then trained on the
         regularisers only).
+
+        ``frames=(start, stop)`` reads only that half-open frame range, memory-mapped,
+        so the ~72 MB fp16 clip never lands on the device in full. Stage C's
+        differentiable decode covers a *window* of the clip (``decode_grad_frames``),
+        and the reference is cut to that same window before it is used — reading all 49
+        frames to score 5 of them was pure transfer and residency.
         """
         path = self.baseline_bucket(video_id) / "Y_full.npy"
         if not path.exists():
             return None
-        return _load_npy(path, device)
+        if frames is None:
+            return _load_npy(path, device)
+        start, stop = int(frames[0]), int(frames[1])
+        arr = np.load(path, allow_pickle=False, mmap_mode="r")
+        # ``np.array`` (a copy), not ``ascontiguousarray``: the slice of a memmap is
+        # already contiguous, so the latter hands back a read-only view of the mapping
+        # and ``torch.from_numpy`` warns about wrapping a non-writable buffer — and the
+        # tensor would keep the whole file mapped for as long as it lives.
+        window = np.array(arr[start:stop])
+        t = torch.from_numpy(window)
+        return t.to(device) if device is not None else t
 
     def save_features(
         self,
@@ -307,6 +347,36 @@ class ProcessedLayout:
         with open(self.norm_stats, "r", encoding="utf-8") as fh:
             return json.load(fh)
 
+    # -- Stage-A generation environment (cross-stage geometry contract) --- #
+
+    def write_stage_a_env(self, env: Mapping[str, object]) -> Path:
+        """Record the backbone geometry and schedule this store was generated with.
+
+        Stages B and C build their plugins from the *backbone's* token width, but
+        neither loads the backbone: Stage B runs on cached labels and defaults to the
+        mock adapter (``token_dim=32``), while Stage A's real Wan2.2-A14B gives 64. The
+        residual-repair net is sized from that number, so the mismatch produced a Stage
+        B checkpoint that could not be loaded into a Stage C running the real backbone —
+        and nothing detected it until the shapes collided.
+
+        Persisting the geometry next to the data makes it a property of the *store*
+        rather than of whichever command line ran last, which is what the two later
+        stages actually need to agree with. Also carries the resolution and teacher
+        step count, because Stage C's target is the ``Y_full`` rendered here and both
+        must match for the comparison to mean anything.
+        """
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.stage_a_env, "w", encoding="utf-8") as fh:
+            json.dump(dict(env), fh, indent=2, ensure_ascii=False)
+        return self.stage_a_env
+
+    def read_stage_a_env(self) -> Dict[str, object]:
+        """The recorded generation environment, or ``{}`` for a pre-existing store."""
+        if not self.stage_a_env.exists():
+            return {}
+        with open(self.stage_a_env, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
     # -- splits (§3 level-6, video_id-disjoint) ------------------------- #
 
     def write_splits(
@@ -334,17 +404,21 @@ class ProcessedLayout:
 # --------------------------------------------------------------------------- #
 
 
-def _to_numpy(x: Tensor) -> np.ndarray:
+def _to_numpy(x: Tensor, dtype: Optional[np.dtype] = None) -> np.ndarray:
     if isinstance(x, torch.Tensor):
-        return x.detach().to("cpu").float().numpy()
-    return np.asarray(x)
+        # ``.float()`` first unconditionally: numpy has no bfloat16, which is the dtype
+        # every real backbone hands us, so a direct ``.numpy()`` raises.
+        arr = x.detach().to("cpu").float().numpy()
+    else:
+        arr = np.asarray(x)
+    return arr.astype(dtype, copy=False) if dtype is not None else arr
 
 
-def _save_npy(path: Path, x: Tensor) -> None:
+def _save_npy(path: Path, x: Tensor, dtype: Optional[np.dtype] = None) -> None:
     """Atomic ``.npy`` save (temp + replace) so a crashed run leaves no half files."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    np.save(tmp, _to_numpy(x))
+    np.save(tmp, _to_numpy(x, dtype))
     # np.save appends .npy to the temp stem; normalise then atomically replace.
     written = tmp if tmp.exists() else tmp.with_suffix(tmp.suffix + ".npy")
     os.replace(written, path)

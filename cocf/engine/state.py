@@ -10,7 +10,7 @@ readable and the whole thing be unit-tested deterministically.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -59,6 +59,12 @@ class EngineState:
     anchor_store: AnchorStore
     cache: Optional[BackboneCache] = None
     tubes: List[SemanticTube] = field(default_factory=list)
+    # tube_id -> pooled CLIP visual embed [d_v], computed from the preview decode at
+    # tube-build time and reused every step. This is what makes the certificate's
+    # §5.3.1 λ_cmsc term computable inside the accelerated loop: scoring it per step
+    # would mean a perception forward per tube per step, while the embed only changes
+    # when the tubes are rebuilt (§P4-4).
+    tube_embeds: Dict[int, Tensor] = field(default_factory=dict)
     # mean damage uncertainty (mean σ over tubes) of the *previous* step, fed into the
     # next step's dynamic budget (§7.3 平均损害不确定度 term). Carried on the state
     # because the budget is sized before this step's σ is known (it conditions the
@@ -79,6 +85,22 @@ class GenerationResult:
     video: Tensor                # [B, 3, F, H, W] decoded video
     z0: Tensor                   # [B, N, d] final clean latent (token form)
     traces: List[StepTrace] = field(default_factory=list)
+    # The tube set the trajectory ended on, and the latent geometry it was built
+    # against. Stage C's §6.3.2 conservation loss is *per tube* — it needs these to
+    # pool each tube's visual embed out of the render — and they are already held by
+    # the engine, so handing them back costs nothing (§P4-4/§P4-A3).
+    tubes: List[SemanticTube] = field(default_factory=list)
+    grid: Optional[TokenGrid] = None
+    # Pixel-frame range ``[start, stop)`` of the source clip that :attr:`video` covers.
+    # ``None`` means the whole clip (every inference render, and any training render
+    # that did not window its differentiable decode). Stage C slices ``Y_full`` by this
+    # before comparing, so a windowed render is never scored against the wrong frames.
+    frame_span: Optional[Tuple[int, int]] = None
+    # Peak CUDA memory (GiB) over the whole trajectory, measured by the engine.
+    # 0.0 off CUDA. §9.4 lists 峰值显存 among the efficiency metrics to report, and an
+    # accelerator that buys latency with memory should have that visible rather than
+    # inferred.
+    peak_gib: float = 0.0
 
     # -- convenience efficiency summaries (§9.4) ------------------------ #
 
@@ -125,4 +147,5 @@ class GenerationResult:
             "rollbacks": self.num_rollbacks,
             "repairs": self.num_repairs,
             "cf_repairs": sum(t.cf_repairs for t in self.traces),
+            "peak_gib": round(self.peak_gib, 3),
         }

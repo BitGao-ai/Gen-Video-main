@@ -37,7 +37,7 @@ from cocf.backbones.base import (
 )
 from cocf.common.config import BackboneConfig
 from cocf.common.logging import get_logger
-from cocf.common.memory import free_memory, resolve_dtype
+from cocf.common.memory import free_memory, normal_mode, resolve_dtype
 from cocf.common.types import TokenGrid
 
 Tensor = torch.Tensor
@@ -108,14 +108,20 @@ class DiffusersVideoBackbone(BackboneAdapter):
                 raise RuntimeError(
                     f"{type(self).__name__} needs BackboneConfig.model_path to load weights"
                 )
-            self._load()
-            for m in (self.vae, self.text_encoder, self.transformer):
-                if m is not None:
-                    m.to(self._home_device(m), self.dtype).eval()
-                    for p in m.parameters():
-                        p.requires_grad_(False)
-            self._place_auxiliary_modules()
-            self._configure_vae_memory()
+            # ``normal_mode``: the load is lazy, so the *first forward wins* — and the
+            # first forward is often a label-only one under ``inference_mode`` (the
+            # Accelerator's text-dim probe, a Stage-A teacher pass). Building the
+            # weights there would make every parameter an inference tensor and break
+            # Stage C's grad-enabled forwards. Weights must never be inference tensors.
+            with normal_mode():
+                self._load()
+                for m in (self.vae, self.text_encoder, self.transformer):
+                    if m is not None:
+                        m.to(self._home_device(m), self.dtype).eval()
+                        for p in m.parameters():
+                            p.requires_grad_(False)
+                self._place_auxiliary_modules()
+                self._configure_vae_memory()
             self._loaded = True
             # After *every* component is placed, so the report reflects the real
             # resident footprint (a subclass's extra experts included).
@@ -159,6 +165,20 @@ class DiffusersVideoBackbone(BackboneAdapter):
             return self.offload_device
         return self.device
 
+    def _resident_denoisers(self) -> List[nn.Module]:
+        """Denoiser module(s) currently occupying the compute device.
+
+        The set :meth:`_module_active` parks while an offloaded component runs. Only
+        the transformer stack qualifies: the VAE is small and its calls interleave with
+        nothing, whereas a denoiser is the one component large enough that co-residency
+        with the text encoder decides whether the run fits. MoE subclasses override
+        this — see :meth:`cocf.backbones.wan22.Wan22Backbone._resident_denoisers`.
+        """
+        t = self.transformer
+        if isinstance(t, nn.Module) and self._home_device(t) == self.device:
+            return [t]
+        return []
+
     @contextlib.contextmanager
     def _module_active(self, module: Optional[nn.Module]) -> Iterator[None]:
         """Bring an offloaded ``module`` onto the compute device for one call.
@@ -166,16 +186,45 @@ class DiffusersVideoBackbone(BackboneAdapter):
         A no-op (and free) when the module already lives on the compute device, so
         call sites stay policy-agnostic — they simply declare "I need this now" and
         the configured policy decides whether a transfer actually happens.
+
+        Under ``BackboneConfig.text_encoder_exclusive`` the resident denoiser is parked
+        for the duration, so the two never share the card. This is not an optimisation
+        but a feasibility requirement on a 40 GB device: a Wan2.2-A14B expert is
+        ~26 GiB and umT5-XXL ~10 GiB, and the naive "swap in on top" costs 36 GiB
+        before a single activation — it OOMs at the *first* prompt of the run. The
+        round trip is ~26 GiB each way over PCIe once per prompt, which against Stage
+        A's minutes-per-clip teacher forward is noise.
         """
         if module is None or self._home_device(module) == self.device:
             yield
             return
-        module.to(self.device)
+        parked: List[nn.Module] = []
+        # Every ``.to()`` below reallocates parameter storage, so it must run outside
+        # any ambient ``inference_mode`` — see :func:`cocf.common.memory.normal_mode`.
+        # This context is entered from label-only passes all the time (encode_text
+        # under Stage-A teacher forward), which is exactly when the taint would be
+        # applied to the *denoisers* Stage C later needs gradients through.
+        with normal_mode():
+            if self.config.text_encoder_exclusive:
+                parked = [m for m in self._resident_denoisers() if m is not module]
+                for m in parked:
+                    m.to(self.offload_device)
+                if parked:
+                    free_memory()
+            module.to(self.device)
         try:
             yield
         finally:
-            module.to(self.offload_device)
-            free_memory()
+            with normal_mode():
+                module.to(self.offload_device)
+                free_memory()
+                # Restore before returning: ``_home_device`` still reports these as
+                # resident, so leaving them on the CPU would make the next denoise run
+                # against weights on the wrong device.
+                for m in parked:
+                    m.to(self.device)
+                if parked:
+                    free_memory()
 
     def _configure_vae_memory(self) -> None:
         """Enable tiled/sliced VAE encode+decode when ``config.vae_tiling`` is set.
@@ -260,22 +309,32 @@ class DiffusersVideoBackbone(BackboneAdapter):
         them off — and the symptom (an OOM tens of minutes into the run) says nothing
         about which. Logging resident bytes against device capacity right after
         placement makes the policy verifiable from the first lines of the log: on
-        Wan2.2-A14B, ~56 GB means the text encoder is parked, ~67 GB means it is not.
+        Wan2.2-A14B, ~26 GiB means one expert is parked, ~52 GiB means neither is.
+
+        Both *allocated* and *reserved* are reported. They answer different questions
+        and are routinely confused: allocated is the live-tensor total this report is
+        about, while reserved is the caching allocator's high-water mark — which is
+        what ``nvidia-smi`` shows, and which never falls on its own. A run whose
+        nvidia-smi figure sits far above the resident figure here has a *transient*
+        problem, not a weights problem.
         """
         if not str(self.device).startswith("cuda") or not torch.cuda.is_available():
             return
         idx = torch.device(self.device).index or 0
         total = torch.cuda.get_device_properties(idx).total_memory / 1024 ** 3
         resident = torch.cuda.memory_allocated(idx) / 1024 ** 3
+        reserved = torch.cuda.memory_reserved(idx) / 1024 ** 3
         policy = [
             f"text_encoder={'cpu' if self.config.offload_text_encoder else 'resident'}",
+            f"te_exclusive={'on' if self.config.text_encoder_exclusive else 'OFF'}",
             f"idle_expert={'cpu' if self.config.offload_idle_expert else 'resident'}",
             f"vae_tiling={'on' if self.config.vae_tiling else 'OFF'}",
         ]
         _log.info(
-            "%s: frozen stack resident %.1f GiB / %.1f GiB (%.1f GiB free for "
-            "activations); policy: %s",
-            type(self).__name__, resident, total, total - resident, ", ".join(policy),
+            "%s: frozen stack resident %.1f GiB (reserved %.1f) / %.1f GiB "
+            "(%.1f GiB free for activations); policy: %s",
+            type(self).__name__, resident, reserved, total, total - resident,
+            ", ".join(policy),
         )
 
     # -- static description --------------------------------------------- #
@@ -345,6 +404,34 @@ class DiffusersVideoBackbone(BackboneAdapter):
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             x = latent_grid.to(self.device, self.dtype) / scale
             return self.vae.decode(x).sample  # type: ignore[union-attr]
+
+    def pixel_span(self, lo: int, hi: int):
+        """Causal-temporal VAE layout: slot 0 → 1 frame, every later slot → ``c_t``.
+
+        ``F = (T-1)·c_t + 1``, so the **prefix** ``[0, hi)`` covers pixel frames
+        ``[0, (hi-1)·c_t + 1)``. Verified against :meth:`decode_latent` by the contract
+        test rather than trusted.
+
+        Any window with ``lo > 0`` is **declined** (``None``). The decoder is causal in
+        time: handed a slice that does not begin at slot 0 it holds no feature cache of
+        the preceding slots, so it re-anchors — treating slot ``lo`` as the clip's
+        leading frame and emitting ``(hi-lo-1)·c_t + 1`` frames, not the ``(hi-lo)·c_t``
+        that sit at ``[(lo-1)·c_t + 1, (hi-1)·c_t + 1)`` of the full decode. Returning
+        that range anyway made the base contract
+
+            decode_latent(z[:, :, lo:hi]) == decode_latent(z)[:, :, start:stop]
+
+        false in both length and content: Stage C's §4.2 pixel loss got a 13-frame
+        render against a 16-frame reference (a broadcast error at ``c_t=4, k=4``), and
+        the ``c_t == 1`` case that *did* line up would have compared the wrong frames
+        silently. It holds for ``lo == 0`` and for nothing else, so that is all this
+        advertises; :meth:`~cocf.engine.inference.InferenceEngine._grad_decode_window`
+        falls back to the prefix window when a random offset is refused.
+        """
+        if lo > 0:
+            return None
+        ct = self.vae_compress[0]
+        return (0, 0 if hi <= 0 else (hi - 1) * ct + 1)
 
     def _reclaim_before_vae(self) -> None:
         """Return cached-but-free allocator blocks to the driver before a VAE call.

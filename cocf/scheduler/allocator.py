@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Set
 import torch
 
 from cocf.common.config import AllocatorConfig
+from cocf.common.logging import get_logger
 from cocf.common.types import (
     Action,
     AllocationDecision,
@@ -37,6 +38,7 @@ from cocf.common.types import (
 )
 
 Tensor = torch.Tensor
+_log = get_logger(__name__)
 _NUM_ACTIONS = len(Action)
 
 
@@ -51,6 +53,41 @@ class ActionAllocator:
         # constant that silently disagrees with the transition the engine performs.
         if lowfreq_stride:
             self.action_cost[int(Action.LOWFREQ)] = 1.0 / float(max(1, lowfreq_stride) ** 2)
+        self._warn_if_ladder_collapses()
+
+    def _warn_if_ladder_collapses(self) -> None:
+        """Say so when two adjacent rungs of the action ladder share a cost (§P4-1).
+
+        The greedy walks the ladder one rung at a time and only moves where the cost
+        delta is non-zero (a zero-delta move buys no budget, so there is nothing to
+        trade). Two adjacent actions priced identically therefore make the *cheaper*
+        one a one-way door: reachable by downgrade, never escapable by upgrade.
+
+        This is a configuration smell, not an error — ``lowfreq_stride == 1`` legitimately
+        makes LOWFREQ cost the same as FULL because it then computes every token, and
+        the two really are the same operation. So we log rather than raise, naming the
+        pair so a mis-edited ``action_cost`` is diagnosable from the first line of the run.
+        """
+        ladder = sorted(Action, key=self._rank_key_for)
+        for lo, hi in zip(ladder[:-1], ladder[1:]):
+            if abs(self.action_cost[int(hi)] - self.action_cost[int(lo)]) <= 1e-12:
+                _log.warning(
+                    "allocator: %s and %s are both priced at %.4f, so the greedy cannot "
+                    "move between them — a tube seeded at %s can never be upgraded past "
+                    "it. Check AllocatorConfig.action_cost (engine.lowfreq_stride == 1 "
+                    "is the one benign case).",
+                    lo.name, hi.name, self.action_cost[int(lo)], lo.name,
+                )
+
+    def _rank_key_for(self, action: Action):
+        """Ladder sort key: cheapest first, ties broken by *most destructive* first.
+
+        ``Action`` is already ordered FULL(0) … ANCHOR(3) by descending expense, so
+        ``-int(action)`` puts the more destructive member of a cost tie lower on the
+        ladder. Without it ``sorted`` falls back to input order, which put INTERP below
+        ANCHOR and made budget pressure skip the *less* destructive action (§P4-1).
+        """
+        return (self.action_cost[int(action)], -int(action))
 
     @staticmethod
     def distinct_token_count(tubes: List[SemanticTube]) -> int:
@@ -138,23 +175,30 @@ class ActionAllocator:
     ) -> Dict[int, Action]:
         """Solve the per-tube action assignment, *seeded at the strength prior*.
 
-        Unlike a cheapest-first knapsack, every tube starts at its §3.3.3 prior
-        action (the cold-start fallback of §1.3). From that seed the solver moves in
-        exactly one direction:
+        The ladder each tube walks is ``[ANCHOR, INTERP, LOWFREQ, FULL]`` — sorted by
+        cost, ties broken most-destructive-first (:meth:`_rank_key_for`). Unlike a
+        cheapest-first knapsack, every tube starts at its §3.3.3 prior action (the
+        cold-start fallback of §1.3). From that seed the solver moves in exactly one
+        direction:
 
         * **over budget** → *downgrade* (toward cheaper actions) the tube whose
           extra damage-per-token-saved is smallest, until the plan fits. A LOW tube
-          may thus fall to ANCHOR only under genuine budget pressure (§3.3.3).
+          may thus fall to ANCHOR only under genuine budget pressure (§3.3.3), and it
+          passes through INTERP on the way rather than jumping straight to the freeze.
         * **under budget** → *upgrade* (toward FULL) the tube whose damage-reduction
           -per-extra-token is largest, while a beneficial upgrade still fits.
+
+        Both moves require a non-zero cost delta — a zero-delta step buys no budget, so
+        there is nothing to trade. That is why the cost vector must be strictly ordered
+        along the ladder; :meth:`_warn_if_ladder_collapses` flags a config that isn't.
 
         With an untrained (flat-μ) predictor no upgrade has positive benefit, so the
         plan stays at the priors — i.e. the system degrades gracefully to the §1.3
         threshold policy until the predictor has learned. Forced-FULL / unstable
         tubes have a singleton admissible set and are never moved.
         """
-        ranked = {  # cheapest → most expensive
-            tid: sorted(acts, key=lambda a: cost[tid][a]) for tid, acts in admissible.items()
+        ranked = {  # cheapest → most expensive; ties broken most-destructive-first
+            tid: sorted(acts, key=self._rank_key_for) for tid, acts in admissible.items()
         }
         pos = {}
         chosen: Dict[int, Action] = {}
