@@ -294,53 +294,83 @@ python scripts/train/train_stage_c.py \
 若阶段 A 用的是 **ti2v-5b**（单专家，常驻约 11 GiB），把 `--wan-variant` 换成 `ti2v-5b`
 即可保留 `--use_lora` 与 `--decode-grad-frames 2`，这是 40 GB 卡上更合理的组合。
 
-**③ 单机 8 卡 × 40 GB**
+**③ 单机 8 卡 × 40 GB —— `torchrun` 数据并行**
 
-阶段 C **没有分布式训练路径**（无 DDP/torchrun，一次 `engine.generate` 就是一张卡上的一条
-轨迹）。8 卡的正确用法是：阶段 A 按分片真并行（上文「单机 8×40 GB 的实际跑法」，8 卡近线性
-加速），阶段 B/C 各自单卡运行，多余的卡用来并行跑不同超参 / 不同 split 的阶段 C 实验：
+阶段 C 支持数据并行：每个 rank 独占一张卡跑自己的分片，`backward()` 之后对 **7.0M 可训练
+参数**做一次 all-reduce（约 28 MB/step，与 27B 的冻结主干无关，因为它永远没有梯度）。用
+`torchrun` 起 8 个进程即可，不需要任何额外开关：
 
 ```bash
-# 阶段 A：8 卡分片并行 —— 见上文「阶段 A」小节的 for 循环 + --finalize-only
-
-# 阶段 B：单卡（插件训练，骨干不参与，40 GB 绰绰有余）
-CUDA_VISIBLE_DEVICES=0 python scripts/train/train_stage_b.py \
+torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_c.py \
     --processed-root ./LCOCF_OpenVid1M_Processed \
-    --checkpoint_save ./checkpoints/stage_b_final.pt \
-    --batch_size 32 --num_epochs 10 --device cuda
-
-# 阶段 C：每张卡一个独立实验（相同数据、不同超参），而不是一个 8 卡任务
-for i in 0 1 2 3; do
-  CUDA_VISIBLE_DEVICES=$i python scripts/train/train_stage_c.py \
-      --processed-root ./LCOCF_OpenVid1M_Processed \
-      --checkpoint_load ./checkpoints/stage_b_final.pt \
-      --checkpoint_save ./checkpoints/stage_c_lr$i.pt \
-      --backbone wan22 --wan-variant a14b-t2v \
-      --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
-      --backbone-dtype bfloat16 \
-      --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 1 \
-      --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
-      --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
-      --offload-idle-expert --batch_size 1 --num_epochs 3 \
-      --lr $(python3 -c "print([1e-5,2e-5,5e-5,1e-4][$i])") \
-      --device cuda > logs/stage_c.$i.log 2>&1 &
-done
-wait
+    --checkpoint_load ./checkpoints/stage_b_final.pt \
+    --checkpoint_save ./checkpoints/stage_c_final.pt \
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+    --backbone-dtype bfloat16 \
+    --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 1 \
+    --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+    --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
+    --offload-idle-expert \
+    --batch_size 1 --num_epochs 3 --device cuda
 ```
 
-> ⚠️ 想要真正的 8 卡数据并行，需要自行给 `FinettuneStage.run()` 加 `torchrun` + DDP（梯度只在
-> 7M 可训练参数上 all-reduce，通信量很小），本仓库尚未实现。**不要**用上面的循环去「拼」一次
-> 大 batch —— 各进程之间没有梯度同步，那只是 4 个独立的实验。
->
-> ⚠️ CPU 内存同样是多进程的实际瓶颈：每个阶段 C 进程稳态约 40 GB（换出的空闲专家 28 GB +
-> umT5 11 GB 都在 CPU 上），4 进程约 160 GB，先 `free -g`。
+单卡命令加 `torchrun --nproc_per_node=N` 就是分布式版本，其余参数一字不改：`--device cuda`
+会被自动钉到本 rank 的 `cuda:$LOCAL_RANK`，数据由 `DistributedSampler` 切分
+（`drop_last=True`，保证各 rank 的 batch 数相同 —— 否则先跑完的 rank 会把其他 rank 卡死在
+all-reduce 里），日志与 checkpoint 只由 rank 0 输出/写盘。有效 batch = `--batch_size × N`。
+
+实现细节都在 `cocf/training/distributed.py`：为什么不是 `DistributedDataParallel`（它要包住
+**一个** module 的前向，而阶段 C 的一步是整条加速引擎加若干个损失）、为什么梯度平均放在裁剪
+之前（各 rank 必须裁同一个梯度才能走出同一步）、为什么开跑前要从 rank 0 广播一次参数（因形状
+不符被丢弃、转而随机初始化的层，或新注入的 LoRA，否则会在各 rank 上分叉成 8 个不同的模型）。未经
+`torchrun` 启动时，其中每个函数都是 no-op，单机单卡的行为与从前逐字节一致。
+
+> ⚠️ **主机内存是 8 rank 的真正门槛**：每个进程把换出的空闲专家（28 GB）和 umT5（11 GB）
+> 放在 CPU 上，稳态约 40 GB/进程，8 个就是 ~320 GB。先 `free -g`；不够就降到
+> `--nproc_per_node=4`，或者改用下面的配对方案。
+
+**配对方案（4 rank，把空闲专家停在邻卡而不是主存）**
+
+`--offload-device` 可以让被换出的组件停在**另一张 GPU** 上：28 GB 的专家换页变成 P2P 拷贝而不
+是绕主存往返，同时彻底消除上面的主机内存压力。8 张卡配成 4 组（偶数卡算、奇数卡停）：
+
+```bash
+cat > run_rank.sh <<'EOF'
+#!/usr/bin/env bash
+exec python scripts/train/train_stage_c.py "$@" \
+    --device cuda:$((2*LOCAL_RANK)) --offload-device cuda:$((2*LOCAL_RANK+1))
+EOF
+chmod +x run_rank.sh
+
+torchrun --standalone --nproc_per_node=4 --no-python ./run_rank.sh \
+    --processed-root ./LCOCF_OpenVid1M_Processed \
+    --checkpoint_load ./checkpoints/stage_b_final.pt \
+    --checkpoint_save ./checkpoints/stage_c_final.pt \
+    --backbone wan22 --wan-variant a14b-t2v \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+    --backbone-dtype bfloat16 --offload-idle-expert \
+    --vae-tile 128 --grad-window-steps 1 --decode-grad-frames 2 \
+    --real-models --metric-frame-chunk 2 --perception-dtype bfloat16 \
+    --sam-model /path/to/SAM --dino-model /path/to/DINO --clip-model /path/to/Clip \
+    --batch_size 1 --num_epochs 3
+```
+
+吞吐是 4 而不是 8，换来的是几乎免费的专家换页和零主机内存占用 —— 在换页频繁（`--steps` 大、
+噪声边界被反复跨越）时通常更划算。`--offload-device` 若指向计算卡本身或本机没有的设备，会告警
+并退回 CPU，不会在运行数小时后炸在一次前向里。**注意每个 rank 必须停在不同的卡上**：直接给
+`torchrun` 传一个固定的 `--offload-device cuda:1`，会让 8 个 rank 把 8 份 28 GB 全堆到同一张卡上。
+
+其余两个阶段不变：阶段 A 用 `--num-shards 8 --shard-index i` 分片并行（见上文），阶段 B 单卡
+即可（只训 1.26M 插件）。
 
 | 档位 | 常驻 | 激活余量 | LoRA | `--decode-grad-frames` | `--batch_size` |
 |------|------|----------|------|------------------------|----------------|
 | 80 GB | 54.1 GiB（双专家） | ~25 GiB | ✅ | 2 | 1 |
 | 40 GB（A14B） | ~27 GiB（单专家） | ~11 GiB | ❌ | 1 | 1 |
 | 40 GB（ti2v-5b） | ~11 GiB | ~28 GiB | ✅ | 2 | 1 |
-| 8×40 GB | 同 40 GB，逐卡独立 | 同 40 GB | 同上 | 同上 | 1（无 DDP） |
+| 8×40 GB（torchrun） | 同 40 GB，每 rank 一张卡 | 同 40 GB | ❌ | 1 | 1/rank（有效 8） |
+| 4×(40+40) GB（配对） | 计算卡 27 GiB，邻卡托管空闲专家 | ~11 GiB | ❌ | 2 | 1/rank（有效 4） |
 
 渲染几何不用再传 —— 脚本从 `metadata/stage_a_env.json` 读取阶段 A 的
 `num_frames/height/width` 与 teacher 步数并对齐；显式传 `--height` 等覆盖时会告警，因为几何一

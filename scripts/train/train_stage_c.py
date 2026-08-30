@@ -73,6 +73,9 @@ from cocf.data.metrics import DEFAULT_FRAME_CHUNK
 from cocf.data.processed_layout import ProcessedLayout
 from cocf.engine import InferenceEngine
 from cocf.training.checkpoint import load_checkpoint
+from cocf.training.distributed import init_distributed
+from cocf.training.distributed import resolve_device as dist_device
+from cocf.training.distributed import shutdown as dist_shutdown
 from cocf.training.stage_c_finetune import FinettuneStage, StageCConfig
 
 
@@ -226,11 +229,24 @@ def main():
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
-    setup_logging(level=logging.INFO)
+    # Join the process group first: it must happen before any weight is built (it
+    # pins this rank's CUDA device) and before logging is configured (so the extra
+    # ranks can be quietened). A run not launched under torchrun gets a disabled
+    # context here and behaves exactly as it always did.
+    dctx = init_distributed(args.device)
+    args.device = dist_device(args.device, dctx)
+
+    # Only rank 0 narrates. Eight interleaved copies of every line make a log that
+    # cannot be read, and the per-rank detail that *is* worth having (shard size,
+    # OOM, warnings) comes through at WARNING.
+    setup_logging(level=logging.INFO if dctx.is_main else logging.WARNING)
     # setup_logging attaches the stdout handler to the "cocf" logger and sets
     # propagate=False, so a bare getLogger("__main__") would emit nothing at
     # INFO — this script's own progress lines included.
     log = get_logger("cocf.stage_c")
+    # The *same* seed on every rank, deliberately: replicas must start from identical
+    # weights (a re-initialised layer is seeded here), and the data is split by the
+    # DistributedSampler rather than by diverging RNG streams.
     torch.manual_seed(args.seed)
 
     if not args.processed_root and not args.manifest:
@@ -319,16 +335,21 @@ def main():
     stage_c = FinettuneStage(accelerator=accelerator, engine=engine, config=stage_c_config)
     accelerator = stage_c.run()
 
-    args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
-    # Save the plugins *and* the LoRA adapters. The adapters live inside the frozen
-    # backbone, which is deliberately outside Accelerator.state_dict() — saving only
-    # that discarded the entire --use_lora fine-tune at the last line of the run.
-    ckpt = stage_c.checkpoint()
-    torch.save(ckpt, args.checkpoint_save)
-    log.info(
-        "Saved final checkpoint to %s (%d LoRA tensors)",
-        args.checkpoint_save, len(ckpt.get("lora", {})),
-    )
+    # One writer: the ranks hold identical weights (gradients are averaged every
+    # step), so rank 0's copy *is* the model — and eight processes writing one path
+    # is a corrupt file, not a redundant one.
+    if dctx.is_main:
+        args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
+        # Save the plugins *and* the LoRA adapters. The adapters live inside the frozen
+        # backbone, which is deliberately outside Accelerator.state_dict() — saving only
+        # that discarded the entire --use_lora fine-tune at the last line of the run.
+        ckpt = stage_c.checkpoint()
+        torch.save(ckpt, args.checkpoint_save)
+        log.info(
+            "Saved final checkpoint to %s (%d LoRA tensors)",
+            args.checkpoint_save, len(ckpt.get("lora", {})),
+        )
+    dist_shutdown()
 
 
 if __name__ == "__main__":

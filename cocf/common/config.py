@@ -331,6 +331,15 @@ class BackboneConfig:
     # fit, and the failure lands on the very first prompt.
     text_encoder_exclusive: bool = True
     offload_idle_expert: bool = True   # keep only the active MoE expert resident (saves ~28 GB)
+    # Where an offloaded component sleeps. "cpu" is the safe default and the only
+    # setting that needs no second device. On a multi-GPU box a *peer GPU* ("cuda:1")
+    # is the faster park: the idle Wan2.2 expert is ~28 GB, and a swap over NVLink /
+    # P2P is roughly an order of magnitude quicker than the round trip through host
+    # RAM — while also removing the ~40 GB per-process host-memory footprint that
+    # limits how many Stage-A shards or Stage-C runs fit on one machine. Only worth it
+    # when that peer card has the room to spare: the parked weights occupy it for the
+    # whole run.
+    offload_device: str = "cpu"
     vae_tiling: bool = True            # tiled/sliced VAE encode+decode (bounded peak)
     # Tile edge (output pixels) when vae_tiling is on. The decoder's peak transient
     # scales with tile_size². 128 bounds a 480×832 decode at ~0.4 GB (vs 1.4 GB at

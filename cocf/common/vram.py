@@ -99,6 +99,15 @@ def add_backbone_args(
                    help="Keep only the current noise band's Wan2.2 expert resident "
                         "(~28 GB saved). This is the default; pass it for an explicit "
                         "record in a launch script.")
+    v.add_argument("--offload-device", type=str, default="cpu",
+                   help="Where offloaded components (the text encoder, the idle "
+                        "Wan2.2 expert) park while idle. 'cpu' (default) is always "
+                        "safe; a peer GPU such as 'cuda:1' turns the ~28 GB expert "
+                        "swap into a P2P copy instead of a host round trip and frees "
+                        "~40 GB of host RAM per process, at the cost of that card "
+                        "holding the parked weights for the whole run. Ignored (with "
+                        "a warning) when it names the compute device or a device "
+                        "this host does not have.")
     parser.set_defaults(offload=True, vae_tiling=True, offload_idle_expert=True,
                         text_encoder_exclusive=True)
 
@@ -198,6 +207,10 @@ def resolve_vram_policy(config: Config, args, real_gpu_backbone: bool) -> None:
     if args.vae_tiling:
         config.backbone.vae_tile_size = args.vae_tile
     config.backbone.offload_idle_expert = args.offload_idle_expert
+    # Default "cpu" => unchanged behaviour. The adapter validates the value once at
+    # load and falls back to CPU (loudly) when it is unusable, so a typo here cannot
+    # surface as a device mismatch deep inside a forward hours into the run.
+    config.backbone.offload_device = getattr(args, "offload_device", "cpu") or "cpu"
 
 
 def apply_geometry(config: Config, args) -> Tuple[int, int, int]:
@@ -294,10 +307,10 @@ def log_vram_policy(config: Config, log, alloc_conf: str) -> None:
     log.info(
         "VRAM policy: text_encoder=%s, te_exclusive=%s, vae_tiling=%s, idle_expert=%s; "
         "geometry=%dx%dx%d; PYTORCH_CUDA_ALLOC_CONF=%s",
-        "cpu between prompts" if b.offload_text_encoder else "RESIDENT",
+        f"{b.offload_device} between prompts" if b.offload_text_encoder else "RESIDENT",
         "on" if b.text_encoder_exclusive else "OFF",
         f"on (tile {b.vae_tile_size}px)" if b.vae_tiling else "OFF (unbounded decode)",
-        "cpu when idle" if b.offload_idle_expert else "both resident",
+        f"{b.offload_device} when idle" if b.offload_idle_expert else "both resident",
         config.data.num_frames, config.data.height, config.data.width, alloc_conf,
     )
     if not b.vae_tiling:

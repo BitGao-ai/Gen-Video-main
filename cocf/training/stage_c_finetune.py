@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from cocf.common.config import Config
 from cocf.common.logging import get_logger
@@ -41,6 +41,14 @@ from cocf.lcocf.damage import (
     VideoFeatures,
 )
 from cocf.training.checkpoint import build_checkpoint
+from cocf.training.distributed import (
+    all_reduce_mean,
+    all_reduce_min,
+    assert_same,
+    average_gradients,
+    broadcast_parameters,
+    context as dist_context,
+)
 from cocf.training.lora import inject_lora, lora_state_dict
 from cocf.training.stage_c_losses import (
     StepRecord,
@@ -201,6 +209,7 @@ class FinettuneStage:
         self.config = config
         self.device = config.device
         self._warned_baseline_mismatch = False
+        self._warned_no_grad_batch = False
 
         # Pin the accelerated render to the schedule Stage A's Y_full was generated
         # with, unless the caller explicitly asked for another one. Doing it here — not
@@ -263,6 +272,31 @@ class FinettuneStage:
                     free_gib, max(1, int(free_gib // _STAGE_C_GIB_PER_CLIP)),
                 )
                 config.batch_size = max(1, int(free_gib // _STAGE_C_GIB_PER_CLIP))
+        else:
+            # batch_size == 1 already: there is nothing left to clamp, but the run can
+            # still be short on headroom — and then it OOMs minutes in with no prior
+            # hint, because the clamp above never looked. Say so at startup instead.
+            free_gib = self._free_vram_gib()
+            if free_gib is not None and free_gib < _STAGE_C_GIB_PER_CLIP:
+                _log.warning(
+                    "Stage C: only %.1f GiB free after the frozen backbone; one clip at "
+                    "%dx%dx%d needs ~%.0f GiB (DiT checkpoint stash ~5 + in-block "
+                    "recompute ~3 + differentiable VAE decode ~8-14). Expect an OOM in "
+                    "the first batch. Lower --decode-grad-frames (1 is the floor), then "
+                    "--metric-frame-chunk, then the render geometry — or free residency "
+                    "with --offload-idle-expert / a single-expert --wan-variant.",
+                    free_gib, *self._frame_shape(), _STAGE_C_GIB_PER_CLIP,
+                )
+
+        # Under data parallelism every rank must agree on the batch size: it decides
+        # how many batches an epoch has, and a rank that clamped lower would finish its
+        # shard early and leave the others blocked in an all-reduce forever. The
+        # smallest card decides. No-op in a single process.
+        agreed = int(all_reduce_min(config.batch_size))
+        if agreed != config.batch_size:
+            _log.warning("Stage C: batch_size %d -> %d to match the smallest rank.",
+                         config.batch_size, agreed)
+            config.batch_size = agreed
 
         # Identify trainable parameters
         self.trainable_params = self._get_trainable_params()
@@ -303,7 +337,10 @@ class FinettuneStage:
         """
         if not str(self.device).startswith("cuda") or not torch.cuda.is_available():
             return None
-        idx = torch.device(self.device).index or 0
+        # ``index or 0`` would read card 0 for a bare "cuda" — wrong on every rank but
+        # rank 0 under torchrun, and this figure decides the batch clamp.
+        idx = torch.device(self.device).index
+        idx = torch.cuda.current_device() if idx is None else idx
         total = torch.cuda.get_device_properties(idx).total_memory
         return (total - torch.cuda.memory_allocated(idx)) / 1024 ** 3
 
@@ -375,16 +412,49 @@ class FinettuneStage:
             processed_root=self.config.processed_root,
             manifest_path=self.config.manifest_path,
         )
+        # Data parallelism (§4.2 on a multi-GPU box): each rank owns a disjoint shard
+        # and the gradients are averaged after every backward. ``drop_last=True`` is
+        # what keeps that safe — it gives every rank the *same* number of batches, and
+        # a rank that ran out early would leave the others waiting in an all-reduce
+        # that never completes. Single-process runs take the original path untouched.
+        dctx = dist_context()
+        sampler = None
+        if dctx.enabled:
+            sampler = DistributedSampler(
+                dataset, num_replicas=dctx.world_size, rank=dctx.rank,
+                shuffle=True, drop_last=True,
+            )
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
-            shuffle=True,
+            sampler=sampler,
+            shuffle=sampler is None,
             # Identity collate: the engine runs per clip because Y_full is per video.
             collate_fn=collate_raw_filtered,
         )
 
-        _log.info(f"Stage C: {len(dataset)} clips, {len(dataloader)} batches")
+        if dctx.enabled:
+            # Ranks share a seed and a checkpoint, so this is normally a no-op — but a
+            # tensor the checkpoint could not restore (a shape-mismatched vis_proj) or
+            # a freshly injected LoRA would otherwise start different on every rank,
+            # and data parallelism over diverged replicas trains nothing coherent.
+            # Before the first collective of the run: the gradient all-reduce walks
+            # this exact list, and a rank with a different length would not error, it
+            # would hang. Same for the batch count, which drives one collective a step.
+            assert_same(len(self.trainable_params), "trainable-parameter count", dctx)
+            assert_same(len(dataloader), "batches per epoch", dctx)
+            n = broadcast_parameters(
+                list(self.trainable_params) + [b for b in self.accelerator.buffers()],
+                dctx,
+            )
+            _log.info(
+                "Stage C: rank %d/%d, %d clips in this shard (%d batches); "
+                "%d tensor(s) synced from rank 0",
+                dctx.rank, dctx.world_size, len(sampler), len(dataloader), n,
+            )
+        else:
+            _log.info(f"Stage C: {len(dataset)} clips, {len(dataloader)} batches")
         if len(dataloader) == 0:
             # No clips resolved (empty/missing manifest). Bail out cleanly instead of
             # dividing by a zero batch count in the epoch-average below.
@@ -395,6 +465,11 @@ class FinettuneStage:
 
         for epoch in range(self.config.num_epochs):
             epoch_loss = 0.0
+            trained_batches = 0
+            if sampler is not None:
+                # Without this every epoch reshuffles to the *same* permutation, so a
+                # rank sees one fixed shard for the whole run.
+                sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(dataloader):
                 # Run accelerated generation for the batch
@@ -405,15 +480,44 @@ class FinettuneStage:
                 # instead of zeroing them in place — lower memory held across the
                 # step boundary and marginally faster.
                 self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.trainable_params, self.config.gradient_clip
-                )
-                self.optimizer.step()
+                # A batch can legitimately produce a loss with no autograd graph: the
+                # render skipped every repair (nothing puts z on the graph), the clip
+                # segmented no tube (no regularisers) and LoRA is off. ``backward()``
+                # on that raises "does not require grad", which used to kill the run at
+                # a random batch hours in. Skipping it is the correct no-op — there is
+                # nothing to learn from this batch — but the *decision* must be shared:
+                # a rank that skipped its collectives while the others all-reduce does
+                # not fail, it hangs.
+                if loss.requires_grad:
+                    loss.backward()
+                # Average across ranks *before* clipping, so every rank clips the same
+                # gradient and therefore takes an identical optimiser step. Called
+                # unconditionally so the collective count matches on every rank; a
+                # no-op when this is a single process.
+                average_gradients(self.trainable_params, dctx)
+                trained = all_reduce_mean(
+                    float(loss.requires_grad), dctx, device=torch.device(self.device)
+                ) > 0.0
+                if trained:
+                    trained_batches += 1
+                    torch.nn.utils.clip_grad_norm_(
+                        self.trainable_params, self.config.gradient_clip
+                    )
+                    self.optimizer.step()
+                elif not self._warned_no_grad_batch:
+                    self._warned_no_grad_batch = True  # once per run, not per batch
+                    _log.warning(
+                        "Stage C: batch %d produced a loss with no autograd graph on "
+                        "any rank — no repair fired, no tube was segmented and LoRA is "
+                        "off, so nothing is trainable from it. Skipping the optimiser "
+                        "step (this message is not repeated). If it is the common case, "
+                        "the run is not learning: raise engine.grad_window_steps or "
+                        "lower the skip pressure (budget.b_min).", batch_idx,
+                    )
 
                 epoch_loss += float(loss)
 
-                if batch_idx % 10 == 0:
+                if batch_idx % 10 == 0 and dctx.is_main:
                     # ``batch_idx + 1`` batches have been summed into epoch_loss;
                     # the old ``max(1, batch_idx)`` divisor skewed the running mean.
                     avg_loss = epoch_loss / (batch_idx + 1)
@@ -423,7 +527,7 @@ class FinettuneStage:
                         f"loss: {loss:.4f} (avg: {avg_loss:.4f})"
                     )
 
-                if (batch_idx + 1) % self.config.save_interval == 0:
+                if (batch_idx + 1) % self.config.save_interval == 0 and dctx.is_main:
                     # Created on first write, not in __post_init__: building a config
                     # object should not touch the filesystem.
                     self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -433,16 +537,43 @@ class FinettuneStage:
                     )
                     torch.save(self.checkpoint(), ckpt_path)
 
-            avg_epoch_loss = epoch_loss / len(dataloader)
-            _log.info(f"Epoch {epoch+1} complete. Average loss: {avg_epoch_loss:.4f}")
+            # Reduced across ranks: each rank only saw its own shard, and a per-rank
+            # mean would have rank 3 keeping a "best" checkpoint rank 0 rejected.
+            avg_epoch_loss = all_reduce_mean(
+                epoch_loss / len(dataloader), dctx, device=torch.device(self.device)
+            )
+            # Report what actually trained, not just the loss: skipping a graph-less
+            # batch is a quiet no-op, and a run where *every* batch is skipped would
+            # otherwise look identical in the log to one that is learning — the exact
+            # failure the crash this replaced used to make impossible to miss.
+            if dctx.is_main:
+                _log.info(
+                    "Epoch %d complete. Average loss: %.4f (optimiser stepped on "
+                    "%d/%d batches)",
+                    epoch + 1, avg_epoch_loss, trained_batches, len(dataloader),
+                )
+            if trained_batches == 0:
+                _log.error(
+                    "Stage C: epoch %d trained on 0 of %d batches — no batch carried "
+                    "an autograd graph, so the checkpoint this epoch writes is the one "
+                    "it started from. With --use_lora off, the only path from the main "
+                    "loss to the backbone is the residual-repair net, which has to fire "
+                    "*inside* the BPTT window: raise engine.grad_window_steps "
+                    "(--grad-window-steps), lower the skip pressure (budget.b_min), or "
+                    "turn LoRA on if the card has room.", epoch + 1, len(dataloader),
+                )
 
+            # The comparison runs on every rank (all-reduced, hence identical), but
+            # only rank 0 writes — eight processes writing one path is a corrupt file.
             if avg_epoch_loss < best_loss:
                 best_loss = avg_epoch_loss
-                self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                best_ckpt = self.config.checkpoint_dir / "stage_c_best.pt"
-                torch.save(self.checkpoint(), best_ckpt)
+                if dctx.is_main:
+                    self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    best_ckpt = self.config.checkpoint_dir / "stage_c_best.pt"
+                    torch.save(self.checkpoint(), best_ckpt)
 
-        _log.info("Stage C fine-tuning complete")
+        if dctx.is_main:
+            _log.info("Stage C fine-tuning complete")
         return self.accelerator
 
     def _finetune_batch(self, batch) -> Tensor:

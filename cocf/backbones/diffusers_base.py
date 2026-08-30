@@ -147,8 +147,60 @@ class DiffusersVideoBackbone(BackboneAdapter):
 
     # -- VRAM residency policy (BackboneConfig.offload_* / vae_tiling) --- #
 
-    #: Where an offloaded component parks while it is idle.
-    offload_device: str = "cpu"
+    #: Fallback park device, used when the config names none (and by subclasses /
+    #: tests that construct an adapter without going through ``BackboneConfig``).
+    _DEFAULT_OFFLOAD_DEVICE: str = "cpu"
+
+    @property
+    def offload_device(self) -> str:
+        """Where an offloaded component parks while it is idle.
+
+        ``BackboneConfig.offload_device`` ("cpu" by default, so nothing changes unless
+        it is set). A peer GPU ("cuda:1") makes the Wan2.2 expert swap an intra-node
+        P2P copy instead of a round trip through host RAM. Validated once, in
+        :meth:`_resolve_offload_device`, because a bad value here would surface as a
+        device-mismatch error inside a forward hours into a run.
+        """
+        cached = getattr(self, "_offload_device", None)
+        if cached is None:
+            cached = self._resolve_offload_device()
+            self._offload_device = cached
+        return cached
+
+    def _resolve_offload_device(self) -> str:
+        """Validate the configured park device, falling back to CPU with a warning.
+
+        Rejected (→ CPU): a device this build cannot address, and the *compute* device
+        itself — parking a module where it already lives would make every ``_module_active``
+        swap a no-op and silently defeat the residency policy the caller asked for.
+        """
+        want = str(getattr(self.config, "offload_device", "") or
+                   self._DEFAULT_OFFLOAD_DEVICE)
+        if want == self._DEFAULT_OFFLOAD_DEVICE:
+            return want
+        try:
+            dev = torch.device(want)
+        except (RuntimeError, TypeError, ValueError):
+            _log.warning("offload_device=%r is not a valid torch device; parking on CPU.",
+                         want)
+            return self._DEFAULT_OFFLOAD_DEVICE
+        if dev.type == "cuda":
+            if not torch.cuda.is_available() or (
+                dev.index is not None and dev.index >= torch.cuda.device_count()
+            ):
+                _log.warning("offload_device=%s is not available on this host "
+                             "(%d CUDA device(s)); parking on CPU.",
+                             want, torch.cuda.device_count() if torch.cuda.is_available() else 0)
+                return self._DEFAULT_OFFLOAD_DEVICE
+            compute = torch.device(self.device)
+            same_index = (dev.index or 0) == (compute.index or 0)
+            if compute.type == "cuda" and same_index:
+                _log.warning(
+                    "offload_device=%s is the compute device — an offloaded module "
+                    "would not actually leave the card. Parking on CPU instead.", want,
+                )
+                return self._DEFAULT_OFFLOAD_DEVICE
+        return want
 
     def _home_device(self, module: Optional[nn.Module]) -> str:
         """Resident device for ``module`` under the config's offload policy.
@@ -320,7 +372,10 @@ class DiffusersVideoBackbone(BackboneAdapter):
         """
         if not str(self.device).startswith("cuda") or not torch.cuda.is_available():
             return
-        idx = torch.device(self.device).index or 0
+        # Bare "cuda" means *the current* device, which is this rank's card under
+        # torchrun — not card 0, whose numbers would be someone else's.
+        idx = torch.device(self.device).index
+        idx = torch.cuda.current_device() if idx is None else idx
         total = torch.cuda.get_device_properties(idx).total_memory / 1024 ** 3
         resident = torch.cuda.memory_allocated(idx) / 1024 ** 3
         reserved = torch.cuda.memory_reserved(idx) / 1024 ** 3

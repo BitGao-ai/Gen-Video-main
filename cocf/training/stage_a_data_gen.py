@@ -499,7 +499,11 @@ class DataGenerationStage:
         if not torch.cuda.is_available():
             return ""
         peak = torch.cuda.max_memory_reserved() / 1024 ** 3
-        total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        # ``max_memory_reserved()`` reports the *current* device, so the capacity it is
+        # printed against must come from the same one — card 0 is only right when the
+        # shard was launched with CUDA_VISIBLE_DEVICES pinning it there.
+        total = (torch.cuda.get_device_properties(torch.cuda.current_device())
+                 .total_memory / 1024 ** 3)
         torch.cuda.reset_peak_memory_stats()
         return f" (vram {peak:.1f}/{total:.1f} GiB peak)"
 
