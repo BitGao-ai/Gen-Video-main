@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
 from cocf.common.logging import get_logger
 from cocf.common.memory import freeze, normal_mode
-from cocf.common.raft import load_raft
+from cocf.common.raft import RAFT_MIN_EDGE, load_raft, raft_pad
 from cocf.lcocf.damage import MetricExtractor, VideoFeatures, crop_to_tube
 
 Tensor = torch.Tensor
@@ -464,17 +464,20 @@ class ModelMetricExtractor(MetricExtractor):
             def _raft_input(video: Tensor) -> Tensor:
                 """``[F,3,H,W]`` in [0,1] → RAFT's [-1,1] input, edge-capped, on device.
 
-                RAFT requires both spatial dims to be multiples of 8, so the capped
-                size is rounded down to that lattice.
+                RAFT requires both spatial dims to be multiples of 8 and no smaller
+                than ``RAFT_MIN_EDGE``, so the capped size is rounded down to that
+                lattice but floored there — a cap tight enough to cross the floor
+                would otherwise make RAFT's correlation pyramid raise.
                 """
                 v = (video.clamp(0, 1) * 2 - 1).to(device)
                 h, w = v.shape[-2:]
                 edge = max(h, w)
                 if flow_max_edge and edge > flow_max_edge:
                     scale = flow_max_edge / edge
-                    size = (max(8, int(h * scale) // 8 * 8), max(8, int(w * scale) // 8 * 8))
+                    size = (max(RAFT_MIN_EDGE, int(h * scale) // 8 * 8),
+                            max(RAFT_MIN_EDGE, int(w * scale) // 8 * 8))
                     v = _F.interpolate(v, size=size, mode="bilinear", align_corners=False)
-                return v.to(raft_dtype)
+                return raft_pad(v.to(raft_dtype))
 
             def flow_fn(video: Tensor) -> Tensor:
                 v = _raft_input(video)

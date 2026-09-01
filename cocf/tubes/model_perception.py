@@ -42,7 +42,7 @@ import torch.nn.functional as F
 from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
 from cocf.common.logging import get_logger
 from cocf.common.memory import free_memory, freeze
-from cocf.common.raft import load_raft
+from cocf.common.raft import load_raft, raft_pad
 from cocf.tubes.regions import PerceptionProvider
 
 Tensor = torch.Tensor
@@ -406,7 +406,6 @@ class ModelPerception(PerceptionProvider):
         """
         import numpy as _np
         import torch as _t
-        import torch.nn.functional as _F
         from PIL import Image
         from transformers import (
             AutoImageProcessor,
@@ -585,11 +584,12 @@ class ModelPerception(PerceptionProvider):
 
                 def _pad8(x: Tensor):
                     _, h, w = x.shape
-                    ph, pw = (8 - h % 8) % 8, (8 - w % 8) % 8
-                    # RAFT wants [N,3,H,W] in [-1,1], H/W divisible by 8.
+                    # RAFT wants [N,3,H,W] in [-1,1], H/W divisible by 8 *and* at
+                    # least RAFT_MIN_EDGE (below that its correlation pyramid
+                    # raises); bottom/right only, so the [:h, :w] slice below
+                    # recovers the caller's field.
                     x = x[None].to(device=device, dtype=raft_dtype)
-                    xp = _F.pad((x * 2 - 1), (0, pw, 0, ph), mode="reflect")
-                    return xp, h, w
+                    return raft_pad(x * 2 - 1), h, w
 
                 ap, h, w = _pad8(frame_a)
                 bp, _, _ = _pad8(frame_b)
