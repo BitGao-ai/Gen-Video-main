@@ -130,9 +130,11 @@ class InferenceEngine(nn.Module):
             cond: Text conditioning (embeddings, etc.).
             backbone: Frozen backbone model.
             record_sink: Optional per-step callback ``(step_idx, t, budget, step_frac,
-                tube_states, strength_feats, actions)`` used by Stage-C end-to-end
-                fine-tuning to collect the exact per-tube features the engine allocated
-                on (§4.2). ``None`` at inference (zero overhead).
+                tube_states, strength_feats, actions, tube_residual, local_cmsc)`` used
+                by Stage-C end-to-end fine-tuning to collect the exact per-tube features
+                the engine allocated on and certified against (§4.2). Called after the
+                transition, so ``actions`` names what really executed. ``None`` at
+                inference (zero overhead).
             decode_grad: If True, run the whole trajectory **on** the autograd graph —
                 the backbone is put in :meth:`~cocf.backbones.base.BackboneAdapter.grad_mode`
                 so its forwards stop using ``inference_mode``, and the final decode is
@@ -250,11 +252,11 @@ class InferenceEngine(nn.Module):
         frame_span: Optional[Tuple[int, int]] = None
         if decode_grad:
             lo, hi, frame_span = self._grad_decode_window(state.grid, backbone)
-            video = backbone.decode_latent(z0_grid[:, :, lo:hi])  # grad-enabled
+            video = backbone.decode_to_unit(z0_grid[:, :, lo:hi])  # grad-enabled
             self._warn_if_no_graph(video, state, window)
         else:
             with torch.no_grad():
-                video = backbone.decode_latent(z0_grid)  # [B, 3, F, H, W]
+                video = backbone.decode_to_unit(z0_grid)  # [B, 3, F, H, W] in [0,1]
 
         return GenerationResult(
             video=video,
@@ -517,21 +519,6 @@ class InferenceEngine(nn.Module):
         optimal_actions = decision.actions  # {tube_id: Action}
         trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
 
-        # Stage-C training hook: emit this step's per-tube (state, strength, action) so the
-        # end-to-end fine-tune can recompute the scheduling regularisers on the exact
-        # features the engine allocated on (§4.2, no train/serve skew). No-op at inference
-        # (record_sink is None) and for warm-up steps (no tubes → returned above).
-        if record_sink is not None:
-            record_sink(
-                step_idx=step_idx,
-                t=t,
-                budget=budget_t,
-                step_frac=step_frac,
-                tube_states=tube_states,
-                strength_feats=strength_feats,
-                actions=optimal_actions,
-            )
-
         # Consume one step of every active forced-FULL window now that this step's
         # allocation has honoured it; the trigger drops windows that have elapsed.
         trigger.step()
@@ -591,6 +578,29 @@ class InferenceEngine(nn.Module):
                 local_cmsc=local_cmsc.get(tid, 0.0),
             )
             certificates[tid] = cert.value
+
+        # Stage-C training hook: emit this step's per-tube (state, strength, executed
+        # action) so the end-to-end fine-tune can recompute the scheduling regularisers
+        # on the exact features the engine allocated on (§4.2, no train/serve skew).
+        # Fired *here*, after the transition and the certificates, for two reasons the
+        # pre-transition position could not satisfy: ``optimal_actions`` now names what
+        # actually ran (a promoted whole-step skip has been folded in), and the skip
+        # residual δ and the local CMSC violation exist — the two certificate inputs
+        # Stage C otherwise had to pass as hard zeros, leaving λ_res and λ_cmsc without
+        # gradient while calibrating E_cert against the full damage.
+        # No-op at inference (record_sink is None) and for warm-up steps (no tubes).
+        if record_sink is not None:
+            record_sink(
+                step_idx=step_idx,
+                t=t,
+                budget=budget_t,
+                step_frac=step_frac,
+                tube_states=tube_states,
+                strength_feats=strength_feats,
+                actions=optimal_actions,
+                tube_residual=result.tube_residual,
+                local_cmsc=local_cmsc,
+            )
 
         # --- Step 7: Risk triggers & local repairs (RAEC) -----
         repairs_this_step = 0
@@ -682,9 +692,9 @@ class InferenceEngine(nn.Module):
     def _decode_preview_frames(
         self, state: EngineState, backbone: BackboneAdapter
     ) -> Tensor:
-        """Decode the current latent to RGB frames ``[grid.t, 3, Hp, Wp]`` for tube
-        segmentation. The tube builder works on pixels and requires exactly one RGB
-        frame per latent-temporal slot (``F == grid.t``).
+        """Decode the current latent to RGB frames ``[grid.t, 3, Hp, Wp]`` in ``[0, 1]``
+        for tube segmentation. The tube builder works on pixels and requires exactly one
+        RGB frame per latent-temporal slot (``F == grid.t``).
 
         Only the **first batch element** is decoded. The result is indexed as
         ``video[0]`` and the rest discarded, so decoding the whole batch bought
@@ -700,7 +710,7 @@ class InferenceEngine(nn.Module):
         """
         with torch.no_grad():
             latent_grid = self.accelerator.backbone.to_grid(state.z[:1], state.grid)
-            video = backbone.decode_latent(latent_grid)  # [1, 3, F, Hp, Wp]
+            video = backbone.decode_to_unit(latent_grid)  # [1, 3, F, Hp, Wp] in [0,1]
         frames = video[0].permute(1, 0, 2, 3).contiguous()
         del video
         f = frames.shape[0]

@@ -42,9 +42,13 @@ class Wan21Backbone(DiffusersVideoBackbone):
 
         path = self.config.model_path
         extra = self.config.extra or {}
-        self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae")
-        self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer")
-        self.text_encoder = UMT5EncoderModel.from_pretrained(path, subfolder="text_encoder")
+        # ``torch_dtype`` + ``low_cpu_mem_usage``: without them ``from_pretrained``
+        # materialises fp32 on the CPU and only the subsequent ``.to(device, dtype)``
+        # narrows it, so a 14B denoiser costs 56 GB of host RAM during load alone.
+        hf = {"torch_dtype": self.dtype, "low_cpu_mem_usage": True}
+        self.vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", **hf)
+        self.transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", **hf)
+        self.text_encoder = UMT5EncoderModel.from_pretrained(path, subfolder="text_encoder", **hf)
         self.tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
         self._max_len = int(extra.get("max_text_len", 512))
 
@@ -74,7 +78,7 @@ class Wan21Backbone(DiffusersVideoBackbone):
     def _run_transformer(
         self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
-        timestep = (t.to(self.device) * 1000.0).flatten()
+        timestep = (self.model_sigma(t.to(self.device)) * 1000.0).flatten()
         out = self.transformer(  # type: ignore[union-attr]
             hidden_states=latent_grid,
             timestep=timestep,

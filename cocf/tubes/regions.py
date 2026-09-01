@@ -57,6 +57,16 @@ class PerceptionProvider(abc.ABC):
     def clip_feature(self, frame: Tensor, mask: Tensor) -> Tensor:
         """CLIP visual embedding ``[d_clip]`` of the region (for text-tube alignment)."""
 
+    def text_feature(self, prompt: str) -> Optional[Tensor]:
+        """CLIP text embedding ``[d_clip]`` of the prompt, or ``None`` if unsupported.
+
+        Exposed so the semantic filter can score a whole frame's regions with one dot
+        product against the features :meth:`region_features` already computed, instead
+        of one image encode per region on top of them. A provider without a text tower
+        returns ``None`` and the filter falls back to :meth:`clip_score`.
+        """
+        return None
+
     @abc.abstractmethod
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
         """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``.
@@ -108,40 +118,66 @@ class RegionExtractor:
         masks = self.perception.segment(frame_rgb)  # [R, Hp, Wp]
         if masks.numel() == 0:
             return []
-        total_px = float(masks.shape[-1] * masks.shape[-2])
+        # Areas for every mask in one reduction: the per-mask ``.item()`` this replaces
+        # was a device sync per region, ~300 per clip before any model ran.
+        areas = masks.flatten(1).float().mean(dim=1).tolist()
         kept: List[tuple] = []
-        for r in range(masks.shape[0]):
-            mask_px = masks[r]
-            area_ratio = float(mask_px.float().mean().item())
+        for r, area_ratio in enumerate(areas):
             if area_ratio < self.cfg.min_region_ratio:  # drop tiny regions
                 continue
-            score = self.perception.clip_score(frame_rgb, mask_px, prompt) if prompt else 1.0
-            if score < self.cfg.min_clip_score:  # drop low-semantic regions
-                continue
-            lat_mask = self._to_latent_mask(mask_px, grid)  # [H_l, W_l] bool
+            lat_mask = self._to_latent_mask(masks[r], grid)  # [H_l, W_l] bool
             tok = self._mask_to_tokens(lat_mask, frame_idx, grid)
             if tok.numel() == 0:
                 continue
-            kept.append((mask_px, lat_mask, tok, score))
+            kept.append((masks[r], lat_mask, tok))
 
         # Features for all surviving regions in one call, so a real backend can run a
         # single batched forward per frame instead of one per region (§P2-8).
         ident, textf = self.perception.region_features(
             frame_rgb, [k[0] for k in kept]
         )
-        return [
-            Region(
+        scores = self._clip_scores(frame_rgb, [k[0] for k in kept], textf, prompt)
+        # The semantic filter (§4.3.1) is applied here rather than before the feature
+        # pass: scoring needs the very CLIP embedding that pass produces, and computing
+        # it twice — once to filter, once to keep — was the frame's dominant non-SAM
+        # cost. ``region_id`` numbers the survivors, which is what the affinity
+        # matrices index.
+        regions: List[Region] = []
+        for i, (_, lat_mask, tok) in enumerate(kept):
+            if scores[i] < self.cfg.min_clip_score:  # drop low-semantic regions
+                continue
+            regions.append(Region(
                 frame=frame_idx,
-                region_id=rid,
+                region_id=len(regions),
                 mask=lat_mask,
                 token_indices=tok,
-                identity_feat=ident[rid],
-                text_feat=textf[rid],
+                identity_feat=ident[i],
+                text_feat=textf[i],
                 center=self._centroid(lat_mask),
-                clip_score=score,
-            )
-            for rid, (_, lat_mask, tok, score) in enumerate(kept)
-        ]
+                clip_score=scores[i],
+            ))
+        return regions
+
+    def _clip_scores(
+        self, frame_rgb: Tensor, masks: Sequence[Tensor],
+        text_feats: Sequence[Tensor], prompt: str,
+    ) -> List[float]:
+        """Region-vs-prompt CLIP match in ``[0,1]`` for a whole frame.
+
+        Uses one text encode plus a dot product against the already-computed region
+        embeddings when the provider exposes :meth:`PerceptionProvider.text_feature`;
+        otherwise falls back to the per-region :meth:`clip_score`.
+        """
+        if not prompt or not masks:
+            return [1.0] * len(masks)
+        txt = self.perception.text_feature(prompt)
+        if txt is None:
+            return [
+                self.perception.clip_score(frame_rgb, m, prompt) for m in masks
+            ]
+        v = F.normalize(torch.stack([f.float() for f in text_feats]), dim=-1)
+        t = F.normalize(txt.float().to(v.device), dim=-1)
+        return ((v @ t).clamp(-1.0, 1.0) * 0.5 + 0.5).tolist()
 
     # -- helpers --------------------------------------------------------- #
 

@@ -43,14 +43,16 @@ _log = get_logger(__name__)
 
 
 def _to_fchw(video: Tensor) -> Tensor:
-    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]`` in [0, 1].
+    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]``.
 
+    Layout only — the value range is settled by
+    :meth:`~cocf.backbones.base.BackboneAdapter.decode_to_unit` at the decode itself.
     Mirrors :func:`cocf.lcocf.data._frames_fchw` so the reference video stored here
     has the *same* frame layout the counterfactual rollout produces when it decodes
     ``z_0`` — the damage computer compares the two frame-for-frame.
     """
     v = video[0] if video.dim() == 5 else video
-    return v.permute(1, 0, 2, 3).contiguous().clamp(0.0, 1.0)
+    return v.permute(1, 0, 2, 3).contiguous()
 
 
 def _frames_per_latent_slot(video_fchw: Tensor, grid_t: int) -> Tensor:
@@ -262,7 +264,7 @@ class TeacherForwardRunner:
                 z0, z_by_step = self.full_denoise(z_init, cond, grid, cache_steps=rep_steps)
 
             # decode the reference video Y_full (full frame layout, as the rollout uses)
-            video_full = _to_fchw(bb.decode_latent(bb.to_grid(z0, grid)))  # [F, 3, Hp, Wp]
+            video_full = _to_fchw(bb.decode_to_unit(bb.to_grid(z0, grid)))  # [F,3,Hp,Wp]
 
             # --- §1.4: build tubes + states + (s_E,s_A,s_T) + visual embeds --- #
             frames_for_tubes = _frames_per_latent_slot(video_full, grid.t)

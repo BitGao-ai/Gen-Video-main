@@ -29,11 +29,17 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from cocf.common.config import FilterConfig
 from cocf.common.logging import get_logger
-from cocf.data.openvid_manifest import OpenVidRecord, SCENE_TYPES, scene_histogram
+from cocf.data.openvid_manifest import (
+    OpenVidRecord,
+    SCENE_TYPES,
+    _to_float,
+    _to_int,
+    scene_histogram,
+)
 from cocf.data.processed_layout import ProcessedLayout
 
 _log = get_logger(__name__)
@@ -78,6 +84,69 @@ class FilterResult:
     kept: List[OpenVidRecord]
     split_by_video: Dict[str, str]   # video_id -> "train" | "val" | "test_hard"
     report: FilterReport
+
+
+def _record_from_row(row: Mapping[str, str]) -> OpenVidRecord:
+    """Rebuild an :class:`OpenVidRecord` from a ``filtered_final.csv`` row."""
+    return OpenVidRecord(
+        video_id=row.get("video_id") or "",
+        video=row.get("video") or "",
+        path=row.get("path") or "",
+        caption=row.get("caption") or "",
+        is_hd=bool(_to_int(row.get("is_hd"), 0)),
+        aesthetic=_to_float(row.get("aesthetic")),
+        motion=_to_float(row.get("motion")),
+        temporal_consistency=_to_float(row.get("temporal_consistency")),
+        camera_motion=row.get("camera_motion") or "",
+        frame=_to_int(row.get("frame")),
+        fps=_to_float(row.get("fps")),
+        seconds=_to_float(row.get("seconds")),
+        scene_type=row.get("scene_type") or "dynamic",
+    )
+
+
+def read_filtered_final(layout: ProcessedLayout) -> Optional[FilterResult]:
+    """Recover the §2.4 kept set and split map from ``metadata/filtered_final.csv``.
+
+    :meth:`QualityFilter.write` emits every :class:`OpenVidRecord` field alongside the
+    ``split`` column, so the filter's decision is fully recoverable from its own output.
+    That is what lets the workers of a sharded Stage-A run inherit it instead of each
+    re-deriving it: re-running the filter per worker re-parses the whole 1.45M-row
+    manifest and, under ``--only-existing-videos``, pays one ``stat`` per row per
+    worker — ~11.6M redundant filesystem calls across 8 GPUs before the first teacher
+    forward, and far worse than that on a network mount.
+
+    The report is filled only with the statistics the CSV actually determines; the
+    per-level drop counts belong to the run that did the filtering and are left at
+    zero, so no caller can mistake a reused result for a fresh one.
+
+    Returns ``None`` when the CSV is absent or carries no usable rows, so callers fall
+    back to running the filter themselves.
+    """
+    rows = layout.read_csv(layout.filtered_final)
+    if not rows:
+        return None
+    kept = [_record_from_row(r) for r in rows if r.get("video_id")]
+    if not kept:
+        return None
+    split_by_video = {
+        r["video_id"]: (r.get("split") or "train")
+        for r in rows if r.get("video_id")
+    }
+    counts: Dict[str, int] = defaultdict(int)
+    for split in split_by_video.values():
+        counts[split] += 1
+    report = FilterReport(
+        total_in=len(kept),
+        kept_final=len(kept),
+        scene_hist=scene_histogram(kept),
+        hd_frac=sum(1 for r in kept if r.is_hd) / len(kept),
+        mean_aesthetic=sum(r.aesthetic for r in kept) / len(kept),
+        n_train=counts["train"],
+        n_val=counts["val"],
+        n_test_hard=counts["test_hard"],
+    )
+    return FilterResult(kept=kept, split_by_video=split_by_video, report=report)
 
 
 def _is_hard(r: OpenVidRecord, fast_motion: float) -> bool:
@@ -254,23 +323,30 @@ class QualityFilter:
         by_aes = sorted(pool, key=lambda r: r.aesthetic, reverse=True)
         selected: List[OpenVidRecord] = []
         chosen = set()
+        n_hd = 0
 
-        def take(r: OpenVidRecord) -> None:
-            if id(r) not in chosen and len(selected) < target:
-                chosen.add(id(r))
-                selected.append(r)
+        def take(r: OpenVidRecord) -> bool:
+            nonlocal n_hd
+            if id(r) in chosen or len(selected) >= target:
+                return False
+            chosen.add(id(r))
+            selected.append(r)
+            n_hd += int(r.is_hd)
+            return True
 
         # 1) force-keep hard samples (§2.3), highest-aesthetic first
         for r in by_aes:
             if _is_hard(r, self.fast_motion):
                 take(r)
-        # 2) meet the HD floor (§2.4 OpenVidHD ≥60%)
+        # 2) meet the HD floor (§2.4 OpenVidHD ≥60%). The HD tally is carried in
+        #    ``take`` rather than recounted per candidate: rescanning ``selected``
+        #    every iteration is O(|pool| · target), which on the full manifest is
+        #    hours of pure CPU with no progress output — and under --num-shards it is
+        #    hours the other workers spend idle waiting for filtered_final.csv.
         hd_target = int(c.hd_min_frac * target)
-        if sum(1 for r in selected if r.is_hd) < hd_target:
+        if n_hd < hd_target:
             for r in by_aes:
-                if r.is_hd:
-                    take(r)
-                if sum(1 for s in selected if s.is_hd) >= hd_target:
+                if r.is_hd and take(r) and n_hd >= hd_target:
                     break
         # 3) fill the rest by descending aesthetic
         for r in by_aes:

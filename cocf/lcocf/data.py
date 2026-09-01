@@ -409,9 +409,13 @@ class TeacherTrajectory:
 
 
 def _frames_fchw(video: Tensor) -> Tensor:
-    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]`` in [0,1]."""
+    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]``.
+
+    Layout only; the value range is settled at the decode by
+    :meth:`~cocf.backbones.base.BackboneAdapter.decode_to_unit`.
+    """
     v = video[0] if video.dim() == 5 else video
-    return v.permute(1, 0, 2, 3).contiguous().clamp(0.0, 1.0)
+    return v.permute(1, 0, 2, 3).contiguous()
 
 
 def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube) -> Tensor:
@@ -420,16 +424,22 @@ def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube) -> Tensor:
     The damage extractor works on pixels while a tube carries latent-grid masks, so
     this is the bridge that lets a label be scored on the region the counterfactual
     actually intervened on (§7.1.1).
+
+    The tube's masks share one latent grid, so they upsample as a single batched
+    interpolate rather than one call per frame.
     """
     f, _, hp, wp = video_fchw.shape
     out = torch.zeros(f, hp, wp, dtype=torch.bool, device=video_fchw.device)
-    for frame, mask in tube.masks_by_frame.items():
-        if not (0 <= frame < f) or mask is None:
-            continue
-        up = F.interpolate(
-            mask[None, None].float(), size=(hp, wp), mode="nearest"
-        )[0, 0] > 0.5
-        out[frame] = up.to(out.device)
+    frames = [
+        (frame, mask) for frame, mask in tube.masks_by_frame.items()
+        if mask is not None and 0 <= frame < f
+    ]
+    if not frames:
+        return out
+    stacked = torch.stack([m.float() for _, m in frames]).unsqueeze(1)   # [n,1,h,w]
+    up = F.interpolate(stacked, size=(hp, wp), mode="nearest")[:, 0] > 0.5
+    idx = torch.tensor([frame for frame, _ in frames], device=out.device)
+    out.index_copy_(0, idx, up.to(out.device))
     return out
 
 
@@ -450,12 +460,13 @@ def tube_clip_embed(
     if d_v is None:
         d_v = int(getattr(perception, "d_clip", 64)) if perception is not None else 64
     frames = tube.frames
+    zeros = torch.zeros(d_v, device=video_fchw.device)
     if perception is None or not frames:
-        return torch.zeros(d_v)
+        return zeros
     mid = frames[len(frames) // 2]
     mask_lat = tube.masks_by_frame.get(mid)
     if mask_lat is None:
-        return torch.zeros(d_v)
+        return zeros
     fi = min(mid, video_fchw.shape[0] - 1)
     frame = video_fchw[fi]                                   # [3, Hp, Wp]
     mask_pix = F.interpolate(
@@ -470,6 +481,76 @@ def tube_clip_embed(
 
 
 # ============================================================================= #
+
+
+def _seeded_noise(like: Tensor, *keys) -> Tensor:
+    """Deterministic Gaussian like ``like`` — reproducible per (clip, step, seed).
+
+    Seeds from a *stable* hash of the keys, not Python's ``hash()`` (which is salted
+    per process via ``PYTHONHASHSEED`` for string keys like ``video_id``), so the
+    multi-seed perturbations — hence the §1.5 uncertainty labels — are byte-identical
+    across runs, processes and shards. Generated on CPU for the same reason: a CUDA
+    generator's stream is device- and driver-dependent, so a store built on one card
+    would not reproduce on another.
+    """
+    digest = hashlib.sha1("|".join(map(str, keys)).encode("utf-8")).hexdigest()
+    g = torch.Generator().manual_seed(int(digest[:8], 16))
+    return torch.randn(like.shape, generator=g).to(like.device, like.dtype)
+
+
+class _FullStepCache:
+    """Memoises the dense full-compute advance shared by every rollout at a step.
+
+    A single-hop rollout starts by advancing the cached ``z_t`` one *unmodified*
+    full-compute step, and only then applies the action to the intervened tube. That
+    advance is a function of ``(step_idx, seed)`` alone — it happens before any tube
+    or action is involved — so the ~12 rollouts a clip runs at one representative step
+    were each recomputing a bit-identical DiT forward.
+
+    Sharing it is what makes the perturbation seed drop ``tube_id``/``action`` from its
+    key. That is also the better label: all actions at a step now see the *same*
+    perturbation (common random numbers), so the multi-seed variance measures the
+    action's own sensitivity rather than the difference between two unrelated noise
+    draws.
+
+    Both returned tensors are read-only to callers. ``coarsen_lowfreq`` /
+    ``interp_temporal`` / the ANCHOR branch all clone before writing, and the
+    continuation loop rebinds rather than mutating, so no rollout can corrupt a
+    later one's entry.
+    """
+
+    def __init__(self, traj: "TeacherTrajectory", backbone: BackboneAdapter,
+                 perturb_std: float) -> None:
+        self._traj = traj
+        self._backbone = backbone
+        self._perturb_std = perturb_std
+        self._entries: Dict[Tuple[int, int], Tuple[Tensor, Tensor]] = {}
+
+    def get(self, step_idx: int, seed: int) -> Tuple[Tensor, Tensor]:
+        """``(z_prev, z_full)`` at ``step_idx`` under perturbation ``seed``."""
+        key = (step_idx, seed)
+        cached = self._entries.get(key)
+        if cached is not None:
+            return cached
+
+        traj = self._traj
+        z_prev = traj.z_by_step[step_idx]
+        if seed:
+            z_prev = z_prev + self._perturb_std * _seeded_noise(
+                z_prev, traj.video_id, step_idx, seed
+            )
+        T = traj.num_total_steps
+        t = T - step_idx
+        t_now = torch.full((z_prev.shape[0],), sigma_from_step(t, T), device=z_prev.device)
+        t_next = torch.full((z_prev.shape[0],), sigma_from_step(t - 1, T), device=z_prev.device)
+        out = self._backbone.denoise(
+            z_prev, t_now, traj.cond, grid=traj.grid, active_mask=None, cache=None
+        )
+        z_full = self._backbone.scheduler_step(out.cache.model_output, t_now, t_next, z_prev)
+
+        entry = (z_prev, z_full)
+        self._entries[key] = entry
+        return entry
 
 
 class COCFDataGenerator:
@@ -501,7 +582,7 @@ class COCFDataGenerator:
         action_cost: Tuple[float, ...] = ACTION_COST,
         seeds_per_prompt: int = 1,
         perturb_std: float = 0.02,
-        free_memory_every: int = 8,
+        free_memory_every: int = 0,
     ):
         self.metric_extractor = metric_extractor
         self.strength_builder = strength_feature_builder
@@ -553,6 +634,7 @@ class COCFDataGenerator:
         feats_full = self.damage_computer.reference_features(
             traj.video_full, traj.prompt, tube_masks=tube_masks
         )
+        step_cache = _FullStepCache(traj, backbone, self.perturb_std)
 
         for step_idx, ti, a in self._balanced_triplets(
             steps, tube_idx_sel, actions, max_samples
@@ -564,9 +646,10 @@ class COCFDataGenerator:
             state = traj.tube_states[tid]
             feats = traj.strength_feats[tid]
             action = Action(a)
-            damage, unc, cost, y_cf, per_axis = self._counterfactual_labels(
+            damage, unc, cost, y_cf, per_axis, residual = self._counterfactual_labels(
                 traj, step_idx, tube, action, backbone, transition,
                 feats_full=feats_full, tube_mask=tube_masks.get(tid),
+                step_cache=step_cache,
             )
             samples.append(
                 COCFTrainingSample(
@@ -588,7 +671,7 @@ class COCFDataGenerator:
                     interaction_density=float(min(max(state.interaction, 0.0), 1.0)),
                     strength_level=int(self._strength_level(feats)),
                     step_frac=float(step_frac),
-                    skip_residual=float(getattr(self, "_last_residual", 0.0)),
+                    skip_residual=float(residual),
                     tube_token_count=int(tube.size),
                     tube_pixels=self._count_tube_pixels(tube),
                     tube_stability=float(state.identity_confidence),
@@ -614,29 +697,43 @@ class COCFDataGenerator:
         """``(step_idx, tube_idx, action)`` triplets ordered so truncation stays balanced.
 
         The generator can only afford ``max_samples`` rollouts per clip, and the order
-        in which candidates are visited therefore *is* the sampling design. Nested
-        loops with an inner ``break`` visit the whole (tube × action) grid of the first
-        representative step before reaching the second, so a cap of 15 against 4 tubes ×
-        4 actions = 16 candidates per step drew **every** sample from the earliest step
-        (§P1-5). The predictor then saw one denoising phase while inference asks it to
-        decide on all of them, leaving ``step_frac`` a constant it cannot use.
+        in which candidates are visited therefore *is* the sampling design. It has to
+        stay balanced across three axes at once, because a prefix that neglects any one
+        of them costs the predictor an input it is asked to condition on at inference.
 
-        Interleaving across steps first — one triplet from each step per round, cycling
-        actions before tubes — makes any prefix of the sequence balanced: steps differ
-        by at most one sample, and actions are evenly spread inside each step.
+        Nested loops with an inner ``break`` visited the whole (tube × action) grid of
+        the first representative step before reaching the second, so a cap of 15 against
+        4 tubes × 4 actions drew every sample from the earliest step (§P1-5) and left
+        ``step_frac`` a constant. Interleaving across steps fixed that but made ``ti``
+        the outer loop of each step's candidate list, which merely moved the imbalance
+        onto the tube axis.
+
+        Candidates are therefore enumerated **round by round**: round ``r`` pairs tube
+        ``i`` with action ``(i + r) mod n_a``. Each round covers every tube exactly
+        once and walks a different diagonal of the (tube × action) grid, so the first
+        ``n_t`` candidates hit distinct tubes *and* distinct actions, ``n_a`` rounds
+        cover every action, and no ``(tube, action)`` pair can repeat — for *any*
+        ``n_t``, not only the square case. The previous formula indexed the action by
+        ``(j % n_a + j // n_t) % n_a``, which degenerates whenever ``n_t`` and ``n_a``
+        share no useful stride: at ``n_t = 3`` it emitted three distinct pairs across
+        twelve slots and never produced ANCHOR at all, so every clip that segmented an
+        odd number of tubes silently contributed no ANCHOR label while paying for four
+        duplicate rollouts.
         """
-        per_step: Dict[int, List[Tuple[int, int, int]]] = {}
-        for s in steps:
-            # actions vary fastest so a short prefix still covers all four
-            per_step[s] = [(s, ti, a) for ti in tube_idx_sel for a in actions]
+        n_t, n_a = len(tube_idx_sel), len(actions)
+        if not n_t or not n_a:
+            return []
+        candidates = [
+            (tube_idx_sel[i], actions[(i + r) % n_a])
+            for r in range(n_a)
+            for i in range(n_t)
+        ]
         out: List[Tuple[int, int, int]] = []
-        for round_i in range(max(len(v) for v in per_step.values()) if per_step else 0):
+        for ti, a in candidates:
             for s in steps:
-                bucket = per_step[s]
-                if round_i < len(bucket):
-                    out.append(bucket[round_i])
-                    if len(out) >= max_samples:
-                        return out
+                out.append((s, ti, a))
+                if len(out) >= max_samples:
+                    return out
         return out
 
     # ------------------------------------------------------------------ #
@@ -652,34 +749,40 @@ class COCFDataGenerator:
         backbone: BackboneAdapter,
         transition: TransitionExecutor,
         *,
+        step_cache: "_FullStepCache",
         feats_full: Optional[VideoFeatures] = None,
         tube_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float]]:
-        """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis)``.
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float], float]:
+        """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis, δ)``.
 
         FULL is the reference: zero damage by construction (no local modification),
         so its label is exact and needs no rollout. Skip actions roll out
         ``seeds_per_prompt`` times (small seeded perturbations of ``z_t``) so the
-        per-axis variance is the §1.5 multi-seed uncertainty label.
+        per-axis variance is the §1.5 multi-seed uncertainty label; ``δ`` is the mean
+        skip residual over those seeds, which is what the certificate's λ_res term is
+        calibrated against.
 
         ``feats_full`` is the caller's hoisted reference-feature extraction (all
-        rollouts of a trajectory compare against the same ``traj.video_full``).
+        rollouts of a trajectory compare against the same ``traj.video_full``);
+        ``step_cache`` is its counterpart on the latent side, supplying the dense
+        advance every rollout at this step shares.
         """
         cost = self._cost_label(action, transition)
-        self._last_residual = 0.0
         if action == Action.FULL:
             zero = torch.zeros(NUM_DAMAGE_DIMS)
-            return zero, zero.clone(), cost, traj.video_full, {ax: 0.0 for ax in DAMAGE_DIMENSIONS}
+            return (zero, zero.clone(), cost, traj.video_full,
+                    {ax: 0.0 for ax in DAMAGE_DIMENSIONS}, 0.0)
 
-        z_t = traj.z_by_step[step_idx]
         dmgs: List[Tensor] = []
+        residuals: List[float] = []
         y_cf0: Optional[Tensor] = None
         per_axis0: Dict[str, float] = {}
         for k in range(self.seeds_per_prompt):
-            z0 = z_t if k == 0 else z_t + self.perturb_std * self._seeded_noise(
-                z_t, traj.video_id, step_idx, tube.tube_id, int(action), k
+            z_prev, z_full = step_cache.get(step_idx, k)
+            y_cf, residual = self._rollout(
+                z_prev, z_full, step_idx, tube, action, traj, backbone, transition
             )
-            y_cf = self._rollout(z0, step_idx, tube, action, traj, backbone, transition)
+            residuals.append(residual)
             dmg, per_axis = self.damage_computer.compute_damage(
                 traj.video_full, y_cf, traj.prompt, tube_mask,
                 tube_id=tube.tube_id, feats_full=feats_full,
@@ -701,33 +804,35 @@ class COCFDataGenerator:
         D = torch.stack(dmgs)                                  # [seeds, 8]
         damage = D.mean(0).clamp(0, 1)
         uncertainty = D.var(0, unbiased=False) if self.seeds_per_prompt > 1 else torch.zeros_like(damage)
-        return damage, uncertainty, cost, y_cf0, per_axis0
+        return (damage, uncertainty, cost, y_cf0, per_axis0,
+                sum(residuals) / max(1, len(residuals)))
 
     def _rollout(
         self,
-        z_t: Tensor,
+        z_prev: Tensor,
+        z_full: Tensor,
         step_idx: int,
         tube: SemanticTube,
         action: Action,
         traj: TeacherTrajectory,
         backbone: BackboneAdapter,
         transition: TransitionExecutor,
-    ) -> Tensor:
-        """Apply the action at step ``t`` then continue all-FULL to ``z_0`` → ``Y_cf``."""
+    ) -> Tuple[Tensor, float]:
+        """Apply the action at step ``t`` then continue all-FULL to ``z_0`` → ``Y_cf``.
+
+        Returns the decoded clip and the skip residual ``δ_k`` measured on the tube's
+        tokens at the intervened step — exactly the quantity RAEC's certificate weights
+        with λ_res at inference, so Stage B can calibrate that coefficient against a
+        real signal (§P1-13).
+
+        ``z_prev``/``z_full`` are the step's shared pre- and post-advance latents
+        (:class:`_FullStepCache`); both are treated as read-only here.
+        """
         grid, cond, T = traj.grid, traj.cond, traj.num_total_steps
-        device = z_t.device
-        t = T - step_idx
-        t_now = torch.full((z_t.shape[0],), sigma_from_step(t, T), device=device)
-        t_next = torch.full((z_t.shape[0],), sigma_from_step(t - 1, T), device=device)
-        # dense full-compute step at the intervention timestep (the FULL reference advance)
-        out = backbone.denoise(z_t, t_now, cond, grid=grid, active_mask=None, cache=None)
-        z_full = backbone.scheduler_step(out.cache.model_output, t_now, t_next, z_t)
-        z = self._apply_action_to_tube(z_full, z_t, tube, action, grid, transition)
-        # δ_k at the intervened step: exactly the quantity RAEC's certificate weights
-        # with λ_res at inference. Measuring it here gives Stage B a real signal to
-        # calibrate that coefficient against (§P1-13).
+        device = z_full.device
+        z = self._apply_action_to_tube(z_full, z_prev, tube, action, grid, transition)
         idx = tube.all_token_indices().to(z.device)
-        self._last_residual = float(
+        residual = float(
             (z_full.index_select(1, idx) - z.index_select(1, idx))
             .pow(2).mean().sqrt().item()
         ) if idx.numel() else 0.0
@@ -737,7 +842,7 @@ class COCFDataGenerator:
             tn = torch.full((z.shape[0],), sigma_from_step(ts, T), device=device)
             tnn = torch.full((z.shape[0],), sigma_from_step(ts - 1, T), device=device)
             z = backbone.full_transition(z, tn, tnn, cond, grid=grid).model_output
-        return _frames_fchw(backbone.decode_latent(backbone.to_grid(z, grid)))
+        return _frames_fchw(backbone.decode_to_unit(backbone.to_grid(z, grid))), residual
 
     def _apply_action_to_tube(
         self,
@@ -849,22 +954,13 @@ class COCFDataGenerator:
         return StrengthLevel.LOW
 
     @staticmethod
-    def _seeded_noise(like: Tensor, *keys) -> Tensor:
-        """Deterministic Gaussian like ``like`` — reproducible per (clip,step,tube,...).
-
-        Seeds from a *stable* hash of the keys, not Python's ``hash()`` (which is
-        salted per process via ``PYTHONHASHSEED`` for string keys like ``video_id``),
-        so the multi-seed perturbations — hence the §1.5 uncertainty labels — are
-        byte-identical across runs, processes and shards.
-        """
-        digest = hashlib.sha1("|".join(map(str, keys)).encode("utf-8")).hexdigest()
-        seed = int(digest[:8], 16)
-        g = torch.Generator().manual_seed(seed)
-        return torch.randn(like.shape, generator=g).to(like.device, like.dtype)
-
-    @staticmethod
     def _count_tube_pixels(tube: SemanticTube) -> int:
-        """Total latent-mask area spanned by the tube across its frames."""
-        if not tube.masks_by_frame:
+        """Total latent-mask area spanned by the tube across its frames.
+
+        Reduced in one op: the per-frame ``int(m.sum())`` this replaces forced a
+        device sync per frame, ~50 of them per sample on a GPU run.
+        """
+        masks = [m for m in tube.masks_by_frame.values() if m is not None]
+        if not masks:
             return 0
-        return int(sum(int(m.sum()) for m in tube.masks_by_frame.values()))
+        return int(torch.stack([m.sum() for m in masks]).sum())

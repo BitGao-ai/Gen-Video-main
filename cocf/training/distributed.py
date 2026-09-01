@@ -35,15 +35,23 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Iterable, Optional, Sequence
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from cocf.common.logging import get_logger
 
 Tensor = torch.Tensor
 _log = get_logger(__name__)
+
+# Ceiling on how long a rank waits inside a collective before the backend gives up.
+# The default is 30 minutes, which is how a job whose rank 3 died on an OOM keeps
+# eight cards at 100% utilisation for half an hour with nothing in the log. A Stage-C
+# step is minutes long, so this is comfortably above any legitimate skew.
+_COLLECTIVE_TIMEOUT = timedelta(minutes=15)
 
 __all__ = [
     "DistContext",
@@ -53,6 +61,7 @@ __all__ = [
     "resolve_device",
     "average_gradients",
     "broadcast_parameters",
+    "all_agree",
     "all_reduce_mean",
     "all_reduce_min",
     "assert_same",
@@ -140,11 +149,13 @@ def init_distributed(device: str = "cuda") -> DistContext:
         # current device to LOCAL_RANK there would leave every implicit allocation —
         # NCCL's buffers included — on a card this rank does not compute on.
         torch.cuda.set_device(_device_index(device, local_rank))
-    dist.init_process_group(backend="nccl" if use_cuda else "gloo")
+    dist.init_process_group(backend="nccl" if use_cuda else "gloo",
+                            timeout=_COLLECTIVE_TIMEOUT)
     ctx = context()
     _log.info(
-        "distributed: rank %d/%d (local_rank %d) on %s backend",
+        "distributed: rank %d/%d (local_rank %d) on %s backend, collective timeout %s",
         ctx.rank, ctx.world_size, ctx.local_rank, "nccl" if use_cuda else "gloo",
+        _COLLECTIVE_TIMEOUT,
     )
     return ctx
 
@@ -180,16 +191,27 @@ def average_gradients(params: Sequence[torch.nn.Parameter],
     alignment term) is given an explicit zero first. Skipping it instead would make
     ranks disagree about *which* tensors take part in the collective, and a mismatched
     all-reduce order does not error — it hangs.
+
+    The gradients are flattened into one buffer for the collective. The payload is the
+    same ~28 MB either way, but Stage B's step is milliseconds long, so paying one
+    NCCL launch instead of one per tensor is the difference between communication
+    being free and being the bottleneck.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
         return
-    scale = 1.0 / ctx.world_size
+    grads = []
     for p in params:
         if p.grad is None:
             p.grad = torch.zeros_like(p)
-        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        p.grad.mul_(scale)
+        grads.append(p.grad)
+    if not grads:
+        return
+    flat = _flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.mul_(1.0 / ctx.world_size)
+    for g, reduced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+        g.copy_(reduced)
 
 
 def broadcast_parameters(tensors: Iterable[Tensor],
@@ -286,3 +308,22 @@ def all_reduce_mean(value: float, ctx: Optional[DistContext] = None,
     if not ctx.enabled or ctx.world_size == 1:
         return float(value)
     return float(_reduced(value, dist.ReduceOp.SUM, ctx, device).item() / ctx.world_size)
+
+
+def all_agree(ok: bool, ctx: Optional[DistContext] = None,
+              device: Optional[torch.device] = None) -> bool:
+    """``True`` only when **every** rank passed ``ok=True``.
+
+    The counterpart to :func:`assert_same` for failures that are local by nature: a
+    per-clip OOM, a reference whose geometry does not match, an unreadable baseline.
+    Such a rank cannot simply skip its batch — the others would block forever in the
+    next gradient all-reduce — and it cannot raise either, for the same reason. Turning
+    the local outcome into a shared one lets all ranks skip the batch *together*,
+    keeping the collective sequence identical.
+
+    This is itself a collective, so it must be called unconditionally by every rank.
+    """
+    ctx = ctx or context()
+    if not ctx.enabled or ctx.world_size == 1:
+        return bool(ok)
+    return _reduced(1.0 if ok else 0.0, dist.ReduceOp.MIN, ctx, device).item() > 0.0

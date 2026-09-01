@@ -62,10 +62,16 @@ _SWAP_WARN_AFTER = 32
 #: of different token geometry. ``a14b-t2v`` is the documented primary (dual-expert MoE
 #: + the Wan2.1 VAE, nothing to set); ``ti2v-5b`` is single-expert with the
 #: high-compression VAE.
+#:
+#: ``flow_shift`` is the upstream rectified-flow schedule shift (see
+#: :meth:`DiffusersVideoBackbone.model_sigma`). It is part of the *variant*, not of the
+#: run, because it decides both the sampled trajectory and where the MoE noise boundary
+#: falls; ``--flow-shift`` overrides it for a deliberate experiment.
 WAN22_VARIANTS: Dict[str, Dict[str, Any]] = {
-    "a14b-t2v": {},
-    "a14b-i2v": {"boundary_ratio": 0.900},
-    "ti2v-5b": {"boundary_ratio": None, "vae_compress": [4, 16, 16], "latent_channels": 48},
+    "a14b-t2v": {"flow_shift": 5.0},
+    "a14b-i2v": {"boundary_ratio": 0.900, "flow_shift": 5.0},
+    "ti2v-5b": {"boundary_ratio": None, "vae_compress": [4, 16, 16],
+                "latent_channels": 48, "flow_shift": 5.0},
 }
 
 
@@ -390,7 +396,7 @@ class Wan22Backbone(Wan21Backbone):
     def _run_transformer(
         self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
-        timestep = (t.to(self.device) * 1000.0).flatten()
+        timestep = (self.model_sigma(t.to(self.device)) * 1000.0).flatten()
         expert = self._expert_for(timestep)
         out = expert(  # type: ignore[misc]
             hidden_states=latent_grid,

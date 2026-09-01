@@ -13,6 +13,11 @@ Usage:
     python scripts/train/train_stage_b.py \
         --processed-root ./LCOCF_OpenVid1M_Processed \
         --checkpoint_load ./checkpoints/after_stage_a.pt
+
+Data-parallel (one process per GPU); each rank owns a stride of every action bucket,
+so the 1:1:1:1 balance holds per rank and the gradients are averaged every step::
+
+    torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_b.py ...
 """
 
 import argparse
@@ -26,6 +31,9 @@ from cocf.common.logging import get_logger, setup_logging
 from cocf.core.accelerator import Accelerator
 from cocf.training.checkpoint import load_checkpoint
 from cocf.data import CounterfactualLMDBDataset, ProcessedLayout
+from cocf.training.distributed import init_distributed
+from cocf.training.distributed import resolve_device as dist_device
+from cocf.training.distributed import shutdown as dist_shutdown
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 
 # Repo root (…/pro_011). Anchors the default processed-store path so the script runs
@@ -175,23 +183,31 @@ def main():
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
-    setup_logging(level=logging.INFO)
+    # Join the process group first: it pins this rank's CUDA device before any weight
+    # is built, and settles which rank narrates. A run not launched under torchrun gets
+    # a disabled context and behaves exactly as a single process always did.
+    dctx = init_distributed(args.device)
+    args.device = dist_device(args.device, dctx)
+
+    setup_logging(level=logging.INFO if dctx.is_main else logging.WARNING)
     # setup_logging attaches the stdout handler to the "cocf" logger and sets
     # propagate=False, so a bare getLogger("__main__") would emit nothing at
     # INFO — this script's own progress lines included.
     log = get_logger("cocf.stage_b")
+    # The *same* seed on every rank: the replicas must start from identical weights,
+    # and the data is split by the sampler rather than by diverging RNG streams.
     torch.manual_seed(args.seed)
 
     # Fail fast (with a precise message) if Stage A never finished writing the store.
     layout = ProcessedLayout(args.processed_root)
     _preflight(layout, log)
 
-    # The action-balanced sampler drops the last partial batch (drop_last=True), so a
-    # batch larger than the whole train split yields zero batches and trains nothing.
-    n_train = len(layout.read_split("train"))
+    # The action-balanced sampler drops the last partial batch, so a batch larger than
+    # this rank's shard of the train split yields zero batches and trains nothing.
+    n_train = len(layout.read_split("train")) // max(1, dctx.world_size)
     batch_size = args.batch_size
     if batch_size > n_train:
-        log.warning("batch_size %d > %d train samples; clamping to %d.",
+        log.warning("batch_size %d > %d train samples per rank; clamping to %d.",
                     batch_size, n_train, n_train)
         batch_size = max(1, n_train)
 
@@ -234,9 +250,14 @@ def main():
     stage_b = JointTrainingStage(accelerator=accelerator, config=stage_b_config)
     accelerator = stage_b.run()
 
-    args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(accelerator.state_dict(), args.checkpoint_save)
-    log.info("Saved checkpoint to %s", args.checkpoint_save)
+    # One writer: the ranks hold identical weights (gradients are averaged every step),
+    # so rank 0's copy *is* the model — and eight processes writing one path is a
+    # corrupt file, not a redundant one.
+    if dctx.is_main:
+        args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(accelerator.state_dict(), args.checkpoint_save)
+        log.info("Saved checkpoint to %s", args.checkpoint_save)
+    dist_shutdown()
 
 
 if __name__ == "__main__":

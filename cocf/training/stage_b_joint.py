@@ -43,6 +43,13 @@ from cocf.data import (
     timestep_stratum,
 )
 from cocf.lcocf.predictor import build_predictor_input_batch
+from cocf.training.distributed import (
+    all_reduce_mean,
+    assert_same,
+    average_gradients,
+    broadcast_parameters,
+    context as dist_context,
+)
 from cocf.training.stage_b_losses import (
     action_probs,
     compute_joint_loss,
@@ -84,10 +91,14 @@ class JointTrainingStage:
         self.device = config.device
         self.train_cfg = config.config.training
         self.layout = ProcessedLayout(config.processed_root)
+        # Data-parallel context, derived from torch.distributed's own state: a plain
+        # single-process run gets a disabled context and every collective below is a
+        # no-op (cocf.training.distributed).
+        self.dctx = dist_context()
 
         # Freeze the backbone (the adapter's weights live on `.module`); only the
         # plugins remain trainable. Done here so the freezing is provable without
-        # running the loop (tested by tests/integration/test_pipeline.py).
+        # running the loop.
         self.accelerator.freeze_backbone()
         self.accelerator.to(self.device)
 
@@ -143,11 +154,14 @@ class JointTrainingStage:
             sampler = StratifiedBatchSampler(
                 actions, scenes, strata,
                 batch_size=self.config.batch_size, seed=self.config.config.seed,
+                rank=self.dctx.rank, world_size=self.dctx.world_size,
             )
             return DataLoader(
                 dataset, batch_sampler=sampler, num_workers=self.config.num_workers,
                 collate_fn=collate_cocf_samples,
             )
+        # Validation is scored on the *whole* split by every rank and then reduced, so
+        # it is not sharded: the metric each rank reports must describe the same data.
         return DataLoader(
             dataset, batch_size=self.config.batch_size, shuffle=False,
             num_workers=self.config.num_workers, collate_fn=collate_cocf_samples,
@@ -160,7 +174,8 @@ class JointTrainingStage:
     def run(self) -> Accelerator:
         """Execute Stage B and return the trained accelerator."""
         _log.info("=== Stage B: Joint Module Training (§4.1) ===")
-        self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if self.dctx.is_main:
+            self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         train_loader = self._build_loader("train", stratified=True)
         if train_loader is None:
@@ -171,6 +186,19 @@ class JointTrainingStage:
         val_loader = self._build_loader("val", stratified=False)
         _log.info("Stage B: %d train batches%s", len(train_loader),
                   f", {len(val_loader)} val batches" if val_loader else " (no val split)")
+
+        if self.dctx.enabled:
+            # Before the first collective: average_gradients walks this exact list and
+            # the epoch loop performs one all-reduce per batch, so a rank that disagrees
+            # on either length would not error — it would hang.
+            assert_same(len(self.trainable_params), "trainable-parameter count", self.dctx)
+            assert_same(len(train_loader), "batches per epoch", self.dctx)
+            n = broadcast_parameters(
+                list(self.trainable_params) + list(self.accelerator.buffers()), self.dctx
+            )
+            _log.info("Stage B: rank %d/%d, %d batches per epoch; %d tensor(s) synced "
+                      "from rank 0", self.dctx.rank, self.dctx.world_size,
+                      len(train_loader), n)
 
         sampler = train_loader.batch_sampler
         opt = self.train_cfg.optim
@@ -184,6 +212,7 @@ class JointTrainingStage:
                 sampler.set_epoch(epoch)
             running: Dict[str, float] = {}
             n_batches = 0
+            n_text_missing = 0
 
             for batch_idx, batch in enumerate(train_loader):
                 global_step += 1
@@ -195,16 +224,21 @@ class JointTrainingStage:
                     total, comps = compute_joint_loss(
                         self.accelerator, batch, training_cfg=self.train_cfg
                     )
+                n_text_missing += int(batch.get("text_missing", 0) or 0)
                 self.optimizer.zero_grad(set_to_none=True)
                 max_norm = self.config.config.memory.max_grad_norm
                 if self.scaler is not None:
                     self.scaler.scale(total).backward()
                     self.scaler.unscale_(self.optimizer)
+                    # Average across ranks *before* clipping, so every rank clips the
+                    # same gradient and therefore takes an identical step.
+                    average_gradients(self.trainable_params, self.dctx)
                     torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     total.backward()
+                    average_gradients(self.trainable_params, self.dctx)
                     torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm)
                     self.optimizer.step()
 
@@ -216,28 +250,49 @@ class JointTrainingStage:
                               epoch + 1, self.config.num_epochs, batch_idx, len(train_loader),
                               comps["total"], self._fmt(comps))
 
-            avg = {k: v / max(1, n_batches) for k, v in running.items()}
+            avg = {k: self._reduce(v / max(1, n_batches)) for k, v in running.items()}
             _log.info("epoch %d done  avg_total=%.4f", epoch + 1, avg.get("total", 0.0))
+            if n_text_missing:
+                _log.warning(
+                    "epoch %d: %d sample(s) had no prompt embedding, so their CMSC "
+                    "terms contributed nothing. Check text_embeds/ against the train "
+                    "split.", epoch + 1, n_text_missing,
+                )
 
             # --- validation & early stopping (§4.1) --------------------- #
-            monitor = avg.get("total", float("inf"))
-            if val_loader is not None and (epoch + 1) % self.train_cfg.val_every_epochs == 0:
+            # One monitored quantity for the whole run: mixing the training total with
+            # the validation MAE (they differ by an order of magnitude) made every
+            # non-validation epoch score as "no improvement" and tripped the patience
+            # counter on a run that was still converging.
+            if val_loader is not None:
+                if (epoch + 1) % self.train_cfg.val_every_epochs != 0:
+                    continue
                 metrics = self._validate(val_loader)
                 _log.info("  val  %s", self._fmt(metrics))
                 monitor = metrics["mae"]
+            else:
+                monitor = avg.get("total", float("inf"))
+
             if monitor < best_metric - 1e-5:
                 best_metric = monitor
                 epochs_no_improve = 0
-                torch.save(self.accelerator.state_dict(), self.config.checkpoint_dir / "stage_b_best.pt")
+                if self.dctx.is_main:
+                    torch.save(self.accelerator.state_dict(),
+                               self.config.checkpoint_dir / "stage_b_best.pt")
                 _log.info("  new best (%.4f) → stage_b_best.pt", best_metric)
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= self.train_cfg.early_stop_patience:
-                    _log.info("early stop after %d epochs without improvement", epochs_no_improve)
+                    _log.info("early stop after %d evaluations without improvement",
+                              epochs_no_improve)
                     break
 
         _log.info("Stage B training complete (best=%.4f)", best_metric)
         return self.accelerator
+
+    def _reduce(self, value: float) -> float:
+        """Mean of a per-rank scalar across the job (identity when single-process)."""
+        return all_reduce_mean(value, self.dctx, device=torch.device(self.device))
 
     # ------------------------------------------------------------------ #
     # validation metrics (§4.1: MAE / cert-violation / budget-hit / smoothness)
@@ -286,10 +341,10 @@ class JointTrainingStage:
 
         n = max(1, n)
         return {
-            "mae": abs_err / n,
-            "cert_violation": cert_viol / n,
-            "budget_hit": budget_hit / n,
-            "smoothness": smooth / n,
+            "mae": self._reduce(abs_err / n),
+            "cert_violation": self._reduce(cert_viol / n),
+            "budget_hit": self._reduce(budget_hit / n),
+            "smoothness": self._reduce(smooth / n),
         }
 
     @staticmethod

@@ -28,6 +28,14 @@ import torch
 
 from cocf.common.config import Config
 from cocf.common.logging import get_logger, setup_logging
+from cocf.common.vram import (
+    add_backbone_args,
+    add_geometry_args,
+    apply_geometry,
+    apply_wan_variant,
+    is_real_gpu_backbone,
+    resolve_vram_policy,
+)
 from cocf.core.accelerator import Accelerator
 from cocf.data.video_writer import save_video
 from cocf.engine import InferenceEngine
@@ -43,10 +51,6 @@ QUALITY_B_MIN = {"fast": 0.30, "balanced": 0.50, "quality": 0.80}
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Accelerated video inference (§7.2)")
     p.add_argument("--prompt", type=str, required=True, help="Text prompt")
-    p.add_argument("--backbone", type=str, default="mock",
-                   help="Registry key: mock | wan22 | wan21 | hunyuanvideo")
-    p.add_argument("--model-path", "--model_path", dest="model_path", type=str,
-                   help="Weights path for a real backbone (unused by 'mock')")
     p.add_argument("--checkpoint", type=Path,
                    help="Trained accelerator checkpoint (Stage B or C). Optional: "
                         "without it the plugins run at their cold-start init.")
@@ -54,11 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quality", choices=sorted(QUALITY_B_MIN), default="balanced",
                    help=f"Compute-budget floor b_min: {QUALITY_B_MIN}")
     p.add_argument("--steps", type=int, help="Override num inference steps")
-    p.add_argument("--num-frames", "--num_frames", dest="num_frames", type=int,
-                   help="Frames to generate (default: config.data.num_frames)")
-    p.add_argument("--height", type=int, help="Frame height (default: config.data.height)")
-    p.add_argument("--width", type=int, help="Frame width (default: config.data.width)")
     p.add_argument("--fps", type=int, default=16, help="Frame rate of the written file")
+    # Backbone selection, §9.1 residency and render geometry come from the shared
+    # helpers, so a render reproduces what Stage A/C were configured with rather than
+    # silently falling back to BackboneConfig's defaults (cocf/common/vram.py).
+    add_backbone_args(p, default_backbone="mock", default_wan_variant="ti2v-5b",
+                      default_vae_tile=128)
+    add_geometry_args(p)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -82,18 +88,21 @@ def main():
     config.seed = args.seed
     config.backbone.name = args.backbone
     config.backbone.device = args.device
+    config.backbone.dtype = args.backbone_dtype
     if args.model_path:
         config.backbone.model_path = args.model_path
+    # Same resolution order as Stage A/C: residency policy, then the variant's
+    # geometry/MoE keys, then the render geometry (validated).
+    real_gpu_backbone = is_real_gpu_backbone(args)
+    resolve_vram_policy(config, args, real_gpu_backbone)
+    apply_wan_variant(config, args)
+    frames, height, width = apply_geometry(config, args)
 
     # --quality sets the budget floor (§7.3), matching the documented semantics.
     config.budget.b_min = QUALITY_B_MIN[args.quality]
     config.budget.b_max = max(config.budget.b_max, config.budget.b_min)
     if args.steps:
         config.engine.num_inference_steps = args.steps
-
-    frames = args.num_frames or config.data.num_frames
-    height = args.height or config.data.height
-    width = args.width or config.data.width
 
     # -- accelerator & engine --------------------------------------------- #
     accelerator = Accelerator.from_config(config)

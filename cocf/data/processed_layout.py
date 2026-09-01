@@ -185,10 +185,10 @@ class ProcessedLayout:
         self,
         video_id,
         *,
-        text_emb: Tensor,
         z_t_by_step: Mapping[int, Tensor],
         y_full: Tensor,
         z_init: Optional[Tensor] = None,
+        text_emb: Optional[Tensor] = None,
         kv_cache: Optional[Mapping[str, Tensor]] = None,
         y_full_dtype: Optional[np.dtype] = np.float16,
     ) -> Path:
@@ -201,10 +201,16 @@ class ProcessedLayout:
         the half-precision round trip is below the noise floor of the comparison. The
         latents (``z_t``, ``z_init``) stay fp32: those *are* re-entered, and Stage C's
         cached-baseline path is only valid if the noise it replays is bit-comparable.
+
+        ``text_emb`` is optional and off by default: the prompt embedding is per-clip
+        data and lives in ``text_embeds/<video_id>.pt``, trimmed to its real length and
+        in fp16 (see :attr:`text_embed_dir`). Writing the untrimmed fp32 sequence here
+        as well duplicated ~8 MiB per clip that nothing ever read.
         """
         bucket = self.baseline_bucket(video_id)
         (bucket / "z_t_sampled").mkdir(parents=True, exist_ok=True)
-        _save_npy(bucket / "text_emb.npy", text_emb)
+        if text_emb is not None:
+            _save_npy(bucket / "text_emb.npy", text_emb, dtype=np.float16)
         for step, z in z_t_by_step.items():
             _save_npy(bucket / "z_t_sampled" / f"t_{int(step):02d}.npy", z)
         _save_npy(bucket / "Y_full.npy", y_full, dtype=y_full_dtype)
@@ -305,16 +311,27 @@ class ProcessedLayout:
 
     def write_csv(self, path: Path, rows: Sequence[Mapping[str, object]],
                   fieldnames: Optional[Sequence[str]] = None) -> Path:
-        """Write a list-of-dicts to ``path`` as CSV (fieldnames inferred if absent)."""
+        """Write a list-of-dicts to ``path`` as CSV (fieldnames inferred if absent).
+
+        Published by an atomic rename, so a concurrent reader sees either the previous
+        file or the complete new one — never a half-written prefix. The workers of a
+        sharded Stage-A run poll ``filtered_final.csv`` to pick up shard 0's filter
+        decision, and a large CSV spends a long time being partially on disk.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = list(rows)
         if fieldnames is None:
             fieldnames = list(rows[0].keys()) if rows else []
-        with open(path, "w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(fieldnames))
-            w.writeheader()
-            for r in rows:
-                w.writerow({k: r.get(k, "") for k in fieldnames})
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(fieldnames))
+                w.writeheader()
+                for r in rows:
+                    w.writerow({k: r.get(k, "") for k in fieldnames})
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
         return path
 
     @staticmethod

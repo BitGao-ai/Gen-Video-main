@@ -30,6 +30,7 @@ import torch
 from cocf.backbones.wan22 import WAN22_VARIANTS
 from cocf.common.config import Config
 from cocf.common.memory import resolve_dtype
+from cocf.data.metrics import DEFAULT_FLOW_MAX_EDGE, DEFAULT_VIT_CHUNK
 
 _log = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ def add_backbone_args(
                         "checkpoint — the adapter raises at load if it does not.")
     g.add_argument("--backbone-dtype", type=str, default="bfloat16",
                    help="Compute dtype for the frozen backbone (bfloat16|float16|float32)")
+    g.add_argument("--flow-shift", type=float, default=None,
+                   help="Override the variant's rectified-flow schedule shift. The "
+                        "shift decides how the step budget is spread over noise levels "
+                        "and (on a Wan2.2 MoE) where the expert boundary falls, so it "
+                        "must match between Stage A and Stage C; 1.0 is the uniform "
+                        "schedule.")
 
     v = parser.add_argument_group("VRAM residency (§9.1)")
     v.add_argument("--no-offload", dest="offload", action="store_false",
@@ -161,13 +168,29 @@ def add_perception_args(
                    help="Weight dtype for DINOv2/CLIP/SAM (float32|bfloat16|float16). "
                         "RAFT stays fp32 regardless — its all-pairs correlation volume "
                         "is numerically fragile at half precision.")
+    g.add_argument("--raft-weights", type=str, default=None,
+                   help="Local RAFT checkpoint (.pth). Without it torchvision fetches "
+                        "its DEFAULT weights over the network, which an offline host "
+                        "cannot do — and a missing RAFT zeroes motion_phase, hence the "
+                        "causal action strength s_A. Under --real-models an "
+                        "unavailable RAFT is a hard failure, not a silent fallback.")
     g.add_argument("--enable-ocr", action="store_true",
                    help="Add the easyocr OCR-fidelity term to the real metric extractor.")
     g.add_argument("--metric-frame-chunk", type=int, default=default_frame_chunk,
-                   help="Frames (and frame pairs) per forward in the real metric "
-                        "extractor. Bounds the RAFT correlation volume. "
-                        f"Default {default_frame_chunk}; lower to 2 or 1 if the damage "
-                        "pass OOMs.")
+                   help="Frame PAIRS per RAFT forward in the real metric extractor. "
+                        "Bounds the correlation volume, the largest allocation in the "
+                        f"pass. Default {default_frame_chunk}; lower to 2 or 1 if the "
+                        "damage pass OOMs.")
+    g.add_argument("--metric-vit-chunk", type=int, default=DEFAULT_VIT_CHUNK,
+                   help="Frames per DINOv2/CLIP forward. These resize to 224 and hold "
+                        "no correlation volume, so they run far wider than RAFT; "
+                        f"default {DEFAULT_VIT_CHUNK}. Lower only on an OOM traced to "
+                        "the identity/appearance towers.")
+    g.add_argument("--metric-flow-max-edge", type=int, default=DEFAULT_FLOW_MAX_EDGE,
+                   help="Longest edge RAFT runs at; frames above it are downscaled. "
+                        "The flow damage axes are ratios against the reference's own "
+                        "scale, so a resolution both sides share cancels out. "
+                        f"Default {DEFAULT_FLOW_MAX_EDGE}; 0 disables the cap.")
 
 
 # --------------------------------------------------------------------------- #
@@ -248,12 +271,17 @@ def apply_wan_variant(config: Config, args) -> None:
     """Copy the variant's geometry/MoE keys into ``config.backbone.extra``.
 
     Only a ``wan*`` backbone reads these keys; other adapters ignore ``extra``, so this
-    is a no-op for a mock smoke run.
+    is a no-op for a mock smoke run. ``--flow-shift`` overrides the variant's schedule
+    shift and is applied last.
     """
     if getattr(args, "finalize_only", False):
         return
     if str(args.backbone).startswith("wan"):
         config.backbone.extra = dict(WAN22_VARIANTS[args.wan_variant])
+    shift = getattr(args, "flow_shift", None)
+    if shift is not None:
+        config.backbone.extra = {**(config.backbone.extra or {}),
+                                 "flow_shift": float(shift)}
 
 
 def build_perception_and_metrics(args, log):
@@ -263,12 +291,18 @@ def build_perception_and_metrics(args, log):
     ``Accelerator.from_config`` falls back to its mock. The metric extractor is built
     with ``share_from=perception`` so the DINOv2/CLIP pair is loaded once rather than
     twice (§P2-7).
+
+    ``--real-models`` means "every perception model is the real one", so it also makes
+    a missing RAFT fatal: the zero-flow fallback yields labels whose ``s_A`` and two
+    damage axes are constant, which is worse than not starting.
     """
     perception = None
     metric_extractor = None
     finalize_only = getattr(args, "finalize_only", False)
     want_perception = (args.real_perception or args.real_models) and not finalize_only
     want_metrics = (args.real_metrics or args.real_models) and not finalize_only
+    raft_weights = getattr(args, "raft_weights", None)
+    require_flow = bool(args.real_models) and not finalize_only
     dtype = resolve_dtype(args.perception_dtype)
     if dtype is torch.float32:
         dtype = None  # keep the checkpoints' own dtype (historical behaviour)
@@ -283,15 +317,23 @@ def build_perception_and_metrics(args, log):
             device=args.device, sam_model=args.sam_model,
             dino_name=args.dino_model, clip_name=args.clip_model,
             points_per_crop=args.sam_points_per_crop, dtype=dtype,
+            raft_weights=raft_weights, require_flow=require_flow,
         )
     if want_metrics:
         from cocf.data import ModelMetricExtractor
-        log.info("Loading real metric extractor (DINOv2+CLIP+RAFT%s) on %s, frame-chunk %d",
-                 " +OCR" if args.enable_ocr else "", args.device, args.metric_frame_chunk)
+        log.info("Loading real metric extractor (DINOv2+CLIP+RAFT%s) on %s, "
+                 "vit-chunk %d, raft pair-chunk %d @ max edge %d",
+                 " +OCR" if args.enable_ocr else "", args.device,
+                 args.metric_vit_chunk, args.metric_frame_chunk,
+                 args.metric_flow_max_edge)
         metric_extractor = ModelMetricExtractor.from_pretrained(
             device=args.device, dino_name=args.dino_model,
             clip_name=args.clip_model, enable_ocr=args.enable_ocr,
-            frame_chunk=args.metric_frame_chunk, share_from=perception, dtype=dtype,
+            frame_chunk=args.metric_frame_chunk,
+            vit_chunk=args.metric_vit_chunk,
+            flow_max_edge=args.metric_flow_max_edge,
+            share_from=perception, dtype=dtype,
+            raft_weights=raft_weights, require_flow=require_flow,
         )
     return perception, metric_extractor
 

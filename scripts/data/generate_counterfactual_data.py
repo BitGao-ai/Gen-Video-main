@@ -168,6 +168,10 @@ def main():
                              "trajectories. Only for a store that will not feed Stage C.")
     parser.add_argument("--no-tube-features", action="store_true",
                         help="Skip the §3 level-4 tube_causal_features bucket (small)")
+    parser.add_argument("--persist-step-latents", action="store_true",
+                        help="Also write the representative-step latents z_t into the "
+                             "baseline bucket (~3 MiB per step per clip). No stage reads "
+                             "them today; for offline analysis of the teacher trajectory.")
     # -- shard-parallel + resume (§1 embarrassingly parallel over clips) ------- #
     parser.add_argument("--num-shards", type=int, default=1,
                         help="Total parallel workers over the clip set. Launch N processes "
@@ -254,6 +258,7 @@ def main():
         persist_buckets=not args.no_buckets,
         persist_baseline=not args.no_baseline,
         persist_tube_features=not args.no_tube_features,
+        persist_step_latents=args.persist_step_latents,
         num_shards=args.num_shards,
         shard_index=args.shard_index,
         finalize_only=args.finalize_only,

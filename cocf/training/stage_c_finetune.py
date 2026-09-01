@@ -25,14 +25,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 
+from cocf.backbones.base import TextConditioning
 from cocf.common.config import Config
 from cocf.common.logging import get_logger
-from cocf.common.memory import set_gradient_checkpointing
+from cocf.common.memory import free_memory, set_gradient_checkpointing
 from cocf.common.types import Action, TubeState
 from cocf.core.accelerator import Accelerator
-from cocf.data import ProcessedLayout, RawFilteredDataset, collate_raw_filtered
+from cocf.data import (
+    HardSamplePrioritySampler,
+    ProcessedLayout,
+    RawFilteredDataset,
+    collate_raw_filtered,
+)
 from cocf.engine import InferenceEngine
 from cocf.lcocf.damage import (
     DAMAGE_DIMENSIONS,
@@ -42,6 +48,7 @@ from cocf.lcocf.damage import (
 )
 from cocf.training.checkpoint import build_checkpoint
 from cocf.training.distributed import (
+    all_agree,
     all_reduce_mean,
     all_reduce_min,
     assert_same,
@@ -63,12 +70,15 @@ Tensor = torch.Tensor
 _log = get_logger(__name__)
 
 # Activation headroom one Stage-C clip needs on top of the frozen weights, at the
-# §4.2 reference geometry (49×384×640 ⇒ 12480 tokens) with a 14B-class expert,
-# grad_window_steps=1 and a windowed differentiable decode. Measured as the sum of
-# the per-block checkpoint stash (~5 GiB), the in-block recompute peak (~3 GiB) and
-# the retained VAE decode graph (~8-14 GiB, see ``--decode-grad-frames``). Used only
-# to clamp an over-large batch before it OOMs minutes into the epoch.
-_STAGE_C_GIB_PER_CLIP = 20.0
+# §4.2 reference geometry (49×384×640 ⇒ 12480 tokens) with a 14B-class expert. The
+# three terms are the ones the graph is actually made of, and two of them are set by
+# knobs — a single constant covering "the worst configuration" told a correctly
+# configured 40 GB run to expect an OOM it was never going to hit, which is the kind
+# of warning that gets flags turned down for no reason.
+_GIB_CHECKPOINT_STASH = 5.0   # one block input per block, per retained BPTT segment
+_GIB_BLOCK_RECOMPUTE = 3.0    # the in-block peak while a checkpointed block reruns
+_GIB_DECODE_PER_SLOT = 0.375  # retained VAE decode graph, per latent slot on the graph
+_GIB_DECODE_FULL = 12.0       # decode_grad_frames=0 ⇒ the whole clip is on the graph
 
 
 # One render is one smoothing group: :func:`tube_temporal_smoothness` keys on
@@ -82,6 +92,8 @@ _DAMAGE_COMPUTER = MultiDimDamageComputer()
 def _step_records(
     *, step_idx: int, t: int, budget: float, step_frac: float,
     tube_states: Dict[int, TubeState], strength_feats, actions,
+    tube_residual: Optional[Dict[int, float]] = None,
+    local_cmsc: Optional[Dict[int, float]] = None,
 ) -> List[StepRecord]:
     """Fan one ``record_sink`` callback out into per-(tube, step) :class:`StepRecord`s.
 
@@ -89,6 +101,8 @@ def _step_records(
     same flat, per-sample shape Stage B uses. This adapter is the glue that was
     missing — which is the direct reason ``stage_c_losses`` had no caller (§P4-A3).
     """
+    tube_residual = tube_residual or {}
+    local_cmsc = local_cmsc or {}
     out: List[StepRecord] = []
     for tid, state in tube_states.items():
         feats = strength_feats.get(tid)
@@ -105,6 +119,8 @@ def _step_records(
                 timestep=int(t),
                 video_id=_RENDER_GROUP,
                 interaction_density=float(state.interaction),
+                skip_residual=float(tube_residual.get(tid, 0.0)),
+                local_cmsc=float(local_cmsc.get(tid, 0.0)),
             )
         )
     return out
@@ -259,33 +275,36 @@ class FinettuneStage:
         # batch turns that into an immediate, explained clamp.
         if config.batch_size > 1:
             free_gib = self._free_vram_gib()
-            if free_gib is not None and free_gib < _STAGE_C_GIB_PER_CLIP * config.batch_size:
+            need = self._headroom_gib()
+            if free_gib is not None and free_gib < need * config.batch_size:
                 _log.warning(
-                    "Stage C: batch_size=%d needs ~%.0f GiB of activation headroom but "
+                    "Stage C: batch_size=%d needs ~%.1f GiB of activation headroom but "
                     "only %.1f GiB is free after the frozen backbone; clamping to %d. "
                     "One engine.generate call renders the whole batch, so the retained "
                     "graph scales with it. To keep the effective batch, free residency "
                     "instead (--offload-idle-expert frees ~27 GiB of the 54 GiB two "
                     "resident Wan2.2 experts take) or shrink the graph "
                     "(--decode-grad-frames, --grad-window-steps).",
-                    config.batch_size, _STAGE_C_GIB_PER_CLIP * config.batch_size,
-                    free_gib, max(1, int(free_gib // _STAGE_C_GIB_PER_CLIP)),
+                    config.batch_size, need * config.batch_size,
+                    free_gib, max(1, int(free_gib // need)),
                 )
-                config.batch_size = max(1, int(free_gib // _STAGE_C_GIB_PER_CLIP))
+                config.batch_size = max(1, int(free_gib // need))
         else:
             # batch_size == 1 already: there is nothing left to clamp, but the run can
             # still be short on headroom — and then it OOMs minutes in with no prior
             # hint, because the clamp above never looked. Say so at startup instead.
             free_gib = self._free_vram_gib()
-            if free_gib is not None and free_gib < _STAGE_C_GIB_PER_CLIP:
+            need = self._headroom_gib()
+            if free_gib is not None and free_gib < need:
                 _log.warning(
                     "Stage C: only %.1f GiB free after the frozen backbone; one clip at "
-                    "%dx%dx%d needs ~%.0f GiB (DiT checkpoint stash ~5 + in-block "
-                    "recompute ~3 + differentiable VAE decode ~8-14). Expect an OOM in "
+                    "%dx%dx%d needs ~%.1f GiB (DiT checkpoint stash %.1f + in-block "
+                    "recompute %.1f + differentiable VAE decode %.1f). Expect an OOM in "
                     "the first batch. Lower --decode-grad-frames (1 is the floor), then "
                     "--metric-frame-chunk, then the render geometry — or free residency "
                     "with --offload-idle-expert / a single-expert --wan-variant.",
-                    free_gib, *self._frame_shape(), _STAGE_C_GIB_PER_CLIP,
+                    free_gib, *self._frame_shape(), need,
+                    self._stash_gib(), _GIB_BLOCK_RECOMPUTE, self._decode_gib(),
                 )
 
         # Under data parallelism every rank must agree on the batch size: it decides
@@ -343,6 +362,19 @@ class FinettuneStage:
         idx = torch.cuda.current_device() if idx is None else idx
         total = torch.cuda.get_device_properties(idx).total_memory
         return (total - torch.cuda.memory_allocated(idx)) / 1024 ** 3
+
+    def _stash_gib(self) -> float:
+        """Retained per-block checkpoint inputs, one set per BPTT segment held."""
+        return _GIB_CHECKPOINT_STASH * max(1, self.config.config.engine.grad_window_steps)
+
+    def _decode_gib(self) -> float:
+        """Retained VAE decode graph — linear in the slots decoded on the graph."""
+        k = int(self.config.config.engine.decode_grad_frames)
+        return _GIB_DECODE_PER_SLOT * k if k > 0 else _GIB_DECODE_FULL
+
+    def _headroom_gib(self) -> float:
+        """Activation headroom one clip needs, for this run's graph bounds."""
+        return self._stash_gib() + _GIB_BLOCK_RECOMPUTE + self._decode_gib()
 
     def _enable_backbone_checkpointing(self) -> None:
         """Turn on activation checkpointing in every DiT expert.
@@ -412,24 +444,22 @@ class FinettuneStage:
             processed_root=self.config.processed_root,
             manifest_path=self.config.manifest_path,
         )
-        # Data parallelism (§4.2 on a multi-GPU box): each rank owns a disjoint shard
-        # and the gradients are averaged after every backward. ``drop_last=True`` is
-        # what keeps that safe — it gives every rank the *same* number of batches, and
-        # a rank that ran out early would leave the others waiting in an all-reduce
-        # that never completes. Single-process runs take the original path untouched.
+        # §4.2 硬样本优先: multi / occlusion / text / face clips are up-weighted so the
+        # end-to-end fine-tune spends more steps on the model's short-board scenes. The
+        # sampler draws with replacement, so it shards by rank without partitioning a
+        # pool — every rank keeps the exact boost and the same step count, which is
+        # what the gradient all-reduce after every backward requires.
         dctx = dist_context()
-        sampler = None
-        if dctx.enabled:
-            sampler = DistributedSampler(
-                dataset, num_replicas=dctx.world_size, rank=dctx.rank,
-                shuffle=True, drop_last=True,
-            )
+        sampler = HardSamplePrioritySampler(
+            dataset.scene_types, seed=self.config.config.seed,
+            rank=dctx.rank, world_size=dctx.world_size,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             sampler=sampler,
-            shuffle=sampler is None,
+            drop_last=True,
             # Identity collate: the engine runs per clip because Y_full is per video.
             collate_fn=collate_raw_filtered,
         )
@@ -454,7 +484,8 @@ class FinettuneStage:
                 dctx.rank, dctx.world_size, len(sampler), len(dataloader), n,
             )
         else:
-            _log.info(f"Stage C: {len(dataset)} clips, {len(dataloader)} batches")
+            _log.info("Stage C: %d clips, %d batches (hard scenes up-weighted)",
+                      len(dataset), len(dataloader))
         if len(dataloader) == 0:
             # No clips resolved (empty/missing manifest). Bail out cleanly instead of
             # dividing by a zero batch count in the epoch-average below.
@@ -466,20 +497,32 @@ class FinettuneStage:
         for epoch in range(self.config.num_epochs):
             epoch_loss = 0.0
             trained_batches = 0
-            if sampler is not None:
-                # Without this every epoch reshuffles to the *same* permutation, so a
-                # rank sees one fixed shard for the whole run.
-                sampler.set_epoch(epoch)
+            # Without this every epoch draws the *same* indices, so the run sees one
+            # fixed subset of the clips however many epochs it is given.
+            sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(dataloader):
-                # Run accelerated generation for the batch
-                # (in practice, this would be batched; here shown per-video for clarity)
-                loss = self._finetune_batch(batch)
-
-                # Backward pass. set_to_none frees the grad tensors between steps
-                # instead of zeroing them in place — lower memory held across the
-                # step boundary and marginally faster.
+                # A per-clip failure (an OOM on a tube-dense clip, a baseline that
+                # vanished, a reference whose geometry does not match) is local to one
+                # rank, but neither raising nor skipping is safe on its own: the other
+                # ranks would block in the next all-reduce until the backend times out.
+                # Fail softly, then agree — ``all_agree`` is itself a collective, so the
+                # sequence stays identical on every rank.
+                try:
+                    loss = self._finetune_batch(batch)
+                    ok = True
+                except RuntimeError as exc:   # OOM included: it subclasses RuntimeError
+                    _log.warning("Stage C: batch %d failed on rank %d (%s: %s); "
+                                 "skipping it on every rank",
+                                 batch_idx, dctx.rank, type(exc).__name__, exc)
+                    loss, ok = torch.zeros((), device=self.device), False
+                    free_memory()
                 self.optimizer.zero_grad(set_to_none=True)
+                if not all_agree(ok, dctx, device=torch.device(self.device)):
+                    continue
+
+                # Backward pass. set_to_none freed the grad tensors above instead of
+                # zeroing them in place — lower memory held across the step boundary.
                 # A batch can legitimately produce a loss with no autograd graph: the
                 # render skipped every repair (nothing puts z on the graph), the clip
                 # segmented no tube (no regularisers) and LoRA is off. ``backward()``
@@ -609,10 +652,12 @@ class FinettuneStage:
         grid = bb.token_grid(*self._frame_shape())
         z_init = self._cached_baseline(video_ids, grid)
         y_full = None  # cached path: read after the render, at the decode window only
+        cond = self._cached_cond(video_ids, captions)
         if z_init is not None:
-            cond = bb.encode_text(captions).to(self.device)
+            if cond is None:
+                cond = bb.encode_text(captions).to(self.device)
         else:
-            cond, grid, z_init = self._build_inputs(captions)
+            cond, grid, z_init = self._build_inputs(captions, cond=cond)
             y_full = self._full_baseline(z_init, cond, grid)
 
         # Accelerated render with the differentiable decode + per-step feature capture.
@@ -845,14 +890,51 @@ class FinettuneStage:
             ys.append(y.permute(1, 0, 2, 3).contiguous())
         return torch.stack(ys)
 
-    def _build_inputs(self, captions):
+    def _build_inputs(self, captions, *, cond=None):
         """Encode captions and sample the shared initial noise / token grid (§7.2)."""
         bb = self.accelerator.backbone
         d = self.config.config.data
         grid = bb.token_grid(d.num_frames, d.height, d.width)
-        cond = bb.encode_text(captions).to(self.device)
+        if cond is None:
+            cond = bb.encode_text(captions).to(self.device)
         z_init = bb.initial_latent(grid, batch=len(captions), device=self.device)
         return cond, grid, z_init
+
+    def _cached_cond(self, video_ids, captions) -> Optional[TextConditioning]:
+        """Stage A's persisted prompt embeddings for the batch, or ``None``.
+
+        Re-encoding the caption is the same frozen umT5 over the same prompt for the
+        same result, and under the default residency policy (``text_encoder=cpu`` +
+        ``te_exclusive``) each call parks the resident ~26 GiB expert on the CPU, moves
+        the ~11 GiB text encoder onto the card and reverses it afterwards — ~74 GiB
+        over PCIe on *every* training step. Stage A already wrote the sequence per clip
+        (``text_embeds/<video_id>.pt``, trimmed and fp16), so the batch is assembled
+        from disk and the encoder never wakes up.
+
+        ``None`` when any clip is missing one, so the caller falls back to encoding —
+        a partially-cached batch would mix two sources on one conditioning tensor.
+        """
+        if self.config.processed_root is None:
+            return None
+        layout = ProcessedLayout(self.config.processed_root)
+        embeds = []
+        for vid in video_ids:
+            path = layout.text_embed_path(vid)
+            if not path.exists():
+                return None
+            embeds.append(torch.load(path, map_location="cpu", weights_only=False).float())
+        if not embeds or any(e.dim() != 2 for e in embeds):
+            return None
+        length = max(e.shape[0] for e in embeds)
+        padded = torch.zeros(len(embeds), length, embeds[0].shape[-1])
+        mask = torch.zeros(len(embeds), length)
+        for i, e in enumerate(embeds):
+            padded[i, : e.shape[0]] = e
+            mask[i, : e.shape[0]] = 1.0
+        return TextConditioning(
+            embeds=padded.to(self.device), mask=mask.to(self.device),
+            prompts=tuple(captions),
+        )
 
     def _full_baseline(self, z_init, cond, grid) -> Tensor:
         """Decode the un-accelerated baseline ``Y_full`` for the §4.2 main loss, on the
@@ -870,18 +952,19 @@ class FinettuneStage:
         bb = self.accelerator.backbone
         with bb.grad_mode(True), torch.no_grad():
             z0, _ = runner.full_denoise(z_init, cond, grid)
-            return bb.decode_latent(bb.to_grid(z0, grid))
+            return bb.decode_to_unit(bb.to_grid(z0, grid))
 
     @staticmethod
     def _to_fchw(video: Tensor, index: int = 0) -> Tensor:
-        """``[B,3,F,H,W]`` (or ``[3,F,H,W]``) → clip ``index`` as ``[F,3,H,W]`` in [0,1].
+        """``[B,3,F,H,W]`` (or ``[3,F,H,W]``) → clip ``index`` as ``[F,3,H,W]``.
 
         Slices *before* permuting: ``permute(...).contiguous()`` on the whole batch
         materialised two more full-size, gradient-carrying copies of every clip when
-        only one of them was about to be read (§P4-B2).
+        only one of them was about to be read (§P4-B2). The render is already in
+        ``[0, 1]`` (:meth:`~cocf.backbones.base.BackboneAdapter.decode_to_unit`).
         """
         v = video[index] if video.dim() == 5 else video
-        return v.permute(1, 0, 2, 3).contiguous().clamp(0.0, 1.0)
+        return v.permute(1, 0, 2, 3).contiguous()
     # ------------------------------------------------------------------ #
     # LoRA + trainable-parameter scope (§4.2)
     # ------------------------------------------------------------------ #

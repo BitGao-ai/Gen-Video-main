@@ -30,9 +30,10 @@ import hashlib
 import json
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ from cocf.data import (
     video_id_str,
     write_raw_dataset_index,
 )
+from cocf.data.quality_filter import read_filtered_final
 from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS, MetricExtractor
 from cocf.lcocf.data import (
     COCFDataGenerator,
@@ -81,6 +83,12 @@ _NORM_GROUPS = ("strength_features", "tube_features", "cost_label")
 # nothing. Absorb the former, still stop loudly on the latter.
 _MAX_CONSECUTIVE_CLIP_FAILURES = 5
 
+# How long a non-owning shard waits for shard 0 to publish filtered_final.csv before
+# giving up and filtering locally. Generous: the publisher has to parse the whole
+# manifest first, and the fallback costs a repeated filter, not a wrong result.
+_FILTER_HANDOFF_TIMEOUT_S = 1800.0
+_FILTER_HANDOFF_POLL_S = 5.0
+
 
 @dataclass
 class StageAConfig:
@@ -101,8 +109,12 @@ class StageAConfig:
     limit: Optional[int] = None              # cap rows per CSV (debug / smoke)
     samples_per_video: Optional[int] = None  # override config.teacher.samples_per_video
     persist_buckets: bool = True             # master switch for §3 level-3/level-4 buckets
-    persist_baseline: bool = True            # write §3 level-3 full_baseline (the ~1TB bucket)
+    persist_baseline: bool = True            # write §3 level-3 full_baseline (the ~TB bucket)
     persist_tube_features: bool = True       # write §3 level-4 tube_causal_features (small)
+    # Write the representative-step latents inside the baseline bucket. Off by default:
+    # ~3 MiB per step per clip that no stage currently reads (Stage C replays z_init,
+    # not z_t). Turn it on for offline analysis of the teacher trajectory.
+    persist_step_latents: bool = False
     seed: int = 1234
     video_subdir: Optional[str] = None       # override config.data.video_subdir (e.g. "videos")
     require_file: bool = False               # keep only clips whose mp4 exists on disk
@@ -159,6 +171,7 @@ class DataGenerationStage:
             device=config.device,
             perception=accelerator.perception,
             seeds_per_prompt=cfg.teacher.seeds_per_prompt,
+            free_memory_every=cfg.teacher.free_memory_every,
         )
         self.transition = accelerator.transition
         # Real-clip decoder (§1.3 real-video anchor). Built once and reused; only
@@ -299,7 +312,24 @@ class DataGenerationStage:
 
         ``write_global`` gates the one-time global-metadata writes to a single shard so
         parallel workers never race on the (large) raw_dataset_index / filtered_final CSVs.
+        It also marks *which* shard owns the filter: every other worker inherits the
+        decision from ``filtered_final.csv`` rather than re-deriving it, since the CSV
+        determines the kept set and the split map exactly (see
+        :func:`~cocf.data.quality_filter.read_filtered_final`).
         """
+        if not write_global:
+            # Only a concurrent generate shard has a publisher to wait for. A
+            # --finalize-only or standalone finalize pass runs alone, so it reuses the
+            # CSV if it is already there and otherwise filters immediately.
+            reused = self._reuse_filter(
+                layout,
+                wait=(not self.config.finalize_only
+                      and self.config.num_shards > 1
+                      and self.config.shard_index > 0),
+            )
+            if reused is not None:
+                return reused
+
         cfg = self.config.config
         video_subdir = self.config.video_subdir or cfg.data.video_subdir
         # Real-video mode is meaningless without the mp4 on disk, so it implies the
@@ -329,6 +359,40 @@ class DataGenerationStage:
             result.report.n_train, result.report.n_val, result.report.n_test_hard,
         )
         return result
+
+    def _reuse_filter(self, layout: ProcessedLayout, *, wait: bool):
+        """The owning shard's ``filtered_final.csv``, or ``None`` to filter locally.
+
+        ``wait`` polls for the file, because a multi-shard launch starts every worker at
+        once and shard 0 needs a moment to publish it; the write is atomic, so anything
+        that appears is complete. Giving up simply falls through to running the filter
+        here, which is correct — only slower — so a lost race can never change the kept
+        set.
+        """
+        deadline = time.monotonic() + (_FILTER_HANDOFF_TIMEOUT_S if wait else 0.0)
+        announced = False
+        while True:
+            result = read_filtered_final(layout)
+            if result is not None:
+                _log.info(
+                    "§2 reusing %s: %d clips; split %d/%d/%d",
+                    layout.filtered_final.name, result.report.kept_final,
+                    result.report.n_train, result.report.n_val,
+                    result.report.n_test_hard,
+                )
+                return result
+            if time.monotonic() >= deadline:
+                if wait:
+                    _log.warning(
+                        "§2 %s did not appear within %ds; running the filter in this "
+                        "shard instead. Shard 0 may have failed, or it is still "
+                        "ingesting.", layout.filtered_final, _FILTER_HANDOFF_TIMEOUT_S,
+                    )
+                return None
+            if not announced:
+                _log.info("§2 waiting for shard 0 to publish %s", layout.filtered_final.name)
+                announced = True
+            time.sleep(_FILTER_HANDOFF_POLL_S)
 
     # ------------------------------------------------------------------ #
     # §1.3–§1.5 generation (per shard, resumable, O(1) memory)
@@ -361,6 +425,7 @@ class DataGenerationStage:
         writer = CounterfactualSampleWriter(
             layout.lmdb_dir,
             shard_size=cfg.teacher.shard_size,
+            map_size=int(cfg.teacher.lmdb_map_size_gib) * 1024 ** 3,
             shard_prefix=(f"shard_s{shard_index:02d}" if sharded else "shard"),
             manifest_name=f"manifest.s{shard_index:02d}.json",
             resume=True,
@@ -553,11 +618,18 @@ class DataGenerationStage:
     # ------------------------------------------------------------------ #
 
     def _persist_baseline(self, traj: TeacherTrajectory) -> None:
-        """Write the §3 level-3 ``full_baseline/<video_id>/`` bucket (z_t keyed by t)."""
-        z_by_t = {traj.num_total_steps - step_idx: z for step_idx, z in traj.z_by_step.items()}
-        text_emb = traj.text_embed if traj.text_embed is not None else torch.zeros(1)
+        """Write the §3 level-3 ``full_baseline/<video_id>/`` bucket.
+
+        ``z_t`` (the representative-step latents) is written only when
+        ``persist_step_latents`` is on: nothing in Stages B/C reads it today, and at
+        ~3 MiB per step per clip it is the second-largest item in the bucket.
+        """
+        z_by_t = (
+            {traj.num_total_steps - step_idx: z for step_idx, z in traj.z_by_step.items()}
+            if self.config.persist_step_latents else {}
+        )
         self.layout.save_baseline(
-            traj.video_id, text_emb=text_emb, z_t_by_step=z_by_t, y_full=traj.video_full,
+            traj.video_id, z_t_by_step=z_by_t, y_full=traj.video_full,
             z_init=traj.z_init,
         )
 
@@ -664,20 +736,25 @@ class DataGenerationStage:
     @staticmethod
     def _scene_interleaved(records: Sequence[OpenVidRecord]) -> List[OpenVidRecord]:
         """Round-robin records across scene types so a ``--limit`` truncation still
-        covers all six scene classes (§1.2 场景覆盖度)."""
-        by_scene: Dict[str, List[OpenVidRecord]] = {}
+        covers all six scene classes (§1.2 场景覆盖度).
+
+        Linear in the record count: the queues are deques popped from the left and
+        dropped once exhausted. The list-based version this replaces used ``pop(0)``,
+        an O(n) shift per record, which on the full 1.45M-row OpenVid manifest spent
+        hours reordering before the first teacher forward could start.
+        """
+        by_scene: Dict[str, Deque[OpenVidRecord]] = {}
         for r in records:
-            by_scene.setdefault(r.scene_type, []).append(r)
+            by_scene.setdefault(r.scene_type, deque()).append(r)
         queues = list(by_scene.values())
         out: List[OpenVidRecord] = []
-        i = 0
-        while len(out) < len(records):
-            q = queues[i % len(queues)]
-            if q:
-                out.append(q.pop(0))
-            i += 1
-            if all(not q for q in queues):
-                break
+        while queues:
+            live: List[Deque[OpenVidRecord]] = []
+            for q in queues:
+                out.append(q.popleft())
+                if q:
+                    live.append(q)
+            queues = live
         return out
 
 
@@ -781,15 +858,18 @@ def _merge_tube_meta(layout: ProcessedLayout) -> List[Dict[str, object]]:
 def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, str]) -> Path:
     """Build the §1.6 shared index / splits / norm by streaming over all shards.
 
-    Backbone-free and, apart from the index/keys it must materialise for ``manifest.json``
-    (an intrinsic output), O(1) in sample count. Two streaming passes:
+    Backbone-free, and a **single** pass over the store. The 3σ damage mask needs every
+    sample's damage before any sample can be judged, which once made this two passes —
+    but the outputs it feeds (``manifest.json``'s key list and index, ``sample_index``,
+    the split lists) are themselves O(samples), so the second pass bought no memory and
+    only doubled the read: on the ``.pt`` backend it re-``torch.load``-ed every shard,
+    payload tensors included. Retaining the handful of scalar index fields per record
+    instead costs a fraction of one shard's payloads and halves the I/O.
 
-    1. accumulate the per-field **online min-max** (§1.6 norm stats) and the damage
-       scalars needed for the 3σ mask — one shard resident at a time;
-    2. emit the merged ``manifest.json`` (every sample, so Stage B can address any
-       record) plus ``sample_index.csv`` + leakage-safe ``splits/*.txt`` (kept,
-       non-outlier samples only — 3σ outliers are omitted from the index, never deleted
-       from the store, matching the original §1.6 contract).
+    Emits the merged ``manifest.json`` (every sample, so Stage B can address any record)
+    plus ``sample_index.csv`` + leakage-safe ``splits/*.txt`` (kept, non-outlier samples
+    only — 3σ outliers are omitted from the index, never deleted from the store,
+    matching the original §1.6 contract).
 
     Works for both the sharded layout (``shard_sNN_*.pt``) and a legacy single-writer
     store (``shard_NNNNN.pt``) — the glob matches both — **and** for the LMDB backend
@@ -808,7 +888,7 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
         # A store that changed backend mid-flight (e.g. ``pip install lmdb`` between
         # two Stage-A runs). Indexing only one of them would quietly drop the other's
         # samples, so say so rather than let the count look right. Warned once here,
-        # not inside the (twice-consumed) record iterator.
+        # not inside the record iterator.
         _log.warning(
             "finalize: %s holds BOTH an LMDB store and %d .pt shard(s). Indexing the "
             "LMDB only — the shards were written by a run with a different backend and "
@@ -818,12 +898,36 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
         )
     backend = "LMDB" if is_lmdb else f"{len(shard_paths)} .pt shard(s)"
 
-    # --- pass 1: online min-max (§1.6 norm) + damage scalars (streaming) ---- #
+    # --- single pass: online min-max (§1.6 norm) + damage + index fields ---- #
     norm_min: Dict[str, np.ndarray] = {}
     norm_max: Dict[str, np.ndarray] = {}
     damage: List[float] = []
-    for _name, _pos, _sid, payload in _iter_store_records(layout, shard_paths):
+    keys: List[str] = []
+    index: Dict[str, list] = {}
+    sample_rows: List[Dict[str, object]] = []
+    seen: set = set()
+    duplicates = 0
+    for name, pos, sid, payload in _iter_store_records(layout, shard_paths):
+        # A sample id is (video, tube, timestep, action) and addresses one record, so a
+        # repeat is a re-write of the same sample — index it once or every consumer
+        # (sample_index, splits, the epoch length) counts it twice.
+        if sid in seen:
+            duplicates += 1
+            if pos >= 0:
+                index[sid] = [name, pos]   # last write wins, matching the writer
+            continue
+        seen.add(sid)
         damage.append(_damage_scalar_from_payload(payload))
+        keys.append(sid)
+        if pos >= 0:
+            index[sid] = [name, pos]
+        sample_rows.append({
+            "sample_id": sid,
+            "video_id": str(payload.get("video_id", "")),
+            "timestep": int(payload.get("timestep", 0)),
+            "action": int(payload.get("action", 0)),
+            "scene_type": payload.get("scene_type", ""),
+        })
         for g in _NORM_GROUPS:
             v = payload.get(g)
             if v is None:
@@ -836,29 +940,19 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
                 np.maximum(norm_max[g], a, out=norm_max[g])
             else:
                 norm_min[g], norm_max[g] = a.copy(), a.copy()
-    keep_mask = _outlier_mask(damage)
+    if duplicates:
+        _log.warning("finalize: %d duplicate sample id(s) collapsed to one entry each",
+                     duplicates)
 
-    # --- pass 2: manifest (all records) + sample_index/splits (kept) -------- #
-    keys: List[str] = []
-    index: Dict[str, list] = {}
-    sample_rows: List[Dict[str, object]] = []
+    # --- apply the 3σ mask to the retained index rows ----------------------- #
+    keep_mask = _outlier_mask(damage)
+    kept_rows = [row for row, keep in zip(sample_rows, keep_mask) if keep]
     buckets: Dict[str, List[str]] = {"train": [], "val": [], "test_hard": []}
-    gi = 0
-    for name, pos, sid, payload in _iter_store_records(layout, shard_paths):
-        keys.append(sid)
-        if pos >= 0:
-            index[sid] = [name, pos]
-        if keep_mask[gi]:
-            vid = str(payload.get("video_id", ""))
-            sample_rows.append({
-                "sample_id": sid,
-                "video_id": vid,
-                "timestep": int(payload.get("timestep", 0)),
-                "action": int(payload.get("action", 0)),
-                "scene_type": payload.get("scene_type", ""),
-            })
-            buckets.get(split_by_video.get(vid, "train"), buckets["train"]).append(sid)
-        gi += 1
+    for row in kept_rows:
+        vid = str(row["video_id"])
+        buckets.get(split_by_video.get(vid, "train"), buckets["train"]).append(
+            str(row["sample_id"])
+        )
 
     if not is_lmdb:
         # manifest.json is the .pt backend's *only* addressing index. The LMDB store
@@ -867,18 +961,18 @@ def finalize_processed_store(layout: ProcessedLayout, split_by_video: Dict[str, 
         (layout.lmdb_dir / "manifest.json").write_text(
             json.dumps({"keys": keys, "index": index}), encoding="utf-8"
         )
-    layout.write_sample_index(sample_rows)
+    layout.write_sample_index(kept_rows)
     layout.write_splits(buckets["train"], buckets["val"], buckets["test_hard"])
     layout.write_norm_stats({
         g: {"min": norm_min[g].tolist(), "max": norm_max[g].tolist()} for g in norm_min
     })
     layout.write_tube_meta(_merge_tube_meta(layout))
 
-    dropped = len(keys) - len(sample_rows)
+    dropped = len(keys) - len(kept_rows)
     _log.info(
         "§1.6 finalize: indexed %d samples from %s; sample_index kept %d "
         "(dropped %d 3σ outliers); splits %d/%d/%d → %s",
-        len(keys), backend, len(sample_rows), dropped,
+        len(keys), backend, len(kept_rows), dropped,
         len(buckets["train"]), len(buckets["val"]), len(buckets["test_hard"]), layout.root,
     )
     return layout.root

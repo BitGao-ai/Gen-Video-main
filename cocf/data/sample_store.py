@@ -28,7 +28,7 @@ import json
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -37,9 +37,17 @@ from cocf.common.logging import get_logger
 
 _log = get_logger(__name__)
 
-# 32 GiB virtual map by default — LMDB only commits pages actually written, so an
-# over-estimate is free on disk and avoids MDB_MAP_FULL on large dataset builds.
-_DEFAULT_MAP_SIZE = 32 * 1024 ** 3
+# Virtual map reserved for the LMDB store. LMDB only commits pages actually written,
+# so an over-estimate costs nothing on disk while an under-estimate aborts the run
+# with MDB_MAP_FULL part-way through. Sized for the §2.4 target (180k clips x ~12
+# samples x ~7 KB ≈ 15 GiB) with room for a wider CLIP embed or more samples per
+# clip; ``CounterfactualSampleWriter(map_size=…)`` overrides it, and the writer grows
+# the map on demand anyway (see :meth:`CounterfactualSampleWriter.put`).
+_DEFAULT_MAP_SIZE = 256 * 1024 ** 3
+
+# Records held in one LMDB write transaction. Bounds the transaction's memory and,
+# with it, how much has to be replayed if the map turns out to need growing.
+_COMMIT_EVERY = 1000
 
 
 def _have_lmdb() -> bool:
@@ -63,6 +71,11 @@ def _decode(blob: bytes) -> Any:
 def _as_payload(sample: Any) -> Dict[str, Any]:
     """Accept a typed sample (``.to_dict()``) or an already-plain dict."""
     return sample.to_dict() if hasattr(sample, "to_dict") else dict(sample)
+
+
+def _dedup(keys: Sequence[str]) -> List[str]:
+    """``keys`` with duplicates removed, first occurrence wins, order preserved."""
+    return list(dict.fromkeys(keys))
 
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +115,8 @@ class CounterfactualSampleWriter:
         if self._use_lmdb:
             import lmdb
 
-            self._env = lmdb.open(str(self.dir), map_size=int(map_size), subdir=True)
+            self._map_size = int(map_size)
+            self._env = lmdb.open(str(self.dir), map_size=self._map_size, subdir=True)
             # Read the prior key list *before* opening the write transaction. Both
             # orders work in LMDB (read txns are independent of the writer), but
             # reading first keeps the write txn's lifetime tight and avoids relying on
@@ -113,7 +127,9 @@ class CounterfactualSampleWriter:
             # is still in data.mdb, but nothing can address it.
             self._prior_keys: List[str] = self._read_keys() if resume else []
             self._txn = self._env.begin(write=True)
-            self._pending = 0
+            # Records written into the open transaction, retained so a map growth
+            # (which has to abort it) can replay them — see :meth:`_put_lmdb`.
+            self._pending: List[Tuple[bytes, bytes]] = []
         else:
             # sharded fallback: accumulate in a buffer, flush every shard_size. When
             # ``resume`` picks up an interrupted shard, continue numbering *after* the
@@ -154,17 +170,51 @@ class CounterfactualSampleWriter:
         payload = _as_payload(sample)
         self._keys.append(sample_id)
         if self._use_lmdb:
-            self._txn.put(sample_id.encode("utf-8"), _encode(payload))
-            self._pending += 1
-            if self._pending >= 1000:  # commit periodically to bound txn memory
-                self._txn.commit()
-                self._txn = self._env.begin(write=True)
-                self._pending = 0
+            self._put_lmdb(sample_id, _encode(payload))
         else:
             self._manifest[sample_id] = [self._shard_name(self._shard_idx), len(self._buffer)]
             self._buffer.append({"sample_id": sample_id, "payload": payload})
             if len(self._buffer) >= self.shard_size:
                 self._flush_shard()
+
+    def _put_lmdb(self, sample_id: str, blob: bytes) -> None:
+        """Write one record, growing the map rather than dying on MDB_MAP_FULL.
+
+        The map is a *virtual* reservation, so outgrowing it is a recoverable
+        bookkeeping fact, not a full disk — but LMDB reports it as an exception from
+        the middle of a days-long generation run, which the caller then counts as a
+        failed clip.
+
+        Growing means aborting the open transaction, which discards every record it
+        held — so the uncommitted batch is kept and replayed. Without that, up to
+        ``_COMMIT_EVERY`` samples would be listed in ``__keys__`` without existing in
+        the store, which reads as a silent data loss rather than as an error.
+        """
+        import lmdb
+
+        record = (sample_id.encode("utf-8"), blob)
+        try:
+            self._txn.put(*record)
+            self._pending.append(record)
+        except lmdb.MapFullError:
+            self._txn.abort()
+            self._map_size *= 2
+            _log.warning("LMDB map full; growing the reservation to %.0f GiB and "
+                         "replaying %d uncommitted record(s)",
+                         self._map_size / 1024 ** 3, len(self._pending))
+            self._env.set_mapsize(self._map_size)
+            self._txn = self._env.begin(write=True)
+            replay, self._pending = self._pending, []
+            for r in replay + [record]:
+                self._txn.put(*r)
+                self._pending.append(r)
+        if len(self._pending) >= _COMMIT_EVERY:  # bound the transaction's memory
+            self._commit_lmdb()
+
+    def _commit_lmdb(self) -> None:
+        self._txn.commit()
+        self._txn = self._env.begin(write=True)
+        self._pending = []
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -185,11 +235,7 @@ class CounterfactualSampleWriter:
             # Persist the ordered key list so the dataset need not enumerate the env.
             # Merge with the keys a previous run committed (``resume``), de-duplicating
             # while preserving order — a plain overwrite silently orphans them.
-            seen, merged = set(), []
-            for k in list(self._prior_keys) + self._keys:
-                if k not in seen:
-                    seen.add(k)
-                    merged.append(k)
+            merged = _dedup(list(self._prior_keys) + self._keys)
             with self._env.begin(write=True) as txn:
                 txn.put(b"__keys__", json.dumps(merged).encode("utf-8"))
             self._env.sync()
@@ -197,8 +243,13 @@ class CounterfactualSampleWriter:
         else:
             self._flush_shard()
             if self.write_manifest:
+                # Same de-duplication as the LMDB branch. ``_manifest`` is a dict and
+                # already keeps only the last write per id, but ``_keys`` is a list —
+                # publishing it raw makes a re-``put`` id appear twice in every index
+                # built from it, and the sharded (multi-worker) layout is exactly the
+                # one that takes this branch.
                 (self.dir / self.manifest_name).write_text(
-                    json.dumps({"keys": self._keys, "index": self._manifest}),
+                    json.dumps({"keys": _dedup(self._keys), "index": self._manifest}),
                     encoding="utf-8",
                 )
 
@@ -299,10 +350,9 @@ class CounterfactualLMDBDataset(Dataset):
     # -- backends ------------------------------------------------------- #
 
     def _open_lmdb(self) -> None:
-        import lmdb
-
-        self._env = lmdb.open(str(self.dir), readonly=True, lock=False, subdir=True)
-        with self._env.begin() as txn:
+        self._env = None
+        self._env_pid = None
+        with self._lmdb_env().begin() as txn:
             raw = txn.get(b"__keys__")
             if raw is not None:
                 self._all_keys = json.loads(raw.decode("utf-8"))
@@ -312,6 +362,24 @@ class CounterfactualLMDBDataset(Dataset):
                 ]
         self._key_set = set(self._all_keys)
         self._shard_cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+
+    def _lmdb_env(self):
+        """This process's read env, opened lazily and re-opened after a fork.
+
+        A ``DataLoader`` with ``num_workers > 0`` forks after the dataset is built, and
+        an LMDB environment must not be shared across that boundary — the workers would
+        inherit the parent's reader slots. Keying the handle on the pid gives each
+        worker its own, which is what makes ``--num_workers`` usable at all: Stage B is
+        IO-bound on this store, so single-process reads are its actual bottleneck.
+        """
+        import lmdb
+
+        pid = os.getpid()
+        if self._env is None or self._env_pid != pid:
+            self._env = lmdb.open(str(self.dir), readonly=True, lock=False,
+                                  subdir=True, max_readers=512)
+            self._env_pid = pid
+        return self._env
 
     def _open_fallback(self) -> None:
         manifest_path = self.dir / "manifest.json"
@@ -333,7 +401,7 @@ class CounterfactualLMDBDataset(Dataset):
 
     def get(self, sample_id: str) -> Dict[str, Any]:
         if self._use_lmdb:
-            with self._env.begin() as txn:
+            with self._lmdb_env().begin() as txn:
                 blob = txn.get(sample_id.encode("utf-8"))
             if blob is None:
                 raise KeyError(sample_id)

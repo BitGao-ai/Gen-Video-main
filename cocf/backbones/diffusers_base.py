@@ -411,9 +411,38 @@ class DiffusersVideoBackbone(BackboneAdapter):
         return TokenGrid(t=t_lat // pt, h=h_lat // ph, w=w_lat // pw)
 
     def timesteps(self, num_inference_steps: int) -> Tensor:
-        # rectified-flow sigmas in (1, 0]; subclasses may override with the
-        # upstream scheduler's shifted schedule.
-        return torch.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
+        return self.model_sigma(
+            torch.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
+        )
+
+    @property
+    def flow_shift(self) -> float:
+        """Rectified-flow schedule shift ``s`` (1.0 = the uniform schedule).
+
+        Read from ``BackboneConfig.extra['flow_shift']`` so it travels with the
+        variant table rather than being hard-coded per adapter.
+        """
+        return float((self.config.extra or {}).get("flow_shift", 1.0))
+
+    def model_sigma(self, sigma: Tensor) -> Tensor:
+        """Schedule position ``∈ (0,1]`` → the noise level the model is trained on.
+
+        The engine, the teacher and the counterfactual generator all count steps down
+        and hand this the uniform ``t/T`` (:func:`sigma_from_step`); the *adapter* owns
+        what that position means to its own model, exactly as it already owns the
+        ``σ → σ·1000`` timestep convention. Rectified-flow video models are trained on
+        a **shifted** schedule ``s·σ / (1 + (s-1)·σ)``, which spends far more of the
+        budget in the high-noise structure phase.
+
+        Applying it here rather than at the call sites keeps the shift consistent
+        across the three places it has to agree — the timestep fed to the transformer,
+        the ``dt`` of the Euler step, and (for a Wan2.2 MoE) the expert routing
+        boundary. A uniform schedule left the high-noise expert covering 3 of 20 steps
+        where the real one covers ~9, so the teacher trajectory was drawn from the
+        wrong denoiser for most of the structure phase.
+        """
+        s = self.flow_shift
+        return sigma if s == 1.0 else s * sigma / (1.0 + (s - 1.0) * sigma)
 
     # -- layout: latent grid ⇄ patch-tokens (the shared maths) ---------- #
 
@@ -646,12 +675,14 @@ class DiffusersVideoBackbone(BackboneAdapter):
     ) -> Tensor:
         """Flow-matching Euler step ``z_{t_next} = z_t + (σ_{next}-σ_t)·v``.
 
-        Both Hunyuan and Wan2.1 are rectified-flow models predicting velocity ``v``;
-        this is the upstream scheduler's update in closed form. A production
-        integration may instead delegate to the model's own
-        ``FlowMatchEulerDiscreteScheduler`` for its exact sigma shift.
+        Both Hunyuan and Wan2.1 are rectified-flow models predicting velocity ``v``.
+        ``t``/``t_next`` are *schedule positions*; the step is taken in the model's own
+        noise space, so the same :meth:`model_sigma` that decides the transformer's
+        timestep also sets ``dt`` — otherwise the shift would move the conditioning
+        without moving the integrator with it.
         """
-        dt = (t_next - t).reshape(-1, *([1] * (tokens.dim() - 1))).to(tokens.dtype)
+        sigma, sigma_next = self.model_sigma(t), self.model_sigma(t_next)
+        dt = (sigma_next - sigma).reshape(-1, *([1] * (tokens.dim() - 1))).to(tokens.dtype)
         return tokens + dt * model_output
 
     def dit_blocks(self) -> List[nn.Module]:

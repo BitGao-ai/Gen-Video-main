@@ -292,7 +292,32 @@ class BackboneAdapter(abc.ABC):
 
     @abc.abstractmethod
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
-        """``[B, C, T, H, W] -> [B, C_pix, F, H_pix, W_pix]`` video."""
+        """``[B, C, T, H, W] -> [B, C_pix, F, H_pix, W_pix]`` video, in the adapter's
+        own value range (see :attr:`decode_is_signed`)."""
+
+    #: Whether :meth:`decode_latent` emits the symmetric ``[-1, 1]`` VAE range.
+    #: True for every real diffusers VAE. Consumers never read this directly — they
+    #: go through :meth:`decode_to_unit`.
+    decode_is_signed: bool = True
+
+    def decode_to_unit(self, latent_grid: Tensor) -> Tensor:
+        """Decode to ``[0, 1]`` pixels — the **only** entry point for anything that
+        treats the result as an image.
+
+        Every downstream consumer (SAM/DINOv2/CLIP, the damage metrics, the §4.2
+        pixel loss, the video writer) is defined on ``[0, 1]``, while a real VAE
+        decodes to ``[-1, 1]``. Applying the conversion once, here, is what keeps
+        those two facts from having to be re-derived at each of the five decode call
+        sites — a plain ``clamp(0, 1)`` at any of them silently crushes the entire
+        lower half of the tonal range instead, which no comparison downstream can
+        detect because both sides of it are clipped the same way.
+
+        Differentiable: Stage C's §4.2 loss path runs through this.
+        """
+        video = self.decode_latent(latent_grid)
+        if self.decode_is_signed:
+            video = (video + 1.0) * 0.5
+        return video.clamp(0.0, 1.0)
 
     def pixel_span(self, lo: int, hi: int) -> Optional[Tuple[int, int]]:
         """Pixel-frame range ``[start, stop)`` that latent slots ``[lo, hi)`` decode to.

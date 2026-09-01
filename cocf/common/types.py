@@ -194,7 +194,7 @@ class Region:
 TUBE_STATE_FIELDS: Tuple[str, ...] = (
     "identity_confidence",  # I_k   = mean cos identity similarity to previous frame
     "occlusion",  # O_k   = 1 - IoU(M_t, Warp(M_{t-1}))
-    "interaction",  # I_inter = Σ IoU with other tubes
+    "interaction",  # I_inter = mean IoU with the other tubes, in [0,1]
     "boundary_uncertainty",  # geometric uncertainty along the tube boundary
     "motion_phase",  # normalised motion magnitude / phase
     "causal_value",  # causal_value_k from L-COCF strength field

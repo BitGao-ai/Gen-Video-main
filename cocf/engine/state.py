@@ -82,7 +82,7 @@ class EngineState:
 class GenerationResult:
     """Output of :meth:`InferenceEngine.generate`."""
 
-    video: Tensor                # [B, 3, F, H, W] decoded video
+    video: Tensor                # [B, 3, F, H, W] decoded video, in [0, 1]
     z0: Tensor                   # [B, N, d] final clean latent (token form)
     traces: List[StepTrace] = field(default_factory=list)
     # The tube set the trajectory ended on, and the latent geometry it was built

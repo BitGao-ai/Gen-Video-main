@@ -42,6 +42,7 @@ import torch.nn.functional as F
 from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
 from cocf.common.logging import get_logger
 from cocf.common.memory import free_memory, freeze
+from cocf.common.raft import load_raft
 from cocf.tubes.regions import PerceptionProvider
 
 Tensor = torch.Tensor
@@ -283,6 +284,10 @@ class ModelPerception(PerceptionProvider):
             self._clip_image_fn(frame, mask), self.d_clip, frame.device, "clip_image_fn"
         )
 
+    def text_feature(self, prompt: str) -> Tensor:
+        """CLIP text embedding ``[d_clip]`` of the prompt (memoised by the callable)."""
+        return self._clip_text_fn(prompt).detach().float()
+
     def optical_flow(self, frame_a: Tensor, frame_b: Tensor) -> Tensor:
         """RAFT flow ``[2, Hp, Wp]`` mapping ``frame_a`` pixels to ``frame_b``."""
         return self._flow_fn(frame_a, frame_b).to(frame_a.device)
@@ -366,6 +371,8 @@ class ModelPerception(PerceptionProvider):
         stability_score_thresh: float = 0.95,
         max_masks: int = 24,
         dtype: Optional[torch.dtype] = None,
+        raft_weights: Optional[str] = None,
+        require_flow: bool = False,
     ) -> "ModelPerception":  # pragma: no cover - needs model downloads
         """Wire SAM(mask-generation) + DINOv2 + CLIP + RAFT into the five callables.
 
@@ -391,6 +398,11 @@ class ModelPerception(PerceptionProvider):
         (:func:`_patch_sam_mask_postprocess`) and the whole mask path is probed here at
         load — half precision otherwise dies inside torchvision NMS on the first
         textured frame, not at load.
+
+        ``raft_weights`` points RAFT at a local checkpoint (an offline host cannot
+        fetch the torchvision ``DEFAULT`` weights); ``require_flow`` makes an
+        unavailable RAFT a hard failure rather than a silent zero-flow fallback — see
+        :func:`cocf.common.raft.load_raft`.
         """
         import numpy as _np
         import torch as _t
@@ -556,10 +568,9 @@ class ModelPerception(PerceptionProvider):
                 _text_cache.popitem(last=False)
             return emb
 
-        try:
-            from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
-
-            raft = freeze(raft_large(weights=Raft_Large_Weights.DEFAULT).to(device))
+        raft = load_raft(device, variant="large", weights_path=raft_weights,
+                         required=require_flow)
+        if raft is not None:
             # RAFT's weights stay in whatever dtype the checkpoint loads as (fp32).
             # The frames handed to us come from the teacher's VAE decode and are
             # therefore often bf16/fp16, which conv2d rejects outright:
@@ -585,7 +596,7 @@ class ModelPerception(PerceptionProvider):
                 with _t.no_grad():
                     fl = raft(ap, bp)[-1][0]  # [2, H+pad, W+pad] in RAFT's (dx, dy)
                 return raft_to_framework_flow(fl[:, :h, :w]).to(device=out_dev, dtype=_t.float32)
-        except Exception:  # torchvision RAFT unavailable → zero flow (motion_phase=0)
+        else:
             def flow_fn(frame_a: Tensor, frame_b: Tensor) -> Tensor:
                 _, h, w = frame_a.shape
                 return _t.zeros(2, h, w, device=frame_a.device)

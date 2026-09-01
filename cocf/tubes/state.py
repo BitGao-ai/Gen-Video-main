@@ -143,20 +143,33 @@ class TubeStateEncoder:
         return float(1.0 - sum(ious) / len(ious))
 
     def _interaction_scores(self, tubes: List[SemanticTube]) -> Dict[int, float]:
-        """Σ IoU of each tube's mask with every *other* tube on shared frames."""
+        """Mean IoU of each tube's mask with the *other* tubes, in ``[0, 1]``.
+
+        Normalised on both axes — over the frames a pair shares and over the tubes a
+        tube is compared against — because this lands in the 7-dim state vector, whose
+        other six components are all bounded. A raw sum grows with ``K`` and with clip
+        length, so it both dominated the predictor's input scale and disagreed with the
+        clamped ``interaction_density`` column written beside it in the same sample.
+        """
         scores = {t.tube_id: 0.0 for t in tubes}
+        if len(tubes) < 2:
+            return scores
         for i, ti in enumerate(tubes):
-            for tj in tubes[i + 1 :]:
+            for tj in tubes[i + 1:]:
                 shared = set(ti.masks_by_frame) & set(tj.masks_by_frame)
+                if not shared:
+                    continue
                 acc = 0.0
                 for f in shared:
                     mi, mj = ti.masks_by_frame[f], tj.masks_by_frame[f]
                     inter = (mi & mj).sum().float()
                     union = (mi | mj).sum().float().clamp_min(1.0)
                     acc += float(inter / union)
+                acc /= len(shared)
                 scores[ti.tube_id] += acc
                 scores[tj.tube_id] += acc
-        return scores
+        peers = len(tubes) - 1
+        return {tid: min(v / peers, 1.0) for tid, v in scores.items()}
 
     def _boundary_uncertainty(self, tube: SemanticTube) -> float:
         """Perimeter/area proxy: thin/fragmented tubes have uncertain boundaries."""

@@ -140,9 +140,11 @@ class ActionAllocator:
                                    action_risk.get(tid) if action_risk else None)
             admissible[tid] = adm
             cost[tid] = {a: self.action_cost[int(a)] * tube.size for a in adm}
-            # detach: μ here drives the non-differentiable control flow (knapsack);
-            # the differentiable training path uses ``stage_b_losses.action_probs``.
-            mu = predictions[tid].mu.detach() if tid in predictions else None
+            # detach + one ``tolist()``: μ here drives the non-differentiable control
+            # flow (knapsack), and reading it element-wise cost a device sync per
+            # (tube, action) — ~400 of them per generation. The differentiable training
+            # path uses ``stage_b_losses.action_probs``.
+            mu = predictions[tid].mu.detach().tolist() if tid in predictions else None
             dmg[tid] = {
                 a: (float(mu[int(a)]) if mu is not None else _prior_damage(a, prior_actions.get(tid)))
                 for a in adm
@@ -280,12 +282,14 @@ class ActionAllocator:
         """Actions a tube may take. FULL is always admissible (the safe fallback)."""
         if forced_full or (state is not None and state.is_unstable):
             return [Action.FULL]
+        # One transfer for the whole risk vector rather than one per action.
+        risks = risk.detach().tolist() if risk is not None else None
         acts = []
         for a in Action:
             if a == Action.FULL:
                 acts.append(a)
                 continue
-            if risk is not None and float(risk[int(a)]) > self.cfg.risk_threshold:
+            if risks is not None and float(risks[int(a)]) > self.cfg.risk_threshold:
                 continue  # this skip is too risky (§5.3.2) — forbid it
             acts.append(a)
         return acts

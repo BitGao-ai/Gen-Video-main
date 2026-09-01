@@ -103,7 +103,7 @@ class CounterfactualConfig:
     """Local single-hop counterfactual verification (§3.3.4)."""
 
     theta_sT: float = 0.50  # trigger CF check only at temporal mutation points s_T>θ
-    eta: float = 0.05  # residual threshold Δ<η ⇒ causal-omission ⇒ repair
+    eta: float = 0.05  # residual threshold: Δ>η ⇒ causal-omission ⇒ repair
     max_checks_per_step: int = 4  # T_jump · S budget cap (keep it cheap)
     repair_net_dim: int = 128  # lightweight residual-repair sub-net width
 
@@ -257,11 +257,6 @@ class EngineConfig:
     # any tube reaches it, the next whole-step-skip promotion is vetoed so the forward
     # runs and every certificate is re-grounded against a real δ. This is what makes
     # ``dense_step_skip_below`` safe to enable (§P4-A2). 0 removes the bound.
-    max_unmeasured_steps: int = 3
-    # Ceiling on consecutive steps a tube may go without a measured skip residual. Once
-    # any tube reaches it, the next whole-step-skip promotion is vetoed so the forward
-    # runs and every certificate is re-grounded against a real δ. This is what makes
-    # ``dense_step_skip_below`` safe to enable by default (§P4-A2). 0 removes the bound.
     max_unmeasured_steps: int = 3
     # Recompute the tokens no tube covers every N steps (0 = never). The background
     # is ~3/4 of the grid and is outside every RAEC guarantee — certificates, rollback
@@ -460,10 +455,25 @@ class TeacherConfig:
     # skip actions probed per (tube, step) — FULL (=0) is the zero-damage reference.
     probe_actions: Tuple[int, ...] = (1, 2, 3)  # LOW FREQ, INTERP, ANCHOR
     max_tubes_per_prompt: int = 4  # reduced from 8: halves rollout count per clip
-    samples_per_video: int = 15  # reduced from 30: matches 3 steps × 4 tubes × ~1 action
+    # One full Latin-square row of (tube × action) per representative step, so the cap
+    # spends its budget on 4 distinct tubes × 4 distinct actions instead of exhausting
+    # one tube first (see COCFDataGenerator._balanced_triplets).
+    samples_per_video: int = 12
+    # Samples between ``torch.cuda.empty_cache()`` calls inside the rollout loop; 0
+    # disables them. Off by default: ``cocf.common.alloc`` runs the allocator with
+    # ``expandable_segments``, which already returns freed blocks to a growable
+    # segment, so reclaiming on a fixed cadence only forces a device sync and makes
+    # the next allocations re-enter the driver. Raise it to 4–8 as an escape valve if
+    # a card OOMs mid-rollout.
+    free_memory_every: int = 0
     scene_balanced: bool = True  # balance static/dynamic/text/face/multi/occlusion
     use_preview_decode_for_tubes: bool = True  # segment a preview decode of z_t
     shard_size: int = 256  # records per on-disk shard
+    # Virtual map reserved for the LMDB store, in GiB. Only pages actually written are
+    # committed, so this is a ceiling rather than an allocation; the writer doubles it
+    # on demand, so it only needs to be raised to avoid the first few grow-and-retry
+    # cycles on a very large build.
+    lmdb_map_size_gib: int = 256
 
 
 # --------------------------------------------------------------------------- #

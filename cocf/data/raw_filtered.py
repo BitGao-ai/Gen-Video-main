@@ -168,6 +168,11 @@ class HardSamplePrioritySampler(Sampler[int]):
     often than easy ones. Sampling is **with replacement** so the boost is exact and
     the epoch length stays fixed; reshuffled deterministically per epoch via
     :meth:`set_epoch`.
+
+    ``rank``/``world_size`` shard the epoch: each rank draws its own
+    ``num_samples // world_size`` indices from the same weights with a rank-offset
+    seed. Drawing with replacement is what makes that sound — there is no pool to
+    partition, so every rank keeps the exact boost and the same step count.
     """
 
     def __init__(
@@ -177,13 +182,18 @@ class HardSamplePrioritySampler(Sampler[int]):
         hard_boost: float = 2.0,
         num_samples: Optional[int] = None,
         seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.n = len(scene_types)
         self.weights = torch.tensor(
             [hard_boost if s in HARD_SCENE_TYPES else 1.0 for s in scene_types],
             dtype=torch.float64,
         )
-        self.num_samples = int(num_samples) if num_samples else self.n
+        self.world_size = max(1, int(world_size))
+        self.rank = int(rank) % self.world_size
+        total = int(num_samples) if num_samples else self.n
+        self.num_samples = max(1, total // self.world_size)
         self.seed = int(seed)
         self.epoch = 0
 
@@ -196,6 +206,8 @@ class HardSamplePrioritySampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         if self.n == 0:
             return iter(())
-        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        g = torch.Generator().manual_seed(
+            self.seed + self.epoch * self.world_size + self.rank
+        )
         idx = torch.multinomial(self.weights, self.num_samples, replacement=True, generator=g)
         return iter(idx.tolist())

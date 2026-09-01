@@ -49,6 +49,7 @@ from cocf.lcocf.data import tube_clip_embed, tube_pixel_mask
 from cocf.lcocf.predictor import build_predictor_input_batch
 from cocf.training.stage_b_losses import (
     action_probs,
+    batch_float,
     budget_penalty,
     tube_temporal_smoothness,
 )
@@ -187,10 +188,10 @@ def cmsc_quality_loss(
 class StepRecord:
     """One (tube, step) observation from the Stage-C accelerated forward.
 
-    Carries exactly the inputs the regularisers re-run the predictor on — no μ/σ is
-    stored, because :func:`stage_c_regularizers` recomputes them with the *grad-on*
-    causal strength (the detached strengths used for allocation would not train the
-    strength weights).
+    Carries exactly the inputs the regularisers re-run the predictor and the
+    certificate on — no μ/σ is stored, because :func:`stage_c_regularizers` recomputes
+    them with the *grad-on* causal strength (the detached strengths used for allocation
+    would not train the strength weights).
     """
 
     tube_features: Tensor      # [7] tube state vector s_{k,t}
@@ -202,6 +203,8 @@ class StepRecord:
     timestep: int
     video_id: str
     interaction_density: float = 0.0
+    skip_residual: float = 0.0   # δ measured by the transition (certificate λ_res)
+    local_cmsc: float = 0.0      # 1 − align(tube, prompt) (certificate λ_cmsc)
 
 
 def collate_step_records(records: Sequence[StepRecord]) -> Dict[str, object]:
@@ -223,6 +226,12 @@ def collate_step_records(records: Sequence[StepRecord]) -> Dict[str, object]:
         "timestep": torch.tensor([r.timestep for r in records], dtype=torch.long),       # [M]
         "interaction_density": torch.tensor(
             [r.interaction_density for r in records], dtype=torch.float32
+        ),
+        "skip_residual": torch.tensor(
+            [r.skip_residual for r in records], dtype=torch.float32
+        ),
+        "local_cmsc": torch.tensor(
+            [r.local_cmsc for r in records], dtype=torch.float32
         ),
         "video_id": [r.video_id for r in records],
     }
@@ -293,17 +302,20 @@ def stage_c_regularizers(
     )
     l_budget = budget_penalty(probs, action_cost, budget)
 
-    # L_cert — certificate calibrated to the realised render damage
+    # L_cert — certificate calibrated to the realised render damage. ``residual`` and
+    # ``local_cmsc`` are the values the engine actually measured this step (captured by
+    # ``record_sink``), not the hard zeros this used to pass: calibrating E_cert against
+    # the full damage while omitting two of its terms pushes the remaining coefficients
+    # up to compensate, undoing the calibration Stage B learned.
     idx = actions.clamp(0, pred.mu.shape[-1] - 1).unsqueeze(-1)
     mu_a = pred.mu.gather(-1, idx).squeeze(-1)                        # [M]
     sigma_a = pred.sigma.gather(-1, idx).squeeze(-1)                  # [M]
-    zeros = mu_a.new_zeros(mu_a.shape)
     e_cert = accelerator.raec.certificate.value(
         mu_a, sigma_a,
-        residual=zeros,
+        residual=batch_float(batch, "skip_residual", mu_a),
         boundary=tube_features[:, _BOUNDARY_IDX],
         anchor_age=tube_features[:, _AGE_IDX],
-        local_cmsc=zeros,
+        local_cmsc=batch_float(batch, "local_cmsc", mu_a),
     )
     target = measured_damage.detach().to(device).reshape(-1).float()
     if target.numel() == 1:

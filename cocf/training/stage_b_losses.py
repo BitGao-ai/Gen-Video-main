@@ -168,8 +168,12 @@ def tube_temporal_smoothness(
     return total / pairs if pairs else total
 
 
-def _batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
-    """Per-sample float column as ``[B]`` on ``like``'s device (zeros when absent)."""
+def batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
+    """Per-sample float column as ``[B]`` on ``like``'s device (zeros when absent).
+
+    Shared with Stage C so both stages feed the certificate the same way — the two had
+    drifted, and the stage that passed zeros silently trained λ_res/λ_cmsc to nothing.
+    """
     v = batch.get(key)
     if not isinstance(v, Tensor) or v.numel() == 0:
         return like.new_zeros(like.shape)
@@ -297,8 +301,7 @@ def compute_joint_loss(
     # coefficients were decorative (§P1-13). Both now carry the real per-sample
     # signal Stage A measured: δ on the intervened tube, and the tube's local
     # text-alignment violation from the stored CMSC embeds.
-    zeros = mu_a.new_zeros(mu_a.shape)
-    residual = _batch_float(batch, "skip_residual", mu_a)
+    residual = batch_float(batch, "skip_residual", mu_a)
     local_cmsc = _local_cmsc_violation(accelerator, batch, mu_a)
     e_cert = accelerator.raec.certificate.value(
         mu_a, sigma_a,

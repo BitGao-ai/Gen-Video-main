@@ -85,12 +85,19 @@ class TextTubeAlignment(nn.Module):
     ) -> Tensor:
         """Stack a ``{tube_id: [d_v]}`` map into ``[K, d_v]`` in ``ids`` order.
 
-        Missing tubes get a zero row so the matrix stays well-defined when a tube
-        lacks a visual embedding on some frame.
+        Missing tubes get a zero row so the matrix stays well-defined when a tube lacks
+        a visual embedding on some frame. Every row is co-located before stacking:
+        ``tube_clip_embed`` returns its zero fallback on the frame's device while the
+        perception provider answers on its own, so a mixed batch would otherwise raise
+        inside ``torch.stack`` rather than degrade.
         """
+        rows = [tube_embeds.get(i) for i in ids]
+        target = device
+        if target is None:
+            present = next((r for r in rows if r is not None), None)
+            target = present.device if present is not None else None
         rows = [
-            tube_embeds[i] if i in tube_embeds and tube_embeds[i] is not None
-            else torch.zeros(dim, device=device)
-            for i in ids
+            r.to(target) if r is not None else torch.zeros(dim, device=target)
+            for r in rows
         ]
-        return torch.stack(rows).to(device) if rows else torch.zeros(0, dim, device=device)
+        return torch.stack(rows) if rows else torch.zeros(0, dim, device=target)

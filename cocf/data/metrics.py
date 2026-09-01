@@ -35,7 +35,8 @@ import torch.nn.functional as F
 
 from cocf.common.hf_clip import clip_image_embed, clip_text_embed, clip_text_inputs
 from cocf.common.logging import get_logger
-from cocf.common.memory import freeze
+from cocf.common.memory import freeze, normal_mode
+from cocf.common.raft import load_raft
 from cocf.lcocf.damage import MetricExtractor, VideoFeatures, crop_to_tube
 
 Tensor = torch.Tensor
@@ -45,11 +46,26 @@ _log = get_logger(__name__)
 _TEXT_CUES = ("text", "word", "letter", "sign", "logo", "caption", "number",
               "title", "subtitle", "字", "文字", "标题")
 
-# Frames (or frame pairs) pushed through a metric backbone in one forward. Sized
-# for RAFT, whose per-pair correlation volume is ``(H/8 · W/8)²`` floats — ~156 MB
-# at 480×832 — so 4 pairs peak around 0.6 GB instead of the ~7 GB a whole 49-frame
-# clip would need in a single batch. Reduced from 8 for 40 GB cards.
+# Frame *pairs* pushed through RAFT in one forward. Sized for its per-pair
+# correlation volume of ``(H/8 · W/8)²`` floats — ~156 MB at 480×832 — so 4 pairs peak
+# around 0.6 GB instead of the ~7 GB a whole 49-frame clip would need in a single
+# batch. Reduced from 8 for 40 GB cards.
 DEFAULT_FRAME_CHUNK = 4
+# Frames per forward for the plain per-frame towers (DINOv2, CLIP). These resize to
+# 224² first and hold no correlation volume, so RAFT's bound is not theirs: sharing it
+# split a 49-frame clip into 13 batches of 4 per tower and left the GPU idle between
+# launches. At 224² under ``no_grad`` a ViT-B batch of 16 is well under 1 GB.
+DEFAULT_VIT_CHUNK = 16
+# Longest edge RAFT sees. Its output is reduced to one mean-magnitude scalar per pair,
+# and both damage axes built on it (`_jerk_increase`, `_motion_deviation`) are ratios
+# against the reference's own scale, so the statistic is invariant to a resolution the
+# full and counterfactual sides share — while the correlation volume it drives falls
+# with the fourth power of the edge.
+DEFAULT_FLOW_MAX_EDGE = 448
+# Prompt embeddings cached per text tower. Stage A scores ~20 counterfactual rollouts
+# against one caption, so a handful of entries removes essentially every repeat encode
+# while keeping the cache bounded across a million-clip run.
+_TEXT_CACHE_MAX = 32
 
 
 def _chunks(total: int, size: int):
@@ -267,8 +283,12 @@ class ModelMetricExtractor(MetricExtractor):
         clip_name: str = "openai/clip-vit-base-patch32",
         enable_ocr: bool = False,
         frame_chunk: int = DEFAULT_FRAME_CHUNK,
+        vit_chunk: int = DEFAULT_VIT_CHUNK,
+        flow_max_edge: int = DEFAULT_FLOW_MAX_EDGE,
         share_from: Optional[object] = None,
         dtype: Optional["torch.dtype"] = None,
+        raft_weights: Optional[str] = None,
+        require_flow: bool = False,
     ) -> "ModelMetricExtractor":  # pragma: no cover - needs model downloads
         """Wire DINOv2 + CLIP + torchvision-RAFT (+ optional OCR) into callables.
 
@@ -282,13 +302,19 @@ class ModelMetricExtractor(MetricExtractor):
         Wrap-up only — the projections/normalisation that matter for *comparison*
         are the model defaults, applied identically to both videos being compared.
 
-        ``frame_chunk`` bounds how many frames (or frame *pairs*, for flow) go
-        through a backbone in one forward. It exists for VRAM, not throughput: RAFT
-        materialises an all-pairs correlation volume of
-        ``B × (H/8 · W/8)²`` floats, which for a whole 49-frame 480×832 clip is a
-        single ~7 GiB tensor — larger than anything else Stage A allocates. All the
-        models run in ``eval`` (so BatchNorm uses running stats) and every reduction
-        here is per-frame, so chunking is numerically transparent.
+        ``frame_chunk`` bounds how many frame *pairs* go through RAFT in one forward,
+        and ``vit_chunk`` how many frames go through DINOv2/CLIP. They are separate
+        because only RAFT materialises an all-pairs correlation volume of
+        ``B × (H/8 · W/8)²`` floats — the largest tensor Stage A allocates — while the
+        224²-resized ViT towers are merely launch-bound at RAFT's batch size.
+        ``flow_max_edge`` caps the resolution RAFT runs at, which is what makes that
+        volume affordable in the first place. All the models run in ``eval`` (so
+        BatchNorm uses running stats) and every reduction here is per-frame, so
+        chunking is numerically transparent.
+
+        ``raft_weights`` / ``require_flow`` are handed to
+        :func:`cocf.common.raft.load_raft` — see there for why an unavailable RAFT
+        must not degrade silently.
         """
         import torch as _t
         import torch.nn.functional as _F
@@ -355,11 +381,21 @@ class ModelMetricExtractor(MetricExtractor):
             return ((v - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)).to(enc_dtype)
 
         def _per_frame(video: Tensor, fn) -> Tensor:
-            """Apply a per-frame encoder over ``video`` in ``frame_chunk`` slices."""
+            """Apply a per-frame encoder over ``video`` in chunks.
+
+            A wide chunk is a throughput win only on the label-only path, where each
+            chunk's activations die as soon as it returns. On Stage C's §6.3.2
+            differentiable branch every chunk stays alive until backward, so widening
+            buys no memory headroom and only raises the per-forward transient on an
+            already tight budget — fall back to the narrow RAFT-sized chunk there, which
+            is what that branch used before. Chunking is numerically transparent either
+            way (every reduction here is per-frame), so this changes throughput only.
+            """
             f = video.shape[0]
             if f == 0:
                 return _t.zeros(0, device=device)
-            return _t.cat([fn(video[lo:hi]) for lo, hi in _chunks(f, frame_chunk)], 0)
+            size = frame_chunk if _t.is_grad_enabled() else vit_chunk
+            return _t.cat([fn(video[lo:hi]) for lo, hi in _chunks(f, size)], 0)
 
         def dino_fn(video: Tensor) -> Tensor:
             def _run(chunk: Tensor) -> Tensor:
@@ -374,6 +410,34 @@ class ModelMetricExtractor(MetricExtractor):
             # (see cocf.common.hf_clip). Stays differentiable for the §6.3.2 loss.
             return _per_frame(video, lambda c: clip_image_embed(clip, _prep(c, clip_proc, clip_dtype)))
 
+        text_cache: Dict[str, Tensor] = {}
+
+        def _text_embed(prompt: str) -> Tensor:
+            """Unit-norm fp32 prompt embedding, memoised across a clip's rollouts.
+
+            Built under ``normal_mode`` + ``no_grad`` so the entry is a plain tensor
+            regardless of the context that first asked for it. A cache is shared across
+            contexts by definition, and Stage A extracts under ``inference_mode``: an
+            entry allocated there is an *inference* tensor, and reusing it on Stage C's
+            differentiable branch — where ``img`` carries a graph and the matmul has to
+            save its operands — raises "Inference tensors cannot be saved for backward".
+            The towers are frozen, so dropping the graph costs nothing.
+            """
+            hit = text_cache.get(prompt)
+            if hit is not None:
+                return hit
+            with normal_mode(), _t.no_grad():
+                # clip_text_inputs, not a bare clip_proc(...): the text tower has a
+                # 77-token position table and rejects anything longer, so an
+                # untruncated OpenVid-1M caption crashed Stage A on its first clip
+                # (see hf_clip).
+                txt_in = clip_text_inputs(clip, clip_proc, [prompt], device=device)
+                txt = F.normalize(clip_text_embed(clip, **txt_in).float(), dim=-1)
+            if len(text_cache) >= _TEXT_CACHE_MAX:
+                text_cache.pop(next(iter(text_cache)))
+            text_cache[prompt] = txt
+            return txt
+
         def clip_text_fn(clip_feats: Tensor, prompt: str) -> float:
             # Both operands to fp32 before the cosine. ``extract`` hands us image
             # features it has already ``.float()``-ed (§P2-7 stopped re-encoding the
@@ -386,24 +450,34 @@ class ModelMetricExtractor(MetricExtractor):
             # where the speed is; a [1,d_clip] dot in fp32 costs nothing measurable
             # (same seam as the RAFT cast below).
             img = F.normalize(clip_feats.to(device).float().mean(0, keepdim=True), dim=-1)
-            # clip_text_inputs, not a bare clip_proc(...): the text tower has a
-            # 77-token position table and rejects anything longer, so an untruncated
-            # OpenVid-1M caption crashed Stage A on its first clip (see hf_clip).
-            txt_in = clip_text_inputs(clip, clip_proc, [prompt], device=device)
-            txt = F.normalize(clip_text_embed(clip, **txt_in).float(), dim=-1)
-            return float((img @ txt.T).clamp(-1, 1).item() * 0.5 + 0.5)
+            return float((img @ _text_embed(prompt).T).clamp(-1, 1).item() * 0.5 + 0.5)
 
-        try:
-            from torchvision.models.optical_flow import Raft_Small_Weights, raft_small
-            raft = freeze(raft_small(weights=Raft_Small_Weights.DEFAULT).to(device))
+        raft = load_raft(device, variant="small", weights_path=raft_weights,
+                         required=require_flow)
+        if raft is not None:
             # Videos decoded by a bf16/fp16 backbone must be cast to RAFT's own
             # weight dtype, or conv2d rejects the pair outright ("Input type
             # (c10::BFloat16) and bias type (float) should be the same"). Cast the
             # frames, not the module, so the caller's precision never leaks in.
             raft_dtype = next(raft.parameters()).dtype
 
+            def _raft_input(video: Tensor) -> Tensor:
+                """``[F,3,H,W]`` in [0,1] → RAFT's [-1,1] input, edge-capped, on device.
+
+                RAFT requires both spatial dims to be multiples of 8, so the capped
+                size is rounded down to that lattice.
+                """
+                v = (video.clamp(0, 1) * 2 - 1).to(device)
+                h, w = v.shape[-2:]
+                edge = max(h, w)
+                if flow_max_edge and edge > flow_max_edge:
+                    scale = flow_max_edge / edge
+                    size = (max(8, int(h * scale) // 8 * 8), max(8, int(w * scale) // 8 * 8))
+                    v = _F.interpolate(v, size=size, mode="bilinear", align_corners=False)
+                return v.to(raft_dtype)
+
             def flow_fn(video: Tensor) -> Tensor:
-                v = (video.clamp(0, 1) * 2 - 1).to(device=device, dtype=raft_dtype)
+                v = _raft_input(video)
                 a, b = v[:-1], v[1:]
                 if a.shape[0] == 0:
                     return _t.zeros(0, device=device)
@@ -412,10 +486,10 @@ class ModelMetricExtractor(MetricExtractor):
                 mags = []
                 for lo, hi in _chunks(a.shape[0], frame_chunk):
                     flow = raft(a[lo:hi], b[lo:hi])[-1]  # [n,2,H,W]
-                    mags.append(flow.flatten(1).norm(dim=1) / flow.shape[-1])
+                    mags.append(flow.norm(dim=1).flatten(1).mean(1))
                     del flow
                 return _t.cat(mags, 0)
-        except Exception:
+        else:
             def flow_fn(video: Tensor) -> Tensor:
                 d = _pool_frames(video.to(device))
                 return (d[1:] - d[:-1]).abs().mean(-1) if d.shape[0] >= 2 else _t.zeros(0, device=device)

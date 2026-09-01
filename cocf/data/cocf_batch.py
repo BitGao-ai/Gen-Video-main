@@ -63,6 +63,12 @@ class StratifiedBatchSampler(Sampler[List[int]]):
         ``sample_index.csv`` so planning a batch never reads a payload.
     batch_size
         Total batch size; split evenly across the present action buckets.
+    rank, world_size
+        Data-parallel shard of this process. Each *action bucket* is strided by rank,
+        so the 1:1:1:1 balance holds within every rank rather than only globally. The
+        batch count is derived from the global sample count, so every rank runs the
+        same number of steps — a rank that finished early would leave the others
+        blocked in the gradient all-reduce.
     """
 
     def __init__(
@@ -74,20 +80,29 @@ class StratifiedBatchSampler(Sampler[List[int]]):
         batch_size: int = 32,
         seed: int = 0,
         drop_last: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.n = len(actions)
         self.batch_size = max(1, int(batch_size))
         self.seed = int(seed)
         self.epoch = 0
+        self.world_size = max(1, int(world_size))
+        self.rank = int(rank) % self.world_size
         self.scenes = list(scenes) if scenes is not None else [""] * self.n
         self.strata = list(strata) if strata is not None else [""] * self.n
-        # bucket dataset indices by action; keep only non-empty buckets
+        # bucket dataset indices by action, then keep this rank's stride of each
         buckets: Dict[int, List[int]] = {}
         for i, a in enumerate(actions):
             buckets.setdefault(int(a), []).append(i)
-        self.action_buckets = {a: idxs for a, idxs in sorted(buckets.items()) if idxs}
-        self._num_batches = self.n // self.batch_size if drop_last else \
-            (self.n + self.batch_size - 1) // self.batch_size
+        self.action_buckets = {}
+        for a, idxs in sorted(buckets.items()):
+            shard = idxs[self.rank::self.world_size]
+            if shard:
+                self.action_buckets[a] = shard
+        per_rank = self.n // self.world_size
+        self._num_batches = per_rank // self.batch_size if drop_last else \
+            (per_rank + self.batch_size - 1) // self.batch_size
 
     def set_epoch(self, epoch: int) -> None:
         """Reshuffle deterministically per epoch (call before each epoch)."""
@@ -111,17 +126,24 @@ class StratifiedBatchSampler(Sampler[List[int]]):
             return
         per_action = max(1, self.batch_size // len(present))
         cursors = {a: 0 for a in present}
+
+        def draw(a: int) -> int:
+            # Small pools repeat (cursor wraps): forcing a 1:1:1:1 action mix on an
+            # imbalanced store necessarily oversamples the rare actions.
+            pool = pools[a]
+            i = pool[cursors[a] % len(pool)]
+            cursors[a] += 1
+            return i
+
         for _ in range(len(self)):
-            batch: List[int] = []
-            for a in present:
-                pool = pools[a]
-                for _k in range(per_action):
-                    # Small pools repeat (cursor wraps): forcing a 1:1:1:1 action mix
-                    # on an imbalanced store necessarily oversamples the rare actions.
-                    batch.append(pool[cursors[a] % len(pool)])
-                    cursors[a] += 1
+            batch: List[int] = [draw(a) for a in present for _k in range(per_action)]
+            # Top up round-robin when batch_size is not a multiple of the number of
+            # present actions: __len__ promises batches of batch_size, and a short
+            # batch would also make the epoch consume fewer samples than it reports.
+            while len(batch) < self.batch_size:
+                batch.append(draw(present[len(batch) % len(present)]))
             rng.shuffle(batch)
-            yield batch[: self.batch_size] if len(batch) > self.batch_size else batch
+            yield batch[: self.batch_size]
 
     def _interleaved(self, idxs: Sequence[int], rng: random.Random) -> List[int]:
         """Order ``idxs`` so consecutive entries vary in timestep stratum and scene.
@@ -171,15 +193,24 @@ def collate_cocf_samples(batch: Sequence[Mapping[str, object]]) -> Dict[str, obj
     for key in _STRING_FIELDS:
         out[key] = [str(b.get(key, "")) for b in batch]
 
-    # text token sequence: pad [L_i, d_c] → [B, L_max, d_c] with a [B, L_max] mask
+    # text token sequence: pad [L_i, d_c] → [B, L_max, d_c] with a [B, L_max] mask.
+    # A sample whose per-clip embedding is missing gets an all-zero row and an all-zero
+    # mask rather than disqualifying the batch: dropping the field entirely made
+    # ``_cmsc_conservation`` return None and the certificate's local-CMSC term fall
+    # back to a hard zero, so one unwritten text_embeds/<vid>.pt silently switched off
+    # L_cmsc for every batch it appeared in.
     text = [_as_tensor(b.get("text_embed")) for b in batch]
-    text = [t for t in text if t is not None and t.dim() == 2]
-    if len(text) == n and n > 0:
-        d_c = text[0].shape[-1]
-        l_max = max(t.shape[0] for t in text)
+    text = [t if (t is not None and t.dim() == 2) else None for t in text]
+    out["text_missing"] = sum(1 for t in text if t is None)
+    ref = next((t for t in text if t is not None), None)
+    if ref is not None and n > 0:
+        d_c = ref.shape[-1]
+        l_max = max(t.shape[0] for t in text if t is not None)
         padded = torch.zeros(n, l_max, d_c)
         mask = torch.zeros(n, l_max)
         for i, t in enumerate(text):
+            if t is None:
+                continue
             li = t.shape[0]
             padded[i, :li] = t.float()
             mask[i, :li] = 1.0

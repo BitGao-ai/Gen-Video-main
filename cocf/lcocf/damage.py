@@ -267,13 +267,15 @@ class MultiDimDamageComputer:
         """Increase in flow-magnitude jerk, **relative to the reference's own scale**.
 
         The absolute difference is not comparable across metric backends: the mock's
-        ``flow_mag`` is a descriptor-difference mean while the real extractor's is
-        ``‖flow‖ / W``, so the same motion yields values orders of magnitude apart and
-        a damage label generated with one backend cannot be read with the other.
+        ``flow_mag`` is a descriptor-difference mean while the real extractor's is a
+        mean RAFT magnitude, so the same motion yields values orders of magnitude apart
+        and a damage label generated with one backend cannot be read with the other.
         Every other axis here is already a *ratio* or a bounded drop; this one was the
         exception. Normalising by the reference jerk makes it scale-free and puts it
         on the same [0, 1] footing as the rest.
         """
+        ref_mag, cf_mag = _align(ref_mag, cf_mag)
+
         def jerk(mag: Tensor) -> float:
             if mag.numel() < 2:
                 return 0.0
@@ -286,7 +288,20 @@ class MultiDimDamageComputer:
         return float(min((cf - ref) / max(denom, self.eps), 1.0))
 
     def _motion_deviation(self, ref_mag: Tensor, cf_mag: Tensor) -> float:
+        ref_mag, cf_mag = _align(ref_mag, cf_mag)
         if ref_mag.numel() == 0:
             return 0.0
         denom = ref_mag.abs().mean().clamp_min(self.eps)
         return float(((cf_mag - ref_mag).abs().mean() / denom).clamp(0.0, 1.0))
+
+
+def _align(a: Tensor, b: Tensor) -> Tuple[Tensor, Tensor]:
+    """Trim two per-pair series to their common length, co-located on ``a``'s device.
+
+    A tube-localised feature spans only the frames its tube covers, so the two sides of
+    a comparison are not guaranteed to be the same length; an unaligned subtraction
+    either raises or — worse, when one side happens to be length 1 — broadcasts and
+    scores nonsense. :meth:`CMSCLoss._motion_term` already guards the same pair.
+    """
+    n = min(a.numel(), b.numel())
+    return a[:n], b[:n].to(a.device)

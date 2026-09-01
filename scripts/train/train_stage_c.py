@@ -33,14 +33,20 @@ geometry and the step count agree. Both are read back from
 ``metadata/stage_a_env.json`` and applied automatically; explicit ``--num-frames/
 --height/--width`` override them and will be warned about if they disagree.
 
-VRAM on a 40 GB card with A14B: one expert is resident at ~26.1 GiB, leaving ~12 GiB.
+VRAM on a 40 GB card with A14B: one expert is resident at ~26.1 GiB, leaving ~13 GiB.
 Activation checkpointing is on for **both** experts, so the retained graph is one block
 input per block per BPTT segment — ~5 GiB at 12,480 tokens with ``--grad-window-steps
-1``. The windowed differentiable decode adds ~1.5 GiB at ``--decode-grad-frames 4``.
+1`` — plus ~3 GiB of in-block recompute and ~1.5 GiB for the windowed differentiable
+decode at ``--decode-grad-frames 4``. ``FinettuneStage`` computes that budget from the
+flags actually in force and warns when it does not fit.
 ``--use_lora`` is **not** feasible here: LoRA is injected into both experts, but only
 one can be resident, and moving a module across devices while its activations are on
 the autograd graph is not sound. If you OOM: ``--decode-grad-frames 2``, then
 ``--vae-tile 96``, then ``--metric-frame-chunk 1``.
+
+Data-parallel (one process per GPU)::
+
+    torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_c.py ...
 """
 
 import argparse
@@ -174,10 +180,25 @@ def _apply_stage_a_env(config: Config, processed_root, args, log) -> None:
             "two full trajectories. Regenerate Stage A without --use-real-video for a "
             "store that feeds Stage C."
         )
+    # The schedule shift decides both the trajectory and (on a Wan2.2 MoE) which expert
+    # runs at each noise level, so a Stage C that renders on a different one is not
+    # comparable to the Y_full it is scored against — and nothing downstream would
+    # notice, because the shapes still match.
+    stored_shift = (env.get("backbone_extra") or {}).get("flow_shift")
+    run_shift = (config.backbone.extra or {}).get("flow_shift")
+    if stored_shift is not None and run_shift is not None \
+            and abs(float(stored_shift) - float(run_shift)) > 1e-6:
+        log.warning(
+            "flow_shift %.3f in this run vs %.3f in the store: the accelerated render "
+            "and Y_full follow different noise schedules, so the quality loss charges "
+            "the schedule difference to the accelerator. Pass --flow-shift %s.",
+            float(run_shift), float(stored_shift), stored_shift,
+        )
     log.info(
-        "Stage A env: %dx%dx%d, %d teacher steps, token_dim=%s",
+        "Stage A env: %dx%dx%d, %d teacher steps, token_dim=%s, flow_shift=%s",
         config.data.num_frames, config.data.height, config.data.width,
         config.teacher.num_inference_steps, env.get("token_dim", "?"),
+        stored_shift if stored_shift is not None else "1.0",
     )
 
 
