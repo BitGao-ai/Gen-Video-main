@@ -465,14 +465,72 @@ class DiffusersVideoBackbone(BackboneAdapter):
 
     # -- VAE ------------------------------------------------------------- #
 
+    def _latent_norm(self, ref: Tensor) -> Optional[Tuple[Tensor, Tensor]]:
+        """Per-channel ``(mean, std)`` of this VAE's latent space, or ``None``.
+
+        Wan's VAE is **not** normalised by a single ``scaling_factor`` the way SD-era
+        VAEs are: ``AutoencoderKLWan`` never registers that key at all (so the
+        ``getattr(..., 1.0)`` fallback below is a no-op on it), and publishes 16
+        per-channel ``latents_mean``/``latents_std`` instead. The official
+        ``WanPipeline`` applies them around every VAE call — ``(raw - mean) / std``
+        going in, ``latent * std + mean`` coming out. The VAE does *not* apply them
+        itself, so omitting them is silent rather than fatal.
+
+        It is load-bearing here because the transformer is a **pretrained** Wan DiT: it
+        denoises in the standardised space (:meth:`initial_latent` seeds ``N(0, I)``,
+        and ``z0`` leaves the loop with per-channel mean ≈ 0, std ≈ 1). Handing that
+        straight to a decoder that expects the raw space — mean ∈ [-0.95, 1.55], std ∈
+        [1.13, 3.27] — is not a uniform dimming that some later gamma could undo: the
+        stds differ by 2.9× *across channels*, so the decoder sees the 16 channels
+        mis-weighted against each other and returns a desaturated, colour-shifted wash.
+        Nothing downstream can detect it, because the counterfactual side is distorted
+        by exactly the same transform as the reference side.
+
+        Returns ``None`` for VAEs publishing no such statistics — HunyuanVideo's
+        ``AutoencoderKLHunyuanVideo`` is a plain ``scaling_factor=0.476986`` VAE — which
+        leaves the scale-only path exactly as it was.
+
+        ``ref`` supplies device/dtype: the VAE may be off-device between calls
+        (:meth:`_reclaim_before_vae`), so the statistics are matched to the tensor they
+        operate on rather than to ``self.device``.
+        """
+        cfg = getattr(self.vae, "config", None)
+        mean = getattr(cfg, "latents_mean", None)
+        std = getattr(cfg, "latents_std", None)
+        if mean is None or std is None:
+            return None
+        c = ref.shape[1]
+        if len(mean) != c or len(std) != c:
+            # A wrong-length statistic would either raise deep inside the VAE or — for
+            # c == 1 — broadcast channel 0 over everything and corrupt silently, which
+            # is the whole failure class this method exists to close. Refuse instead.
+            raise RuntimeError(
+                f"{type(self).__name__}: vae.config latents_mean/latents_std have "
+                f"{len(mean)}/{len(std)} entries but the latent has {c} channels"
+            )
+        kw = {"device": ref.device, "dtype": ref.dtype}
+        return (torch.tensor(mean, **kw).view(1, c, 1, 1, 1),
+                torch.tensor(std, **kw).view(1, c, 1, 1, 1))
+
     def encode_video(self, video: Tensor) -> Tensor:
+        """``[B, C_pix, F, H, W] -> [B, C, T, H', W']`` in the **model's** latent space.
+
+        Standardised, i.e. the space :meth:`denoise` operates in and the exact inverse
+        of :meth:`decode_latent` — see :meth:`_latent_norm` for why that is two
+        transforms on a Wan VAE and one on a Hunyuan one.
+        """
         self._ensure_loaded()
         self._reclaim_before_vae()
         with self._forward_ctx():
             x = video.to(self.device, self.dtype)
             lat = self.vae.encode(x).latent_dist.sample()  # type: ignore[union-attr]
+            norm = self._latent_norm(lat)
+            if norm is not None:
+                mean, std = norm
+                lat = (lat - mean) / std
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             return lat * scale
+        return None
 
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
         """``[B, C, T, H, W] -> [B, C_pix, F, H_pix, W_pix]``.
@@ -481,13 +539,23 @@ class DiffusersVideoBackbone(BackboneAdapter):
         ``backbone.grad_mode()`` gets a decode that is **on** the autograd graph (the
         §4.2 pixel/semantic loss path); everyone else keeps the ``inference_mode``
         decode and its memory saving.
+
+        ``latent_grid`` is in the standardised space the transformer denoises in, so it
+        is de-standardised back to the VAE's own raw space before the decode — the
+        inverse of :meth:`encode_video`, and what the official ``WanPipeline`` does at
+        the same point. :meth:`_latent_norm` explains why skipping it is silent.
         """
         self._ensure_loaded()
         self._reclaim_before_vae()
         with self._forward_ctx():
             scale = getattr(self.vae.config, "scaling_factor", 1.0)  # type: ignore[union-attr]
             x = latent_grid.to(self.device, self.dtype) / scale
+            norm = self._latent_norm(x)
+            if norm is not None:
+                mean, std = norm
+                x = x * std + mean
             return self.vae.decode(x).sample  # type: ignore[union-attr]
+        return None
 
     def pixel_span(self, lo: int, hi: int):
         """Causal-temporal VAE layout: slot 0 → 1 frame, every later slot → ``c_t``.

@@ -180,7 +180,7 @@ torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_b.py \
 
 ```bash
 python scripts/train/train_stage_c.py \
-    --processed-root ./LCOCF_OpenVid1M_Processed \
+    --processed-root ./LCOCF_Test10_Processed \
     --checkpoint_load ./checkpoints/stage_b_final.pt \
     --checkpoint_save ./checkpoints/stage_c_final.pt \
     --backbone wan22 --wan-variant a14b-t2v \
