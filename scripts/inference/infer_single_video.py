@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Backbone selection, §9.1 residency and render geometry come from the shared
     # helpers, so a render reproduces what Stage A/C were configured with rather than
     # silently falling back to BackboneConfig's defaults (cocf/common/vram.py).
-    add_backbone_args(p, default_backbone="mock", default_wan_variant="ti2v-5b",
+    add_backbone_args(p, default_backbone="mock", default_wan_variant="a14b-t2v",
                       default_vae_tile=128)
     add_geometry_args(p)
     p.add_argument("--device", type=str, default="cuda")

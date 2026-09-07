@@ -229,7 +229,7 @@ def main():
     add_backbone_args(
         parser,
         default_backbone="mock",
-        default_wan_variant="ti2v-5b",
+        default_wan_variant="a14b-t2v",
         # Unlike Stage A's label-only decode, this one runs *on the autograd graph*, so
         # every tile's intermediates are retained for backward and a large tile costs
         # more than it saves. Bounded further by --decode-grad-frames.

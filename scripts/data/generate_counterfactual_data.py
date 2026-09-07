@@ -143,6 +143,7 @@ def main():
         parser,
         default_backbone="wan22",
         default_model_path=str(DEFAULT_MODEL_PATH),
+        default_wan_variant="a14b-t2v",
         # Stage A's decode is label-only, so it takes the largest tile its headroom
         # allows: peak scales with tile², tile *count* with 1/tile². At 384x640 that
         # is 8 tiles at 256 px against 28 at 128 px, for ~1.4 GiB of transient.

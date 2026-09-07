@@ -45,7 +45,7 @@ def add_backbone_args(
     *,
     default_backbone: str = "wan22",
     default_model_path: str = "",
-    default_wan_variant: str = "ti2v-5b",
+    default_wan_variant: str = "a14b-t2v",
     default_vae_tile: int = 256,
 ) -> None:
     """Backbone selection + the §9.1 VRAM residency switches.
