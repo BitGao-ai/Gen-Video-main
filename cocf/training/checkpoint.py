@@ -24,7 +24,7 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Optional
 
 from cocf.common.logging import get_logger
-from cocf.training.lora import attach_lora, lora_state_dict
+from cocf.training.lora import attach_lora, lora_state_dict, LoRALinear
 
 _log = get_logger(__name__)
 
@@ -47,8 +47,32 @@ def build_checkpoint(
     back (see :func:`cocf.training.lora.attach_lora`).
     """
     ckpt: Dict[str, Any] = {ACCELERATOR_KEY: accelerator.state_dict()}
+    ckpt["risk_definition"] = "neutral_centered_v1"
+    ckpt["model_metadata"] = {
+        "backbone": (accelerator.config.backbone.name
+                     if accelerator.config.backbone.name != "mock" else None),
+        "text_dim": accelerator.text_dim,
+        "visual_dim": accelerator.visual_dim,
+        "token_dim": accelerator.token_dim,
+    }
     lora = lora_state_dict(accelerator.backbone)
     if lora:
+        modules = {id(m): m for _, root in accelerator.backbone.lora_roots()
+                   if root is not None for m in root.modules() if isinstance(m, LoRALinear)}
+        geometries = {(m.lora_A.shape[0], m.scaling * m.lora_A.shape[0]) for m in modules.values()}
+        if len(geometries) != 1:
+            raise ValueError("Mixed LoRA ranks/scales cannot be represented by this checkpoint format")
+        rank, alpha = next(iter(geometries))
+        for count in range(1, len(list(accelerator.backbone.dit_blocks())) + 1):
+            targets = {id(m) for block in accelerator.backbone.lora_target_blocks(count)
+                       for m in block.modules() if isinstance(m, LoRALinear)}
+            # Target blocks must not include unwrapped linear layers on reload.
+            blocks = list(accelerator.backbone.lora_target_blocks(count))
+            if targets == set(modules) and all(any(isinstance(m, LoRALinear) for m in b.modules()) for b in blocks):
+                last_n_blocks = count
+                break
+        else:
+            raise ValueError("Cannot infer the actual LoRA target block geometry")
         ckpt[LORA_KEY] = lora
         ckpt[LORA_CONFIG_KEY] = {
             "rank": rank, "alpha": alpha, "last_n_blocks": last_n_blocks,
@@ -106,8 +130,8 @@ def load_checkpoint(
     *,
     training_config: Any = None,
     attach: bool = True,
-    strict_lora: bool = False,
-    allow_shape_mismatch: bool = True,
+    strict_lora: bool = True,
+    allow_shape_mismatch: bool = False,
 ) -> int:
     """Restore plugin weights from **either** checkpoint layout; return LoRA count.
 
@@ -128,9 +152,20 @@ def load_checkpoint(
         match.
     """
     state = ckpt[ACCELERATOR_KEY] if is_two_part(ckpt) else ckpt
+    metadata = ckpt.get("model_metadata", {}) if is_two_part(ckpt) else {}
+    expected = {"backbone": accelerator.config.backbone.name,
+                "text_dim": accelerator.text_dim, "visual_dim": accelerator.visual_dim,
+                "token_dim": accelerator.token_dim}
+    if not allow_shape_mismatch:
+        for key, value in metadata.items():
+            if key in expected and value is not None and value != expected[key]:
+                raise ValueError(f"Checkpoint {key}={value!r}, current model={expected[key]!r}")
+    if not is_two_part(ckpt) or ckpt.get("risk_definition") != "neutral_centered_v1":
+        _log.warning("Legacy checkpoint: certificate calibration must be validated or retrained "
+                     "for neutral-centered CMSC risk inputs")
     if allow_shape_mismatch:
         state = _filter_shape_mismatch(accelerator, state)
-    accelerator.load_state_dict(state, strict=False)
+    accelerator.load_state_dict(state, strict=not allow_shape_mismatch)
     missing = [k for k in accelerator.state_dict() if k not in state]
     if missing:
         # Includes anything _filter_shape_mismatch just dropped (already detailed

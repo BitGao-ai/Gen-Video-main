@@ -242,7 +242,7 @@ def main():
     perception, metric_extractor = build_perception_and_metrics(args, log)
 
     log.info("Building accelerator with backbone '%s' (perception=%s, metrics=%s)",
-             args.backbone, "real" if perception else "mock",
+             config.backbone.name, "real" if perception else "mock",
              "real" if metric_extractor else "mock")
     accelerator = Accelerator.from_config(
         config, perception=perception, metric_extractor=metric_extractor,

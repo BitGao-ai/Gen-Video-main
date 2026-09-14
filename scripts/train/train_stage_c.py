@@ -249,6 +249,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
+    if args.batch_size != 1:
+        parser.error("--batch_size must be 1: semantic-tube state is per video")
+    if args.checkpoint_load and not args.checkpoint_load.is_file():
+        parser.error(f"Checkpoint not found: {args.checkpoint_load}")
 
     # Join the process group first: it must happen before any weight is built (it
     # pins this rank's CUDA device) and before logging is configured (so the extra

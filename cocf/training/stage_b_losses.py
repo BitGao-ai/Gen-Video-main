@@ -45,6 +45,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from cocf.common.config import TrainingConfig
+from cocf.cmsc.alignment import alignment_risk
 from cocf.common.types import TUBE_STATE_FIELDS
 from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS, NUM_DAMAGE_DIMS
 from cocf.lcocf.predictor import build_predictor_input_batch
@@ -207,10 +208,11 @@ def _local_cmsc_violation(accelerator, batch: Dict[str, object], like: Tensor) -
             tokens = txt[i]
             if isinstance(mask, Tensor) and mask.numel():
                 keep = mask.to(dev)[i].bool()
-                if bool(keep.any()):
-                    tokens = tokens[keep]        # ignore padding tokens
+                tokens = tokens[keep]
+            if tokens.shape[0] == 0:
+                continue
             score = accelerator.cmsc_alignment.tube_scores(tokens, cf[i : i + 1])
-            out[i] = 1.0 - score.reshape(-1)[0]
+            out[i] = alignment_risk(score).reshape(-1)[0]
     return out
 
 
@@ -319,7 +321,7 @@ def compute_joint_loss(
 
     # --- L_budget: expected action cost vs the dynamic budget ---------------- #
     action_cost = torch.tensor(
-        accelerator.config.allocator.action_cost, device=device, dtype=torch.float32
+        accelerator.allocator.action_cost, device=device, dtype=torch.float32
     )
     l_budget = budget_penalty(probs, action_cost, budget)
 

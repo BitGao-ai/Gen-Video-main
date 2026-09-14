@@ -43,7 +43,9 @@ from cocf.data import (
     timestep_stratum,
 )
 from cocf.lcocf.predictor import build_predictor_input_batch
+from cocf.training.checkpoint import build_checkpoint
 from cocf.training.distributed import (
+    all_agree,
     all_reduce_mean,
     assert_same,
     average_gradients,
@@ -56,6 +58,8 @@ from cocf.training.stage_b_losses import (
     damage_scalar_batch,
     per_sample_budget,
     tube_temporal_smoothness,
+    batch_float,
+    _local_cmsc_violation,
 )
 
 Tensor = torch.Tensor
@@ -216,9 +220,11 @@ class JointTrainingStage:
 
             for batch_idx, batch in enumerate(train_loader):
                 global_step += 1
-                if global_step < opt.warmup_steps:  # linear LR warmup
+                if global_step <= opt.warmup_steps:  # include the target-LR boundary
                     for g in self.optimizer.param_groups:
                         g["lr"] = opt.lr * global_step / max(1, opt.warmup_steps)
+                    if global_step == opt.warmup_steps:
+                        _log.info("Stage B warmup complete: step=%d lr=%.8g", global_step, opt.lr)
 
                 with autocast(str(self.device), self._amp_dtype):
                     total, comps = compute_joint_loss(
@@ -230,9 +236,25 @@ class JointTrainingStage:
                 if self.scaler is not None:
                     self.scaler.scale(total).backward()
                     self.scaler.unscale_(self.optimizer)
+                    finite = all_agree(
+                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.trainable_params),
+                        self.dctx, device=torch.device(self.device))
+                    if not finite:
+                        self.scaler.update(new_scale=self.scaler.get_scale() * self.scaler.get_backoff_factor())
+                        self.optimizer.zero_grad(set_to_none=True)
+                        _log.warning("Stage B step %d: nonfinite gradients; all ranks skip update", global_step)
+                        continue
                     # Average across ranks *before* clipping, so every rank clips the
                     # same gradient and therefore takes an identical step.
                     average_gradients(self.trainable_params, self.dctx)
+                    finite = all_agree(
+                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.trainable_params),
+                        self.dctx, device=torch.device(self.device))
+                    if not finite:
+                        self.scaler.update(new_scale=self.scaler.get_scale() * self.scaler.get_backoff_factor())
+                        self.optimizer.zero_grad(set_to_none=True)
+                        _log.warning("Stage B step %d: gradient reduction overflow; all ranks skip update", global_step)
+                        continue
                     torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -265,7 +287,7 @@ class JointTrainingStage:
             # non-validation epoch score as "no improvement" and tripped the patience
             # counter on a run that was still converging.
             if val_loader is not None:
-                if (epoch + 1) % self.train_cfg.val_every_epochs != 0:
+                if self.train_cfg.val_every_epochs <= 0 or (epoch + 1) % self.train_cfg.val_every_epochs != 0:
                     continue
                 metrics = self._validate(val_loader)
                 _log.info("  val  %s", self._fmt(metrics))
@@ -277,7 +299,7 @@ class JointTrainingStage:
                 best_metric = monitor
                 epochs_no_improve = 0
                 if self.dctx.is_main:
-                    torch.save(self.accelerator.state_dict(),
+                    torch.save(build_checkpoint(self.accelerator),
                                self.config.checkpoint_dir / "stage_b_best.pt")
                 _log.info("  new best (%.4f) → stage_b_best.pt", best_metric)
             else:
@@ -306,7 +328,7 @@ class JointTrainingStage:
 
         n = 0
         abs_err = cert_viol = budget_hit = smooth = 0.0
-        action_cost = torch.tensor(acc.config.allocator.action_cost, device=self.device)
+        action_cost = torch.tensor(acc.allocator.action_cost, device=self.device)
         for batch in loader:
             tube_features = batch["tube_features"].to(self.device).float()
             strength_features = batch["strength_features"].to(self.device).float()
@@ -325,9 +347,9 @@ class JointTrainingStage:
             mu_a = pred.mu.gather(-1, idx).squeeze(-1)
             sigma_a = pred.sigma.gather(-1, idx).squeeze(-1)
             e_cert = acc.raec.certificate.value(
-                mu_a, sigma_a, residual=mu_a.new_zeros(mu_a.shape),
+                mu_a, sigma_a, residual=batch_float(batch, "skip_residual", mu_a),
                 boundary=tube_features[:, 3], anchor_age=tube_features[:, 6],
-                local_cmsc=mu_a.new_zeros(mu_a.shape),
+                local_cmsc=_local_cmsc_violation(acc, batch, mu_a),
             )
             probs = action_probs(pred.mu)
             expected_cost = (probs * action_cost).sum(-1)

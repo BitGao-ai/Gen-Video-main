@@ -131,7 +131,8 @@ class Accelerator(nn.Module):
         # -- decision layer: budget + allocator + action executor ------------ #
         self.budget_scheduler = BudgetScheduler(config.budget)
         self.allocator = ActionAllocator(
-            config.allocator, lowfreq_stride=config.engine.lowfreq_stride
+            config.allocator, lowfreq_stride=config.engine.lowfreq_stride,
+            identity_unstable_threshold=config.tube.identity_unstable_threshold,
         )
         self.transition = TransitionExecutor(
             backbone,

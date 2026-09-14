@@ -54,23 +54,27 @@ class MockBackbone(BackboneAdapter):
         self._vae_s = int(extra.get("vae_spatial", 8))
         self._d_text = int(extra.get("text_dim", 16))
         self._text_len = int(extra.get("text_len", 8))
-        torch.manual_seed(extra.get("seed", 0))
+        # Deterministic init without resetting the caller's global RNG (a bare
+        # torch.manual_seed here silently re-seeded every later consumer of the
+        # global stream, e.g. encode_video's latent sampling).
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(extra.get("seed", 0)))
 
-        d = self._d
-        # patch embed: latent channels -> token dim, and back for to_grid
-        self.patch_embed = nn.Linear(self._c, d)
-        self.unpatch = nn.Linear(d, self._c)
-        # a single attention+MLP block standing in for the DiT stack
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(d, num_heads=4, batch_first=True)
-        self.cross = nn.MultiheadAttention(d, num_heads=4, batch_first=True, kdim=d, vdim=d)
-        self.text_proj = nn.Linear(self._d_text, d)
-        self.mlp = nn.Sequential(nn.Linear(d, d * 2), nn.GELU(), nn.Linear(d * 2, d))
-        self.t_embed = nn.Sequential(nn.Linear(1, d), nn.SiLU(), nn.Linear(d, d))
-        self._net = nn.ModuleList(
-            [self.patch_embed, self.unpatch, self.norm, self.attn, self.cross,
-             self.text_proj, self.mlp, self.t_embed]
-        )
+            d = self._d
+            # patch embed: latent channels -> token dim, and back for to_grid
+            self.patch_embed = nn.Linear(self._c, d)
+            self.unpatch = nn.Linear(d, self._c)
+            # a single attention+MLP block standing in for the DiT stack
+            self.norm = nn.LayerNorm(d)
+            self.attn = nn.MultiheadAttention(d, num_heads=4, batch_first=True)
+            self.cross = nn.MultiheadAttention(d, num_heads=4, batch_first=True, kdim=d, vdim=d)
+            self.text_proj = nn.Linear(self._d_text, d)
+            self.mlp = nn.Sequential(nn.Linear(d, d * 2), nn.GELU(), nn.Linear(d * 2, d))
+            self.t_embed = nn.Sequential(nn.Linear(1, d), nn.SiLU(), nn.Linear(d, d))
+            self._net = nn.ModuleList(
+                [self.patch_embed, self.unpatch, self.norm, self.attn, self.cross,
+                 self.text_proj, self.mlp, self.t_embed]
+            )
         for p in self._net.parameters():
             p.requires_grad_(False)  # frozen, like a real pretrained backbone
         # Reside on the configured device, exactly like a real backbone loaded onto
@@ -92,7 +96,6 @@ class MockBackbone(BackboneAdapter):
 
     def token_grid(self, num_frames: int, height: int, width: int) -> TokenGrid:
         t = max(1, num_frames // self._patch_t)
-        h = max(1, height // (self._vae_s * self._patch_s) * self._patch_s) or 1
         # simplest sane mapping for tests: latent grid = pixels / vae / patch
         h = max(1, height // self._vae_s // self._patch_s)
         w = max(1, width // self._vae_s // self._patch_s)
@@ -163,7 +166,12 @@ class MockBackbone(BackboneAdapter):
             g = torch.Generator().manual_seed(int(digest, 16) % (2 ** 31))
             embeds[i] = torch.randn(self._text_len, self._d_text, generator=g)
         mask = torch.ones(b, self._text_len)
-        return TextConditioning(embeds=embeds, mask=mask, prompts=tuple(prompts))
+        return TextConditioning(
+            # On the adapter's device like a real encoder's output — ``denoise``
+            # only casts dtype, so a CUDA mock would otherwise mix devices.
+            embeds=embeds.to(self.device), mask=mask.to(self.device),
+            prompts=tuple(prompts),
+        )
 
     # -- denoiser (real gather/scatter sparsity) ------------------------ #
 
@@ -232,7 +240,9 @@ class MockBackbone(BackboneAdapter):
 
     def _mk_cache(self, eps: Tensor, prev: Optional[BackboneCache]) -> BackboneCache:
         step = (prev.step + 1) if prev is not None else 0
-        return BackboneCache(model_output=eps, step=step)
+        # The adapter contract (transition.py) is that the cached copy is detached:
+        # keeping the graph on it would chain every step's activations together.
+        return BackboneCache(model_output=eps.detach(), step=step)
 
     # -- scheduler (simple Euler / flow-matching style update) ---------- #
 

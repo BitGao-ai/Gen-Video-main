@@ -153,6 +153,10 @@ class InferenceEngine(nn.Module):
         # The peak-memory probe wraps the whole trajectory because §9.4 asks for 峰值显存
         # alongside the latency/FLOPs figures, and a saving that is really a
         # memory-for-time trade should be visible as one. It is a no-op off CUDA.
+        if z_init.shape[0] != 1 or len(prompts) != 1 or cond.embeds.shape[0] != 1:
+            raise ValueError("InferenceEngine requires a single video and prompt per call")
+        if cond.prompts and list(cond.prompts) != list(prompts):
+            raise ValueError("prompts must match the encoded conditioning prompts")
         with peak_memory("engine.generate") as mem:
             with backbone.grad_mode(decode_grad):
                 result = self._generate(
@@ -208,8 +212,9 @@ class InferenceEngine(nn.Module):
         # case here: a run computing 2 of 30 steps would train nothing at all while
         # every log line still said use_lora. 0 keeps the whole trajectory.
         window = int(getattr(self.engine_cfg, "grad_window_steps", 0))
-        truncating = decode_grad and window > 0
-        retained_computed = 0
+        state.grad_window = window if decode_grad else 0
+        _log.info("generation start: steps=%d batch=%d tokens=%d decode_grad=%s grad_window=%d",
+                  num_steps, batch_size, grid.num_tokens, decode_grad, state.grad_window)
 
         for step_idx in range(num_steps):
             # Reverse time: step 0 is t=T, step num_steps-1 is t=1
@@ -227,19 +232,17 @@ class InferenceEngine(nn.Module):
             )
             state.traces.append(trace)
 
-            # Cut the graph once it holds ``window`` denoiser forwards (no-op at
-            # inference). Skipped steps add no activations, so they never trigger it.
-            # Never on the final step: truncation exists to bound what *subsequent*
-            # steps accumulate, and cutting here would only discard the graph the
-            # decode is about to need.
-            if truncating and step_idx < num_steps - 1:
-                if trace.compute_ratio > 0.0:
-                    retained_computed += 1
-                if retained_computed >= window:
-                    state.z = state.z.detach()
-                    if state.cache is not None:
-                        state.cache = state.cache.detach()
-                    retained_computed = 0
+            if trace.compute_ratio > 0.0:
+                state.retained_computed += 1
+            log_step = _log.info if (step_idx % max(1, self.engine_cfg.log_every_steps) == 0 or step_idx == num_steps - 1) else _log.debug
+            log_step(
+                "step %d/%d: compute=%.4f mask=%.4f budget=%.3f tubes=%d "
+                "rollbacks=%d repairs=%d cf_repairs=%d latent_grad=%s retained=%d cuts=%d",
+                step_idx + 1, num_steps, trace.compute_ratio, trace.mask_ratio,
+                trace.budget, trace.num_tubes, trace.rollbacks, trace.repairs,
+                trace.cf_repairs, state.z.requires_grad, state.retained_computed, state.graph_cuts,
+            )
+            _log.debug("step %d actions=%s", step_idx + 1, trace.actions)
 
         # Decode final latent to video. The adapter owns the token<->grid layout
         # (`to_grid`) and the VAE decode (`decode_latent`).
@@ -258,6 +261,8 @@ class InferenceEngine(nn.Module):
             with torch.no_grad():
                 video = backbone.decode_to_unit(z0_grid)  # [B, 3, F, H, W] in [0,1]
 
+        _log.info("generation decoded: shape=%s video_grad=%s graph_cuts=%d",
+                  tuple(video.shape), video.requires_grad, state.graph_cuts)
         return GenerationResult(
             video=video,
             z0=state.z,
@@ -343,7 +348,8 @@ class InferenceEngine(nn.Module):
 
         * no step inside the retained window ran the denoiser (a fully-cached
           trajectory touches no backbone weight, so there is nothing to differentiate);
-        * the truncation cut the graph after the last computed step.
+        * detached anchors replaced the differentiable state, or no trainable
+          LoRA/repair operation contributed to the final render.
 
         Both leave Stage C training only its schedule regulariser while the logs look
         perfectly healthy.
@@ -355,8 +361,8 @@ class InferenceEngine(nn.Module):
             "decode_grad=True but the render carries no autograd graph — the §4.2 "
             "pixel/semantic losses cannot reach the backbone (LoRA / repair net). "
             "Denoiser forwards ran at step(s) %s of %d; the BPTT window retains %s "
-            "computed step(s). Raise engine.grad_window_steps (0 = full trajectory) "
-            "or lower the skip pressure (budget.b_min, engine.dense_step_skip_below).",
+            "computed step(s). Check LoRA/repair participation and detached anchor "
+            "replacement; increasing the window alone does not guarantee gradients.",
             computed or "none", len(state.traces),
             window if window > 0 else "all",
         )
@@ -388,11 +394,12 @@ class InferenceEngine(nn.Module):
         # current latent first (build() expects [F, 3, Hp, Wp] with F == grid.t).
         if step_idx == self.engine_cfg.tube_build_step or (
             self.engine_cfg.tube_refresh_every > 0
-            and step_idx % self.engine_cfg.tube_refresh_every == 0
+            and (step_idx - self.engine_cfg.tube_build_step) % self.engine_cfg.tube_refresh_every == 0
             and step_idx > self.engine_cfg.tube_build_step
         ):
             frames_rgb = self._decode_preview_frames(state, backbone)
-            state.tubes = self.tube_builder.build(frames_rgb, state.grid, state.prompt)
+            state.tubes, _, state.latent_flows = self.tube_builder.build_with_states(
+                frames_rgb, state.grid, state.prompt)
             # Pool each tube's CLIP visual embed off the *same* preview frames while
             # they are still in hand (§P4-4). These feed the certificate's local-CMSC
             # term every step; recomputing them per step would cost a perception
@@ -406,7 +413,11 @@ class InferenceEngine(nn.Module):
             # Re-segmentation mints fresh tube ids (they are monotonic, so nothing
             # inherits a previous tube's anchor — §P1-10). Retire the anchors of tubes
             # that no longer exist so the store does not grow for the whole run.
-            dropped = state.anchor_store.retain({t.tube_id for t in state.tubes})
+            live_ids = {t.tube_id for t in state.tubes}
+            dropped = state.anchor_store.retain(live_ids)
+            # Same cleanup for the trigger: a retired id at the unmeasured cap would
+            # otherwise veto every later whole-step-skip promotion.
+            self.accelerator.raec.trigger.retain(live_ids)
             _log.debug(f"  Built {len(state.tubes)} semantic tubes "
                        f"({dropped} stale anchor(s) retired)")
 
@@ -423,7 +434,10 @@ class InferenceEngine(nn.Module):
         # tube_builder.update returns {tube_id: TubeState}; using tube_id (not the
         # list index) is required because L-COCF indexes states[tube.tube_id] and
         # tube_ids are persistent/global (and drift from list position after splits).
-        tube_states: Dict[int, TubeState] = self.tube_builder.update(state.tubes)
+        for tube in state.tubes:
+            tube.state.anchor_age = float(state.anchor_store.age(tube.tube_id, step_idx))
+        tube_states: Dict[int, TubeState] = self.tube_builder.update(
+            state.tubes, latent_flow_by_frame=state.latent_flows)
 
         # --- Step 3: Compute causal strengths & L-COCF damage predictions -----
         if state.subgraph is None:
@@ -461,7 +475,7 @@ class InferenceEngine(nn.Module):
             state.tubes, tube_states, strength_feats, strengths,
             budget=budget_t, step_frac=step_frac, device=state.z.device,
         )
-        trace.predicted_cost = float(
+        trace.predicted_damage = float(
             sum(float(p.mu.detach().mean()) for p in damage_preds.values())
         )
         # Carry this step's mean damage uncertainty (mean σ over tubes) into the next
@@ -490,7 +504,8 @@ class InferenceEngine(nn.Module):
         # it and ``CMSCLoss.local_conservation``, written for exactly this, had no
         # caller anywhere (§P4-4).
         local_cmsc = self.accelerator.cmsc_loss.local_conservation(
-            state.cond.embeds[0], state.tube_embeds
+            state.cond.embeds[0], state.tube_embeds,
+            text_mask=state.cond.mask[0] if state.cond.mask is not None else None,
         ) if state.tube_embeds else {}
         # §2.2's hard risk constraint ``E_cert_k(a_k) ≤ τ_r``, evaluated *before* the
         # action is chosen. The allocator has always accepted this argument; nobody
@@ -517,6 +532,7 @@ class InferenceEngine(nn.Module):
             step=step_idx,
         )
         optimal_actions = decision.actions  # {tube_id: Action}
+        trace.predicted_cost = decision.predicted_cost
         trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
 
         # Consume one step of every active forced-FULL window now that this step's
@@ -674,13 +690,13 @@ class InferenceEngine(nn.Module):
         for tube in state.tubes:
             tid = tube.tube_id
             cert_k = certificates.get(tid, 1.0)
-            computed = not optimal_actions.get(tid, Action.FULL).is_skip
-            if cert_k <= self.trigger_cfg.tau_anchor or (
+            computed = result.compute_ratio > 0 and not optimal_actions.get(tid, Action.FULL).is_skip
+            if computed and (cert_k <= self.trigger_cfg.tau_anchor or (
                 self.trigger_cfg.seed_anchor_on_first_compute
                 and computed
                 and cert_k <= self.trigger_cfg.tau_high
                 and not state.anchor_store.has(tid)
-            ):
+            )):
                 state.anchor_store.update(tube, state.z, step_idx)
 
         return trace
@@ -720,6 +736,23 @@ class InferenceEngine(nn.Module):
             frames = frames.index_select(0, sel)
         return frames
 
+    def _before_compute(self, state: EngineState, t: int) -> None:
+        """Release a completed BPTT segment only when another forward will replace it.
+
+        Anchors already store detached tensors. Repairs in skipped steps remain on
+        the current segment; the window bounds denoiser forwards, not repair memory.
+        """
+        if state.grad_window <= 0 or state.retained_computed < state.grad_window:
+            return
+        _log.info("BPTT cut before step %d: retained=%d latent_grad=%s",
+                  self.engine_cfg.num_inference_steps - t + 1,
+                  state.retained_computed, state.z.requires_grad)
+        state.z = state.z.detach()
+        if state.cache is not None:
+            state.cache = state.cache.detach()
+        state.retained_computed = 0
+        state.graph_cuts += 1
+
     def _warmup_step(
         self, state: EngineState, t: int, backbone: BackboneAdapter
     ) -> Tuple[Tensor, Optional[BackboneCache], float]:
@@ -735,6 +768,7 @@ class InferenceEngine(nn.Module):
         T = self.engine_cfg.num_inference_steps
         t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
         t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
+        self._before_compute(state, t)
         out = backbone.denoise(
             state.z, t_now, state.cond, grid=state.grid,
             active_mask=None, cache=state.cache,
@@ -783,7 +817,19 @@ class InferenceEngine(nn.Module):
         T = self.engine_cfg.num_inference_steps
         t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
         t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
-        return self.accelerator.transition.step(
+        executor = self.accelerator.transition
+        if executor.adapter is not backbone:
+            raise ValueError("Transition backbone must match the engine's adapter")
+        masks = executor.prepare_masks(
+            decision, state.tubes, state.grid, device=state.z.device, cache=state.cache
+        )
+        will_compute = bool(masks[1].any()) or state.cache is None or state.cache.model_output is None
+        if will_compute:
+            self._before_compute(state, t)
+        else:
+            _log.debug("step %d: reuse cache; preserving current gradient segment",
+                       T - t + 1)
+        return executor.step(
             z_t=state.z,
             t=t_now,
             t_next=t_next,
@@ -794,6 +840,7 @@ class InferenceEngine(nn.Module):
             cache=state.cache,
             anchor_latent=self._assemble_anchor_latent(state),
             measure_residual=self.engine_cfg.measure_residual,
+            prepared_masks=masks,
         )
 
     def _counterfactual_check(

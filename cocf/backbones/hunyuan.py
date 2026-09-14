@@ -46,16 +46,21 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
 
         path = self.config.model_path
         extra = self.config.extra or {}
-        self.vae = AutoencoderKLHunyuanVideo.from_pretrained(path, subfolder="vae")
+        # Same load discipline as the Wan adapters: without ``torch_dtype`` +
+        # ``low_cpu_mem_usage`` every component materialises in fp32 on the CPU
+        # first (~60 GB transient for 8B + Llama) before ``.to()`` narrows it.
+        hf = {"torch_dtype": self.dtype, "low_cpu_mem_usage": True}
+        self.vae = AutoencoderKLHunyuanVideo.from_pretrained(path, subfolder="vae", **hf)
         self.transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-            path, subfolder="transformer"
+            path, subfolder="transformer", **hf
         )
         # primary LLM text encoder (token-level sequence used for joint attention)
-        self.text_encoder = LlamaModel.from_pretrained(path, subfolder="text_encoder")
+        self.text_encoder = LlamaModel.from_pretrained(path, subfolder="text_encoder", **hf)
         self.tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
         # secondary CLIP encoder for the pooled global condition
-        self._clip = CLIPTextModel.from_pretrained(path, subfolder="text_encoder_2")
+        self._clip = CLIPTextModel.from_pretrained(path, subfolder="text_encoder_2", **hf)
         self._clip_tok = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2")
+        self._clip.requires_grad_(False)
         self._clip.to(self.device, self.dtype).eval()
         self._max_len = int(extra.get("max_text_len", 256))
 

@@ -107,6 +107,8 @@ def build_cmsc_observation(
     text_embed: Tensor,
     *,
     differentiable: bool = False,
+    frame_span=None,
+    full_frame_count=None,
 ) -> CMSCObservation:
     """Assemble a :class:`CMSCObservation` from a rendered clip (§6 features).
 
@@ -143,7 +145,8 @@ def build_cmsc_observation(
     ``offload=False``: the reference is detached but still has to sit on the render's
     device to be compared against it.
     """
-    tube_masks = {t.tube_id: tube_pixel_mask(video_fchw, t) for t in tubes}
+    tube_masks = {t.tube_id: tube_pixel_mask(video_fchw, t, grid,
+                  frame_span=frame_span, full_frame_count=full_frame_count) for t in tubes}
     feats = metric_extractor.extract(
         video_fchw, prompt, differentiable=differentiable, tube_masks=tube_masks,
         # Both observations this builds are compared element-wise on the render's
@@ -154,7 +157,9 @@ def build_cmsc_observation(
         offload=False,
     )
     tube_embeds = {
-        t.tube_id: tube_clip_embed(video_fchw, t, grid, perception) for t in tubes
+        t.tube_id: tube_clip_embed(video_fchw, t, grid, perception,
+            differentiable=differentiable, frame_span=frame_span,
+            full_frame_count=full_frame_count) for t in tubes
     }
     tube_identity = {
         tid: f.mean(0) for tid, f in feats.tube_dino.items() if f.numel()
@@ -204,7 +209,7 @@ class StepRecord:
     video_id: str
     interaction_density: float = 0.0
     skip_residual: float = 0.0   # δ measured by the transition (certificate λ_res)
-    local_cmsc: float = 0.0      # 1 − align(tube, prompt) (certificate λ_cmsc)
+    local_cmsc: float = 0.0      # neutral-centered alignment risk (certificate λ_cmsc)
 
 
 def collate_step_records(records: Sequence[StepRecord]) -> Dict[str, object]:
@@ -298,7 +303,7 @@ def stage_c_regularizers(
 
     # L_budget — expected action cost vs the dynamic budget
     action_cost = torch.tensor(
-        accelerator.config.allocator.action_cost, device=device, dtype=torch.float32
+        accelerator.allocator.action_cost, device=device, dtype=torch.float32
     )
     l_budget = budget_penalty(probs, action_cost, budget)
 

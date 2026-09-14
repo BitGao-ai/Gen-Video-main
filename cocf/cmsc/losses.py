@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cocf.cmsc.alignment import TextTubeAlignment
+from cocf.cmsc.alignment import TextTubeAlignment, alignment_risk
 from cocf.common.config import CMSCConfig
 from cocf.lcocf.damage import VideoFeatures
 
@@ -159,7 +159,7 @@ class CMSCLoss(nn.Module):
     # ------------------------------------------------------------------ #
 
     def local_conservation(
-        self, text_embeds: Tensor, tube_embeds: Dict[int, Tensor]
+        self, text_embeds: Tensor, tube_embeds: Dict[int, Tensor], text_mask=None
     ) -> Dict[int, float]:
         """Inference-time risk proxy per tube ∈ [0, 1]: how far *below neutral* a tube's
         prompt alignment sits.
@@ -195,12 +195,16 @@ class CMSCLoss(nn.Module):
         ids = list(tube_embeds)
         if not ids:
             return {}
+        if text_mask is not None:
+            text_embeds = text_embeds[text_mask.to(text_embeds.device).bool()]
+        if text_embeds.shape[0] == 0:
+            return {i: 0.0 for i in ids}
         dev = self.alignment.vis_proj.weight.device
         dim = next(iter(tube_embeds.values())).shape[-1]
         v = TextTubeAlignment.stack_tube_embeds(tube_embeds, ids, dim, device=dev)
         with torch.no_grad():
             scores = self.alignment.tube_scores(text_embeds.to(dev), v)  # [K] ∈ [0,1]
-            violation = ((0.5 - scores) * 2.0).clamp(0.0, 1.0)           # [K] ∈ [0,1]
+            violation = alignment_risk(scores)
         return {i: float(violation[j]) for j, i in enumerate(ids)}
 
     # ------------------------------------------------------------------ #
@@ -213,10 +217,11 @@ class CMSCLoss(nn.Module):
         if len(ids) < 1:
             return torch.zeros((), device=dev)
         dim = next(iter(full.tube_embeds.values())).shape[-1]
-        vf = TextTubeAlignment.stack_tube_embeds(full.tube_embeds, ids, dim)
-        va = TextTubeAlignment.stack_tube_embeds(accel.tube_embeds, ids, dim)
-        a_full = self.alignment.matrix(full.text_embeds, vf)   # [L, K] (grad)
-        a_accel = self.alignment.matrix(accel.text_embeds, va)  # [L, K] (grad)
+        dev = self.alignment.vis_proj.weight.device
+        vf = TextTubeAlignment.stack_tube_embeds(full.tube_embeds, ids, dim, device=dev)
+        va = TextTubeAlignment.stack_tube_embeds(accel.tube_embeds, ids, dim, device=dev)
+        a_full = self.alignment.matrix(full.text_embeds.to(dev), vf)
+        a_accel = self.alignment.matrix(accel.text_embeds.to(dev), va)
         return (a_full - a_accel).abs().mean()
 
     @staticmethod

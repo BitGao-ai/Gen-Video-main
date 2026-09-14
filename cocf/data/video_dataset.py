@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import abc
 import csv
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -153,7 +154,9 @@ class SyntheticVideoReader(VideoReader):
         return self._len
 
     def read(self, path: str, frame_indices: Sequence[int]) -> Tensor:
-        g = torch.Generator().manual_seed(self._seed + (abs(hash(path)) % (2 ** 20)))
+        g = torch.Generator().manual_seed(
+            self._seed + int(hashlib.sha1(path.encode("utf-8")).hexdigest()[:8], 16) % (2 ** 20)
+        )
         base = torch.rand(3, self._h, self._w, generator=g)
         yy = torch.linspace(0, 1, self._h).reshape(1, self._h, 1)
         out = []

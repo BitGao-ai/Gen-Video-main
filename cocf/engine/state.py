@@ -41,6 +41,7 @@ class StepTrace:
     repairs: int = 0
     cf_checks: int = 0
     cf_repairs: int = 0
+    predicted_damage: float = 0.0
 
     @property
     def active_ratio(self) -> float:
@@ -70,6 +71,10 @@ class EngineState:
     # because the budget is sized before this step's σ is known (it conditions the
     # predictor), so the causal, no-future-info signal is the previous step's σ.
     prev_mean_uncertainty: float = 0.0
+    grad_window: int = 0
+    retained_computed: int = 0
+    graph_cuts: int = 0
+    latent_flows: Dict[int, Tensor] = field(default_factory=dict)
     # accumulated metrics
     traces: List[StepTrace] = field(default_factory=list)
 

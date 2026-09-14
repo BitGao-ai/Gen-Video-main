@@ -45,8 +45,12 @@ _NUM_ACTIONS = len(Action)
 class ActionAllocator:
     """Greedy (or LP) multiple-choice knapsack over per-tube actions (§2.2)."""
 
-    def __init__(self, config: AllocatorConfig, lowfreq_stride: Optional[int] = None) -> None:
+    def __init__(self, config: AllocatorConfig, lowfreq_stride: Optional[int] = None,
+                 identity_unstable_threshold: float = 0.5) -> None:
         self.cfg = config
+        # Same knob ``mapping.py`` reads from TubeConfig — passed in by the
+        # accelerator so the prior and the admissibility filter cannot drift apart.
+        self.identity_unstable_threshold = float(identity_unstable_threshold)
         self.action_cost = list(config.action_cost)  # indexed by Action value
         # LOWFREQ's true cost is set by the executor's spatial stride (a stride-s
         # lattice computes 1/s² of the tube's tokens), so derive it rather than trust a
@@ -280,7 +284,8 @@ class ActionAllocator:
         risk: Optional[Tensor],
     ) -> List[Action]:
         """Actions a tube may take. FULL is always admissible (the safe fallback)."""
-        if forced_full or (state is not None and state.is_unstable):
+        if forced_full or (state is not None
+                           and state.is_unstable(self.identity_unstable_threshold)):
             return [Action.FULL]
         # One transfer for the whole risk vector rather than one per action.
         risks = risk.detach().tolist() if risk is not None else None

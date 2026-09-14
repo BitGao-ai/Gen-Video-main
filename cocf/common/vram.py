@@ -240,7 +240,7 @@ def apply_geometry(config: Config, args) -> Tuple[int, int, int]:
     """Write ``--num-frames/--height/--width`` into ``config.data``, validated.
 
     Rejected here rather than deep in a reshape: ``token_grid`` floor-divides by
-    ``vae_compress * patch``, so a height of 400 silently renders 392 and every latent
+    ``vae_compress * patch``, so a height of 408 silently renders 400 and every latent
     written by the run is off-geometry against the pixels it claims to describe.
     """
     d = config.data
@@ -277,7 +277,7 @@ def apply_wan_variant(config: Config, args) -> None:
     if getattr(args, "finalize_only", False):
         return
     if str(args.backbone).startswith("wan"):
-        config.backbone.extra = dict(WAN22_VARIANTS[args.wan_variant])
+        config.backbone.extra = {**(config.backbone.extra or {}), **WAN22_VARIANTS[args.wan_variant]}
     shift = getattr(args, "flow_shift", None)
     if shift is not None:
         config.backbone.extra = {**(config.backbone.extra or {}),
@@ -302,7 +302,7 @@ def build_perception_and_metrics(args, log):
     want_perception = (args.real_perception or args.real_models) and not finalize_only
     want_metrics = (args.real_metrics or args.real_models) and not finalize_only
     raft_weights = getattr(args, "raft_weights", None)
-    require_flow = bool(args.real_models) and not finalize_only
+    require_flow = bool(args.real_models or getattr(args, "require_flow", False)) and not finalize_only
     dtype = resolve_dtype(args.perception_dtype)
     if dtype is torch.float32:
         dtype = None  # keep the checkpoints' own dtype (historical behaviour)

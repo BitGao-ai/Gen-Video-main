@@ -26,6 +26,7 @@ backbone (user requirement #1).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -83,9 +84,11 @@ def _noise_latent(z0: Tensor, sigma: float, generator: Optional[torch.Generator]
     ``z_t`` are produced by noising the encoded ``z0`` instead of by denoising noise.
     """
     eps = torch.randn(
-        z0.shape, generator=generator, device=z0.device, dtype=z0.dtype
+        z0.shape, generator=generator,
+        device=generator.device if generator is not None else z0.device,
+        dtype=z0.dtype,
     )
-    return (1.0 - sigma) * z0 + sigma * eps
+    return (1.0 - sigma) * z0 + sigma * eps.to(z0.device)
 
 
 @dataclass
@@ -247,9 +250,11 @@ class TeacherForwardRunner:
                     w=max(1, lat.shape[4] // p_w),
                 )
                 z0 = bb.to_tokens(lat)
-                gen = torch.Generator(device=z0.device).manual_seed(
-                    (abs(hash(video_id)) % (2 ** 31)) + 1
-                )
+                # Stable per-clip seed: sha1, not hash() (salted per process via
+                # PYTHONHASHSEED), on a CPU generator — a CUDA generator's stream is
+                # device/driver-dependent (see lcocf.data._seeded_noise).
+                clip_seed = int(hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:8], 16)
+                gen = torch.Generator().manual_seed(clip_seed)
                 T = self.cfg.num_inference_steps
                 z_by_step = {
                     step_idx: _noise_latent(z0, sigma_from_step(T - step_idx, T), gen)

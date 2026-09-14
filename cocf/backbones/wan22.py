@@ -94,6 +94,10 @@ class Wan22Backbone(Wan21Backbone):
         # the base ctor derives the patch-token width from ``_latent_channels``/``patch``.
         if "patch" in extra:
             self.patch = tuple(extra["patch"])                     # e.g. (1, 2, 2)
+        # Whether the geometry came from an explicit variant/extra entry (vs the
+        # class default): an explicit declaration must win over config detection —
+        # a conflict there means the detection is unreliable, not the declaration.
+        self._vae_compress_explicit = "vae_compress" in extra
         if "vae_compress" in extra:
             self.vae_compress = tuple(extra["vae_compress"])       # e.g. (4, 16, 16)
         if "latent_channels" in extra:
@@ -130,34 +134,33 @@ class Wan22Backbone(Wan21Backbone):
     def _detect_vae_compress(vae: nn.Module) -> Optional[Tuple[int, int, int]]:
         """``(t, h, w)`` compression from the VAE config, or ``None`` if unstated.
 
-        Read from config rather than by walking ``encoder.down_blocks[*].downsamplers``:
-        that is the 2-D ``AutoencoderKL``/UNet layout, and ``AutoencoderKLWan``'s blocks
-        expose no such attribute — so the walk always fell through with a product of 1
-        and reported ``(1, 1, 1)``, overwriting the correct ``(4, 8, 8)`` and inflating
-        the token grid by 4·8·8 = 256×. (It also crashed outright on any block that
-        *defines* ``downsamplers = None``.)
+        Only *explicitly stated* scale factors are trusted. Deriving the spatial
+        factor from ``temperal_downsample`` (``2**len(...)``) is wrong for TI2V-5B:
+        its VAE adds a ``patch_size=2``/``is_residual`` stage, so the real spatial
+        compression is 16 while the list length yields 8 — and that wrong guess
+        overwrote the correct declared ``(4, 16, 16)``, quadrupling the token grid.
 
-        Returning ``None`` when the config says nothing is the important part: the
-        adapter's declared ``vae_compress`` is then left alone. A geometry guess that
-        can be wrong is worse than no guess — it silently reshapes every latent.
+        Returning ``None`` when the config states nothing is the important part:
+        the adapter's declared ``vae_compress`` is then left alone. A geometry
+        guess that can be wrong is worse than no guess — it silently reshapes
+        every latent.
         """
         cfg = getattr(vae, "config", None)
         if cfg is None:
             return None
 
-        temporal = getattr(cfg, "temporal_compression_ratio", None)
-        spatial = getattr(cfg, "spatial_compression_ratio", None)
-        if isinstance(temporal, int) and isinstance(spatial, int):
+        # Current ``AutoencoderKLWan`` registers these two; ``WanPipeline`` reads
+        # the same keys.
+        temporal = getattr(cfg, "scale_factor_temporal", None)
+        spatial = getattr(cfg, "scale_factor_spatial", None)
+        if all(isinstance(v, int) and v > 0 for v in (temporal, spatial)):
             return temporal, spatial, spatial
 
-        # Wan's VAE states its downsampling schedule as a per-stage bool list (the
-        # upstream field carries a typo, so accept both spellings). This is the same
-        # derivation ``WanPipeline`` uses: 2**sum for time, 2**len for space.
-        stages = getattr(cfg, "temperal_downsample", None)
-        if stages is None:
-            stages = getattr(cfg, "temporal_downsample", None)
-        if isinstance(stages, (list, tuple)) and stages:
-            return 2 ** int(sum(bool(s) for s in stages)), 2 ** len(stages), 2 ** len(stages)
+        # Generic names used by other VAE families (never present on Wan).
+        temporal = getattr(cfg, "temporal_compression_ratio", None)
+        spatial = getattr(cfg, "spatial_compression_ratio", None)
+        if all(isinstance(v, int) and v > 0 for v in (temporal, spatial)):
+            return temporal, spatial, spatial
         return None
 
     # -- component construction (adds the low-noise expert) ------------- #
@@ -192,6 +195,14 @@ class Wan22Backbone(Wan21Backbone):
             self._token_dim = self._latent_channels * pt * ph * pw
         detected = self._detect_vae_compress(self.vae)
         if detected is not None and detected != self.vae_compress:
+            if self._vae_compress_explicit:
+                raise ValueError(
+                    f"{type(self).__name__}: the VAE config states compression "
+                    f"{detected} but the variant explicitly declares "
+                    f"{self.vae_compress} — refusing to override an explicit "
+                    f"geometry with a detected one; check --wan-variant against "
+                    f"the checkpoint."
+                )
             _log.info(
                 "%s: overriding vae_compress %s → %s to match the VAE config",
                 type(self).__name__, self.vae_compress, detected,

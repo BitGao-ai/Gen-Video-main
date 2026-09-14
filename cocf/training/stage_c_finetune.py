@@ -50,13 +50,12 @@ from cocf.training.checkpoint import build_checkpoint
 from cocf.training.distributed import (
     all_agree,
     all_reduce_mean,
-    all_reduce_min,
     assert_same,
     average_gradients,
     broadcast_parameters,
     context as dist_context,
 )
-from cocf.training.lora import inject_lora, lora_state_dict
+from cocf.training.lora import inject_lora
 from cocf.training.stage_c_losses import (
     StepRecord,
     build_cmsc_observation,
@@ -165,7 +164,7 @@ class StageCConfig:
     manifest_path: Optional[Path] = None  # fallback video/caption manifest
     processed_root: Optional[Path] = None  # preferred: §3 store (raw_filtered/)
     config: Config = field(default_factory=Config)  # full run config
-    batch_size: int = 4  # Smaller batches due to full-pipeline overhead
+    batch_size: int = 1  # Engine owns one semantic-tube trajectory per call.
     num_workers: int = 2
     num_epochs: int = 3
     # Denoising steps for the accelerated render. ``None`` — the default — means "match
@@ -220,6 +219,8 @@ class FinettuneStage:
         engine: InferenceEngine,
         config: StageCConfig,
     ) -> None:
+        if config.batch_size != 1:
+            raise ValueError("Stage C requires batch_size=1: semantic-tube state is per video")
         self.accelerator = accelerator
         self.engine = engine
         self.config = config
@@ -261,61 +262,14 @@ class FinettuneStage:
         # block inputs with or without LoRA (see the method docstring).
         self._enable_backbone_checkpointing()
 
-        # The whole batch goes through a single ``engine.generate`` call
-        # (:meth:`_finetune_batch`), so activations scale with batch_size and there is
-        # no gradient-accumulation path to trade against it. On a 40 GB card with a
-        # 14B expert resident, anything above 1 is an OOM rather than a slowdown.
-        #
-        # The budget is *per clip*, not a fixed floor: with a 14B expert the retained
-        # graph is dominated by terms linear in the batch — the per-DiT-block stash
-        # (B·N·d, ~0.5 GiB/block-boundary at B=4, 12480 tokens, d=5120) and the
-        # differentiable VAE decode (every tile of every clip retained for backward).
-        # A card with 25 GiB free therefore clears an "is it ≥ 24 GiB" floor and still
-        # OOMs on batch 4 several minutes in; requiring the headroom to scale with the
-        # batch turns that into an immediate, explained clamp.
-        if config.batch_size > 1:
-            free_gib = self._free_vram_gib()
-            need = self._headroom_gib()
-            if free_gib is not None and free_gib < need * config.batch_size:
-                _log.warning(
-                    "Stage C: batch_size=%d needs ~%.1f GiB of activation headroom but "
-                    "only %.1f GiB is free after the frozen backbone; clamping to %d. "
-                    "One engine.generate call renders the whole batch, so the retained "
-                    "graph scales with it. To keep the effective batch, free residency "
-                    "instead (--offload-idle-expert frees ~27 GiB of the 54 GiB two "
-                    "resident Wan2.2 experts take) or shrink the graph "
-                    "(--decode-grad-frames, --grad-window-steps).",
-                    config.batch_size, need * config.batch_size,
-                    free_gib, max(1, int(free_gib // need)),
-                )
-                config.batch_size = max(1, int(free_gib // need))
-        else:
-            # batch_size == 1 already: there is nothing left to clamp, but the run can
-            # still be short on headroom — and then it OOMs minutes in with no prior
-            # hint, because the clamp above never looked. Say so at startup instead.
-            free_gib = self._free_vram_gib()
-            need = self._headroom_gib()
-            if free_gib is not None and free_gib < need:
-                _log.warning(
-                    "Stage C: only %.1f GiB free after the frozen backbone; one clip at "
-                    "%dx%dx%d needs ~%.1f GiB (DiT checkpoint stash %.1f + in-block "
-                    "recompute %.1f + differentiable VAE decode %.1f). Expect an OOM in "
-                    "the first batch. Lower --decode-grad-frames (1 is the floor), then "
-                    "--metric-frame-chunk, then the render geometry — or free residency "
-                    "with --offload-idle-expert / a single-expert --wan-variant.",
-                    free_gib, *self._frame_shape(), need,
-                    self._stash_gib(), _GIB_BLOCK_RECOMPUTE, self._decode_gib(),
-                )
-
-        # Under data parallelism every rank must agree on the batch size: it decides
-        # how many batches an epoch has, and a rank that clamped lower would finish its
-        # shard early and leave the others blocked in an all-reduce forever. The
-        # smallest card decides. No-op in a single process.
-        agreed = int(all_reduce_min(config.batch_size))
-        if agreed != config.batch_size:
-            _log.warning("Stage C: batch_size %d -> %d to match the smallest rank.",
-                         config.batch_size, agreed)
-            config.batch_size = agreed
+        free_gib = self._free_vram_gib()
+        need = self._headroom_gib()
+        if free_gib is not None and free_gib < need:
+            _log.warning(
+                "Stage C: %.1f GiB free, estimated single-video headroom %.1f GiB; "
+                "reduce decode window or resolution before training.",
+                free_gib, need,
+            )
 
         # Identify trainable parameters
         self.trainable_params = self._get_trainable_params()
@@ -694,6 +648,13 @@ class FinettuneStage:
             y_accel, y_full, captions, result, text_embeds=cond.embeds
         )
         l_reg, _ = self._regularizers(records, cmsc_terms.get("measured_damage", 0.0))
+        _log.info(
+            "Stage C loss: pixel=%.6f (grad=%s) quality=%.6f (grad=%s) "
+            "regularizer=%.6f (grad=%s) video_grad=%s records=%d",
+            float(l_pixel.detach()), l_pixel.requires_grad,
+            float(l_quality.detach()), l_quality.requires_grad,
+            float(l_reg.detach()), l_reg.requires_grad, y_accel.requires_grad, len(records),
+        )
         return (
             self.config.lambda_pixel * l_pixel
             + self.config.lambda_quality * l_quality
@@ -773,6 +734,9 @@ class FinettuneStage:
         comps: Dict[str, float] = {}
         damages: list = []
         n = min(y_accel.shape[0], len(captions))
+        _log.info("CMSC geometry: decoded_frames=%d full_frames=%d span=%s latent_slots=%d tubes=%d",
+                  y_accel.shape[2], self._frame_shape()[0], result.frame_span, grid.t,
+                  len(result.tubes))
         for b in range(n):
             # Accelerated branch keeps the autograd graph (``differentiable=True``);
             # the baseline is a detached, no-grad reference — the "conserve the
@@ -780,10 +744,12 @@ class FinettuneStage:
             accel_obs = build_cmsc_observation(
                 me, self.accelerator.perception, self._to_fchw(y_accel, b),
                 captions[b], result.tubes, grid, text[b], differentiable=True,
+                frame_span=result.frame_span, full_frame_count=self._frame_shape()[0],
             )
             full_obs = build_cmsc_observation(
                 me, self.accelerator.perception, self._to_fchw(y_full, b),
                 captions[b], result.tubes, grid, text[b],
+                frame_span=result.frame_span, full_frame_count=self._frame_shape()[0],
             )
             loss_b, comps_b = cmsc_quality_loss(
                 self.accelerator.cmsc_loss, full_obs, accel_obs
@@ -989,17 +955,6 @@ class FinettuneStage:
     # ------------------------------------------------------------------ #
     # Checkpointing (the adapters live inside the frozen backbone)
     # ------------------------------------------------------------------ #
-
-    def lora_state_dict(self) -> Dict[str, Tensor]:
-        """Trained LoRA weights, or ``{}`` when LoRA is off / was not injected.
-
-        ``Accelerator.state_dict()`` cannot carry these — the backbone is a plain
-        attribute by design — so Stage C's checkpoint must save them explicitly or the
-        fine-tune is discarded at the moment it finishes.
-        """
-        if not self._lora_params:
-            return {}
-        return lora_state_dict(self.accelerator.backbone)
 
     def checkpoint(self) -> Dict[str, object]:
         """Full Stage-C checkpoint: plugin weights + LoRA adapters + their geometry.

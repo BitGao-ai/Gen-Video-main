@@ -275,6 +275,12 @@ class TransitionExecutor:
     # The step
     # ------------------------------------------------------------------ #
 
+    def prepare_masks(self, decision, tubes, grid, *, device, cache=None):
+        """Resolve promotion once so gradient management sees the executed mask."""
+        planned = self.build_active_mask(decision, tubes, grid, device=device)
+        active = self._maybe_promote_to_step_skip(planned, cache, decision, tubes)
+        return planned, active
+
     def step(
         self,
         z_t: Tensor,
@@ -289,6 +295,7 @@ class TransitionExecutor:
         anchor_latent: Optional[Tensor] = None,
         want_attention: bool = False,
         measure_residual: bool = False,
+        prepared_masks: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> TransitionResult:
         """Advance ``z_t`` to ``z_{t_next}`` honouring the per-tube allocation.
 
@@ -303,9 +310,8 @@ class TransitionExecutor:
             *cache-reused full step* reference, feeding the error certificate.
         """
         device = z_t.device
-        planned_mask = self.build_active_mask(decision, tubes, grid, device=device)
-        active_mask = self._maybe_promote_to_step_skip(
-            planned_mask, cache, decision, tubes
+        planned_mask, active_mask = prepared_masks if prepared_masks is not None else self.prepare_masks(
+            decision, tubes, grid, device=device, cache=cache
         )
         # A promotion cleared a non-empty plan: every tube that was going to be
         # refreshed is now reusing cache. Record it so the caller certifies and logs

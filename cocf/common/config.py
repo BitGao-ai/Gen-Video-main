@@ -270,15 +270,17 @@ class EngineConfig:
     risk_control_enabled: bool = True  # enable RAEC trigger/repair at inference
     # Stage-C truncated BPTT (§4.2), in the classic segment sense: the graph is cut
     # every ``grad_window_steps`` *computed* denoising steps (steps whose denoiser
-    # actually ran — skipped steps add no activations and carry no gradient). Counting
+    # actually ran; skips may carry gradients and repair activations). Counting
     # computed steps rather than wall-clock ones is what keeps the LoRA branch
     # trainable on an accelerated trajectory: a run that computes 2 of 30 steps must
     # not have its graph cut simply because those 2 were early.
+    # Reset before the next computed step, never immediately after a forward.
     # Note this is a periodic reset, not a sliding window — at the final decode the
     # graph holds between 1 and ``grad_window_steps`` computed steps depending on
     # where the last cut landed. Peak activation memory is what the bound buys.
     # 0 = full BPTT (real backbones will OOM). Ignored at inference (decode_grad=False).
     grad_window_steps: int = 4
+    log_every_steps: int = 1  # detailed intermediate steps remain available at DEBUG
     # Latent temporal slots decoded **on the autograd graph** during Stage C (§4.2).
     # 0 = the whole clip.
     #
@@ -597,7 +599,13 @@ def _build_dataclass(cls: Type[T], data: Dict[str, Any]) -> T:
         if is_dataclass(ftype) and isinstance(value, dict):
             kwargs[f.name] = _build_dataclass(ftype, value)  # type: ignore[arg-type]
         elif isinstance(value, list):
-            kwargs[f.name] = tuple(value) if "Tuple" in str(ftype) else value
+            def convert_tuple(v, annotation):
+                if typing.get_origin(annotation) is tuple and isinstance(v, (list, tuple)):
+                    args = typing.get_args(annotation)
+                    return tuple(convert_tuple(x, args[0] if len(args) == 2 and args[1] is Ellipsis else args[i])
+                                 for i, x in enumerate(v))
+                return v
+            kwargs[f.name] = convert_tuple(value, ftype)
         else:
             kwargs[f.name] = value
     return cls(**kwargs)  # type: ignore[call-arg]

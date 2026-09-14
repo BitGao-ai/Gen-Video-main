@@ -60,7 +60,7 @@ if (_REPO_ROOT / "cocf" / "__init__.py").is_file() and _LOADED != _REPO_ROOT:
 
 from cocf.common.types import Action, TUBE_STATE_FIELDS
 from cocf.data.processed_layout import ProcessedLayout
-from cocf.data.sample_store import CounterfactualLMDBDataset
+from cocf.data.sample_store import _store_is_lmdb, iter_lmdb_records
 from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS
 
 # A FULL rollout reproduces the teacher transition, so its damage is bounded by
@@ -101,13 +101,70 @@ def _vec(payload: Dict, key: str, dim: int) -> Optional[np.ndarray]:
     return a if a.size == dim else None
 
 
-def load_samples(layout: ProcessedLayout, limit: Optional[int]) -> Tuple[List[Dict], List[str]]:
-    ds = CounterfactualLMDBDataset(layout.lmdb_dir, text_embed_dir=layout.text_embed_dir)
-    n = len(ds) if limit is None else min(limit, len(ds))
-    if not n:
+class Scan:
+    """Lightweight aggregates from one streaming pass over the store.
+
+    The checks only read a handful of small fields, so full payloads (tensors and
+    all) are never resident at once: a whole store used to be materialised into a
+    list, which is tens of GiB of Python objects on a real run.
+    """
+
+    def __init__(self) -> None:
+        self.damage: List[np.ndarray] = []
+        self.actions: List[int] = []
+        self.uncertainty: List[np.ndarray] = []
+        self.tube_features: List[np.ndarray] = []
+        self.step_fracs: List[float] = []
+        self.video_ids: set = set()
+        self.keys: set = set()
+        self.n = 0
+        self.n_dup = 0
+        self.n_missing_damage = 0
+
+
+def _iter_records(layout: ProcessedLayout):
+    """Stream ``(sample_id, payload)`` — at most one record (LMDB) or one shard
+    (.pt fallback) resident at a time."""
+    if _store_is_lmdb(layout.lmdb_dir):
+        yield from iter_lmdb_records(layout.lmdb_dir)
+    else:
+        import torch
+
+        for shard in sorted(Path(layout.lmdb_dir).glob("shard_*.pt")):
+            for rec in torch.load(shard, map_location="cpu", weights_only=False):
+                yield rec["sample_id"], rec["payload"]
+
+
+def scan_samples(layout: ProcessedLayout, limit: Optional[int]) -> Scan:
+    n_dim = len(DAMAGE_DIMENSIONS)
+    scan = Scan()
+    for key, payload in _iter_records(layout):
+        if limit is not None and scan.n >= limit:
+            break
+        if key in scan.keys:
+            scan.n_dup += 1
+        scan.keys.add(key)
+        d = _vec(payload, "damage_label", n_dim)
+        if d is None:
+            d = np.zeros(n_dim, np.float32)
+            scan.n_missing_damage += 1
+        scan.damage.append(d)
+        scan.actions.append(int(payload.get("action", -1)))
+        u = _vec(payload, "uncertainty", n_dim)
+        if u is not None:
+            scan.uncertainty.append(u)
+        tf = _vec(payload, "tube_features", len(TUBE_STATE_FIELDS))
+        if tf is not None:
+            scan.tube_features.append(tf)
+        scan.step_fracs.append(round(float(payload.get("step_frac", 0.0)), 4))
+        vid = payload.get("video_id")
+        if vid:
+            scan.video_ids.add(str(vid))
+        scan.n += 1
+    if not scan.n:
         raise SystemExit(f"{layout.lmdb_dir} 里没有样本 —— Stage A 可能没跑完")
-    print(f"读取 {n} / {len(ds)} 条样本 (来自 {layout.lmdb_dir})\n")
-    return [ds[i] for i in range(n)], list(ds.keys[:n])
+    print(f"读取 {scan.n} 条样本 (来自 {layout.lmdb_dir})\n")
+    return scan
 
 
 # --------------------------------------------------------------------------- #
@@ -190,14 +247,12 @@ def check_axes(rep: Report, dmg: np.ndarray) -> None:
         rep.add("PASS", "damage 轴有效性", f"8 个轴全部有方差。{detail}")
 
 
-def check_uncertainty(rep: Report, samples: List[Dict]) -> None:
+def check_uncertainty(rep: Report, scan: Scan) -> None:
     """Multi-seed variance: zero everywhere means the seeds never differed."""
-    rows = [x for x in (_vec(s, "uncertainty", len(DAMAGE_DIMENSIONS)) for s in samples)
-            if x is not None]
-    if not rows:
+    if not scan.uncertainty:
         rep.add("WARN", "多 seed 不确定度", "样本里没有 uncertainty 字段。")
         return
-    u = np.stack(rows)
+    u = np.stack(scan.uncertainty)
     nz = float((u > 1e-8).any(1).mean())
     if nz > 0.5:
         rep.add("PASS", "多 seed 不确定度",
@@ -209,7 +264,7 @@ def check_uncertainty(rep: Report, samples: List[Dict]) -> None:
                 "\n      后果:Stage B 的异方差加权退化为等权。")
 
 
-def check_coverage(rep: Report, act: np.ndarray, samples: List[Dict], keys: List[str]) -> None:
+def check_coverage(rep: Report, act: np.ndarray, scan: Scan) -> None:
     """§4: the sampling design actually covers what it claims to."""
     counts = Counter(int(a) for a in act)
     dist = "  ".join(f"{Action(k).name}={counts.get(int(k),0)}" for k in Action)
@@ -217,8 +272,8 @@ def check_coverage(rep: Report, act: np.ndarray, samples: List[Dict], keys: List
     share = [counts.get(int(a), 0) / max(1, n) for a in Action]
     skew = max(share) / max(1e-9, min(share)) if min(share) > 0 else float("inf")
 
-    steps = sorted({round(float(s.get("step_frac", 0.0)), 4) for s in samples})
-    dup = len(keys) - len(set(keys))
+    steps = sorted(set(scan.step_fracs))
+    dup = scan.n_dup
 
     parts = [f"动作分布: {dist}  (最大/最小 = {skew:.2f}×)", f"step_frac 取值: {steps}"]
     level = "PASS"
@@ -242,14 +297,12 @@ def check_coverage(rep: Report, act: np.ndarray, samples: List[Dict], keys: List
     rep.add(level, "采样设计覆盖度", "\n      ".join(parts))
 
 
-def check_tube_features(rep: Report, samples: List[Dict]) -> None:
+def check_tube_features(rep: Report, scan: Scan) -> None:
     """The 7-dim state is consumed as if every component were in [0,1]."""
-    rows = [x for x in (_vec(s, "tube_features", len(TUBE_STATE_FIELDS)) for s in samples)
-            if x is not None]
-    if not rows:
+    if not scan.tube_features:
         rep.add("WARN", "管状态值域", "样本里没有 tube_features 字段。")
         return
-    tf = np.stack(rows)
+    tf = np.stack(scan.tube_features)
     bad = [(TUBE_STATE_FIELDS[i], float(tf[:, i].min()), float(tf[:, i].max()))
            for i in range(tf.shape[1])
            if tf[:, i].min() < -1e-6 or tf[:, i].max() > 1.0 + 1e-6]
@@ -263,9 +316,9 @@ def check_tube_features(rep: Report, samples: List[Dict]) -> None:
                 "\n      已知项:interaction 是 IoU 之和而非均值(P2-4),上界为 (K-1)×帧数。")
 
 
-def check_text_embeds(rep: Report, layout: ProcessedLayout, samples: List[Dict]) -> None:
+def check_text_embeds(rep: Report, layout: ProcessedLayout, scan: Scan) -> None:
     """A missing per-clip embedding silently zeroes the whole batch's CMSC loss."""
-    vids = {str(s.get("video_id", "")) for s in samples if s.get("video_id")}
+    vids = scan.video_ids
     if not vids:
         rep.add("WARN", "text_embed 完整性", "样本里没有 video_id,无法校验。")
         return
@@ -292,30 +345,20 @@ def main() -> int:
         print(f"             {env.get('num_frames')}x{env.get('height')}x{env.get('width')}, "
               f"{env.get('teacher_steps')} steps, token_dim={env.get('token_dim')}\n")
 
-    samples, keys = load_samples(layout, args.limit)
-    n_dim = len(DAMAGE_DIMENSIONS)
-    # Explicit None handling, not ``_vec(...) or zeros``: a numpy array has no
-    # unambiguous truth value, so the ``or`` form raises instead of defaulting.
-    rows = []
-    n_missing = 0
-    for s in samples:
-        d = _vec(s, "damage_label", n_dim)
-        if d is None:
-            d, n_missing = np.zeros(n_dim, np.float32), n_missing + 1
-        rows.append(d)
-    if n_missing:
-        print(f"注意: {n_missing} 条样本缺少 damage_label,已按全零计入。\n")
-    dmg = np.stack(rows)
-    act = np.array([int(s.get("action", -1)) for s in samples])
+    scan = scan_samples(layout, args.limit)
+    if scan.n_missing_damage:
+        print(f"注意: {scan.n_missing_damage} 条样本缺少 damage_label,已按全零计入。\n")
+    dmg = np.stack(scan.damage)
+    act = np.array(scan.actions)
 
     rep = Report()
     check_full_anchor(rep, dmg, act)
     check_monotonicity(rep, dmg, act)
     check_axes(rep, dmg)
-    check_uncertainty(rep, samples)
-    check_coverage(rep, act, samples, keys)
-    check_tube_features(rep, samples)
-    check_text_embeds(rep, layout, samples)
+    check_uncertainty(rep, scan)
+    check_coverage(rep, act, scan)
+    check_tube_features(rep, scan)
+    check_text_embeds(rep, layout, scan)
 
     n_fail = sum(1 for r in rep.rows if r[0] == "FAIL")
     n_warn = sum(1 for r in rep.rows if r[0] == "WARN")

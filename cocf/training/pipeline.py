@@ -23,7 +23,8 @@ from cocf.common.config import Config
 from cocf.common.logging import get_logger
 from cocf.core.accelerator import Accelerator
 from cocf.engine import InferenceEngine
-from cocf.training.checkpoint import load_checkpoint
+from cocf.training.checkpoint import load_checkpoint, build_checkpoint
+from cocf.training.distributed import resolve_device
 from cocf.training.stage_a_data_gen import DataGenerationStage, StageAConfig
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 from cocf.training.stage_c_finetune import FinettuneStage, StageCConfig
@@ -105,7 +106,12 @@ class TrainingPipeline:
         self.config = config
         self.pipeline_cfg = pipeline_cfg
         # Device lives on the backbone sub-config (Config has no top-level `device`).
-        self.device = torch.device(config.backbone.device)
+        selected = resolve_device(config.backbone.device)
+        if selected.startswith("cuda") and not torch.cuda.is_available():
+            _log.warning("CUDA unavailable; pipeline using CPU")
+            selected = "cpu"
+        config.backbone.device = selected
+        self.device = torch.device(selected)
 
         # Create experiment directory
         self.pipeline_cfg.experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +216,7 @@ class TrainingPipeline:
                 processed_root=self._processed_root(),
                 config=self.config,
                 device=self.device,
+                checkpoint_dir=self.pipeline_cfg.experiment_dir / "stage_b",
             )
 
         self._stage_b = JointTrainingStage(
@@ -250,7 +257,7 @@ class TrainingPipeline:
             payload = self._stage_c.checkpoint()
             n_lora = len(payload.get("lora", {}))
         else:
-            payload = {"accelerator": self.accelerator.state_dict()}
+            payload = build_checkpoint(self.accelerator)
             n_lora = 0
         torch.save(payload, ckpt_path)
         _log.info("Saved checkpoint to %s (%d LoRA tensors)", ckpt_path, n_lora)

@@ -31,6 +31,11 @@ from cocf.common.config import CMSCConfig
 Tensor = torch.Tensor
 
 
+def alignment_risk(scores: Tensor) -> Tensor:
+    """Shared neutral-centered certificate input for training and inference."""
+    return ((0.5 - scores) * 2.0).clamp(0.0, 1.0)
+
+
 class TextTubeAlignment(nn.Module):
     """Projects text tokens and tube visual embeds into a shared space and aligns.
 

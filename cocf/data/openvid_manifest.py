@@ -67,6 +67,40 @@ _OCCLUSION_CUES = ("behind", "occlud", "overlap", "hidden", "cover", "in front o
                    "block", "遮挡", "重叠", "前面", "后面")
 
 
+def _cue_re(cues: Sequence[str]) -> Optional[re.Pattern]:
+    """Word-start-anchored regex over the ASCII cues (``None`` when there are none).
+
+    Plain substring matching let "and" hit hand/land/stand/island and "man" hit
+    woman/human, flooding the multi/face classes with single-subject clips. The
+    ``\\b`` anchor keeps legitimate stems working ("occlud" → "occluded", "child"
+    → "children", word-level "and" → "a cat and a dog") while killing mid-word
+    false positives. CJK cues have no word boundaries and stay substring.
+    """
+    words = [c for c in cues if c.isascii()]
+    if not words:
+        return None
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")")
+
+
+def _cjk_cues(cues: Sequence[str]) -> List[str]:
+    return [c for c in cues if not c.isascii()]
+
+
+def _has_cue(cap: str, rex: Optional[re.Pattern], cjk: Sequence[str]) -> bool:
+    return bool(rex is not None and rex.search(cap)) or any(c in cap for c in cjk)
+
+
+_FACE_RE = _cue_re(_FACE_HINTS)
+_HANDS_RE = _cue_re(_HANDS_HINTS)
+_FACE_CJK = _cjk_cues(_FACE_HINTS) + _cjk_cues(_HANDS_HINTS)
+_MULTI_RE = _cue_re(_MULTI_CUES)
+_MULTI_CJK = _cjk_cues(_MULTI_CUES)
+_OCCLUSION_RE = _cue_re(_OCCLUSION_CUES)
+_OCCLUSION_CJK = _cjk_cues(_OCCLUSION_CUES)
+_TEXT_RE = _cue_re(_TEXT_CUES)
+_TEXT_CJK = _cjk_cues(_TEXT_CUES)
+
+
 @dataclass
 class OpenVidRecord:
     """One parsed OpenVid clip: path + carried metadata + derived scene type."""
@@ -120,13 +154,13 @@ def infer_scene_type(caption: str, motion: float, camera_motion: str = "",
     """
     cap = (caption or "").lower()
     cam = (camera_motion or "").lower()
-    if any(c in cap for c in _OCCLUSION_CUES):
+    if _has_cue(cap, _OCCLUSION_RE, _OCCLUSION_CJK):
         return "occlusion"
-    if any(c in cap for c in _TEXT_CUES):
+    if _has_cue(cap, _TEXT_RE, _TEXT_CJK):
         return "text"
-    if any(c in cap for c in _FACE_HINTS) or any(c in cap for c in _HANDS_HINTS):
+    if _has_cue(cap, _FACE_RE, _FACE_CJK) or _has_cue(cap, _HANDS_RE, ()):
         return "face"
-    if any(c in cap for c in _MULTI_CUES):
+    if _has_cue(cap, _MULTI_RE, _MULTI_CJK):
         return "multi"
     # otherwise distinguish static vs single-subject dynamic by motion magnitude;
     # a non-"static"/"none" camera motion also implies a dynamic scene.

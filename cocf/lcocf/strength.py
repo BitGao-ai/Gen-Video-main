@@ -68,7 +68,14 @@ class CausalStrengthFeatureBuilder:
                 sum(subgraph.entity_importance.values()) / len(subgraph.entity_importance)
                 if subgraph.entity_importance else 0.5
             )
-            entity_importance = 1.0 if subgraph.critical_entities else base
+            # No tube→entity match was resolved, so this is a *prompt-level* prior,
+            # not a per-tube one. It must not be pinned to 1.0: with normalised
+            # equal weights a hard 1.0 forces s ≥ 1/3 > θ2 for every tube, making
+            # the LOW tier (the cheapest mapping) unreachable on any prompt that
+            # names a critical-looking entity — i.e. most prompts. A bounded
+            # additive boost keeps critical prompts stronger without collapsing
+            # the tier ladder.
+            entity_importance = min(1.0, base + 0.25) if subgraph.critical_entities else base
         s_E = float(min(max(entity_importance, 0.0), 1.0))
 
         # s_A: motion magnitude (already normalised in the state) gated by how much

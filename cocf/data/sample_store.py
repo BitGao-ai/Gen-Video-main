@@ -225,9 +225,30 @@ class CounterfactualSampleWriter:
         if not self._buffer:
             return
         shard_path = self.dir / self._shard_name(self._shard_idx)
-        torch.save(self._buffer, shard_path)
+        temporary = shard_path.with_suffix(".pt.tmp")
+        with temporary.open("wb") as stream:
+            torch.save(self._buffer, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, shard_path)
         self._shard_idx += 1
         self._buffer = []
+
+    def flush(self) -> None:
+        """Commit all samples before the caller publishes durable clip progress."""
+        if self._use_lmdb:
+            merged = _dedup(list(self._prior_keys) + self._keys)
+            self._txn.put(b"__keys__", json.dumps(merged).encode("utf-8"))
+            self._commit_lmdb()
+            self._env.sync()
+        else:
+            self._flush_shard()
+            if os.name == "posix":
+                fd = os.open(self.dir, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
 
     def close(self) -> None:
         if self._use_lmdb:

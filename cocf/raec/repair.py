@@ -89,7 +89,7 @@ class BoundaryRepair:
         """Moderate-risk fix: pull the tube toward the freshly computed ``z_full``
         at the boundary and mark it for cache refresh, without a full rollback."""
         idx = tube.all_token_indices().to(z_current.device)
-        z = self._fuse_boundary(z_current, z_full, tube, grid, toward_interior=False)
+        z = self._fuse_boundary(z_current, z_full, tube, grid)
         return RepairResult(z=z, refreshed=idx, rolled_back=False)
 
     # ------------------------------------------------------------------ #
@@ -102,16 +102,14 @@ class BoundaryRepair:
         z_exterior: Tensor,
         tube: SemanticTube,
         grid: TokenGrid,
-        toward_interior: bool = True,
     ) -> Tensor:
         """Blend ``z_interior`` (e.g. anchor) and ``z_exterior`` (e.g. z_full) over a
         tube's tokens using a per-token weight derived from depth-into-the-tube.
 
         ``w = 1 − exp(−depth / σ_bnd)`` → ~0 at the edge (favour the exterior,
         neighbour-consistent latent) and →1 deep inside (favour the interior,
-        safe latent). With ``toward_interior=False`` the roles invert (used by the
-        lighter REPAIR path, which keeps the current latent inside and only
-        reconciles the rim with z_full).
+        safe latent). REPAIR uses the current latent as the interior; ROLLBACK
+        uses the restored anchor. Both reconcile the rim with z_full.
         """
         sigma = max(self.cfg.sigma_bnd, 1e-3)
         out = z_interior.clone()
@@ -125,8 +123,6 @@ class BoundaryRepair:
             wi = local - hi * grid.w
             d_tok = depth[hi.clamp(0, grid.h - 1), wi.clamp(0, grid.w - 1)].float()
             w = 1.0 - torch.exp(-d_tok / sigma)            # [n_tok] ∈ [0,1)
-            if not toward_interior:
-                w = 1.0 - w
             w = w.view(1, -1, 1).to(out.device, out.dtype)
             gidx = idx.to(out.device)
             blended = w * z_interior.index_select(1, gidx) + (1 - w) * z_exterior.index_select(1, gidx)
@@ -141,9 +137,11 @@ class BoundaryRepair:
         (capped at ``max_depth``). Vectorised: each iteration keeps only pixels whose
         4 neighbours are all still set.
         """
+        if max_depth < 1:
+            raise ValueError("max_depth must be positive")
         cur = mask.bool()
         depth = cur.to(torch.int32)
-        for _ in range(max(1, max_depth)):
+        for _ in range(max_depth - 1):
             up = torch.zeros_like(cur); up[:-1] = cur[1:]
             dn = torch.zeros_like(cur); dn[1:] = cur[:-1]
             lf = torch.zeros_like(cur); lf[:, :-1] = cur[:, 1:]

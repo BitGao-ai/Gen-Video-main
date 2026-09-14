@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import traceback
 from collections import deque
@@ -268,8 +269,18 @@ class DataGenerationStage:
         bb = self.backbone
         try:
             bb.ensure_loaded()
-        except Exception as exc:  # pragma: no cover - mock adapters have nothing to load
-            _log.debug("ensure_loaded() before env write: %s", exc)
+        except Exception as exc:
+            if self.config.config.backbone.name == "mock":
+                # Mock adapters have nothing to load; their geometry is declared.
+                _log.debug("ensure_loaded() before env write: %s", exc)
+            else:
+                # A real backbone that failed to load would record the pre-load
+                # geometry *guess* — exactly the wrong token_dim this function
+                # exists to prevent — and Stages B/C would build plugins from it.
+                raise RuntimeError(
+                    "ensure_loaded() failed before writing stage_a_env.json; "
+                    "aborting rather than persisting a pre-load geometry guess"
+                ) from exc
         d = self.config.config.data
         env = {
             "backbone": self.config.config.backbone.name,
@@ -545,6 +556,7 @@ class DataGenerationStage:
         for s in samples:
             writer.put(self._sample_id(s), s)
             n += 1
+        writer.flush()
         self._log_progress(pf, rec.video_id, n, split)
         _log.info(
             "  [shard %d | +%d] %s → %d samples in %.1fs%s",
@@ -577,6 +589,7 @@ class DataGenerationStage:
         """Append one durable (flushed) progress line so a restart can skip this clip."""
         fh.write(json.dumps({"video_id": video_id, "n": int(n_samples), "split": split}) + "\n")
         fh.flush()
+        os.fsync(fh.fileno())
 
     @staticmethod
     def _read_progress(path: Path) -> set:
@@ -699,7 +712,11 @@ class DataGenerationStage:
         dcfg = self.config.config.data
         reader = self._video_reader
         assert reader is not None, "real-video decode requested but no reader built"
-        g = torch.Generator().manual_seed(dcfg.seed + (abs(hash(rec.video_id)) % (2 ** 20)))
+        # Stable per-clip seed: sha1, not hash() — a str hash is salted per process
+        # (PYTHONHASHSEED), so retries and other shards would sample different
+        # frames for the same clip (see lcocf.data._seeded_noise).
+        clip_seed = int(hashlib.sha1(rec.video_id.encode("utf-8")).hexdigest()[:8], 16)
+        g = torch.Generator().manual_seed(dcfg.seed + clip_seed % (2 ** 20))
         available = reader.num_frames(rec.path)
         idx = sample_frame_indices(available, dcfg.num_frames, dcfg.frame_interval, generator=g)
         frames = reader.read(rec.path, idx)                 # [F, 3, h, w] in [0, 1]

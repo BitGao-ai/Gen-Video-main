@@ -223,10 +223,12 @@ class ModelPerception(PerceptionProvider):
         d_clip: int,
         device: str | torch.device = "cpu",
         batch_fn: Optional[Callable] = None,
+        clip_grad_fn: Optional[FeatureFn] = None,
     ) -> None:
         self._segment_fn = segment_fn
         self._identity_fn = identity_fn
         self._clip_image_fn = clip_image_fn
+        self._clip_grad_fn = clip_grad_fn
         self._clip_text_fn = clip_text_fn
         self._flow_fn = flow_fn
         # (frame, [mask]) -> ([identity], [clip]); enables the batched path below.
@@ -284,6 +286,13 @@ class ModelPerception(PerceptionProvider):
             self._clip_image_fn(frame, mask), self.d_clip, frame.device, "clip_image_fn"
         )
 
+    def clip_feature_grad(self, frame: Tensor, mask: Tensor) -> Tensor:
+        """Frozen CLIP forward retaining gradients to the input pixels."""
+        if self._clip_grad_fn is None:
+            raise RuntimeError("Differentiable tube CLIP requires clip_grad_fn")
+        return self._as_vector(self._clip_grad_fn(frame, mask), self.d_clip,
+                               frame.device, "clip_grad_fn", detach=False)
+
     def text_feature(self, prompt: str) -> Tensor:
         """CLIP text embedding ``[d_clip]`` of the prompt (memoised by the callable)."""
         return self._clip_text_fn(prompt).detach().float()
@@ -316,7 +325,7 @@ class ModelPerception(PerceptionProvider):
 
     # -- helpers -------------------------------------------------------- #
 
-    def _as_vector(self, feat: Tensor, width: int, device, what: str) -> Tensor:
+    def _as_vector(self, feat: Tensor, width: int, device, what: str, *, detach: bool = True) -> Tensor:
         """Coerce a callable's output to the contracted 1-D ``[width]`` feature vector.
 
         A leading batch axis of 1 is unwrapped (``[1, d]`` → ``[d]``); anything else is
@@ -336,7 +345,7 @@ class ModelPerception(PerceptionProvider):
         ``tube_visual_embed`` (:func:`cocf.lcocf.data.tube_clip_embed`) and into CMSC's
         probed ``visual_dim``. See :mod:`cocf.common.hf_clip` for the fix at the source.
         """
-        feat = feat.detach().float().to(device)
+        feat = (feat.detach() if detach else feat).float().to(device)
         if feat.ndim > 1 and feat.shape[0] == 1:
             feat = feat[0]
         if feat.ndim != 1 or feat.shape[0] != width:
@@ -521,14 +530,29 @@ class ModelPerception(PerceptionProvider):
             return feat
 
         def clip_image_fn(frame: Tensor, mask: Tensor) -> Tensor:
+            with _t.no_grad():
+                return clip_grad_fn(frame, mask)
+
+        def clip_grad_fn(frame: Tensor, mask: Tensor) -> Tensor:
             crop = _masked_crop(frame, mask)
             if crop is None or crop.numel() == 0:
                 return _t.zeros(d_clip, device=frame.device)
-            px = clip_proc(images=[_to_pil(crop)], return_tensors="pt")["pixel_values"].to(
-                device=device, dtype=clip_dtype)
-            with _t.no_grad():
-                feat = clip_image_embed(clip, px)[0]  # [d_clip]
-            return feat
+            ip = clip_proc.image_processor
+            size = ip.size
+            edge = int(size["shortest_edge"] if isinstance(size, dict) else size)
+            h, w = crop.shape[-2:]
+            resized = (edge, int(edge * w / h)) if h <= w else (int(edge * h / w), edge)
+            px = _t.nn.functional.interpolate(crop[None].to(device=device, dtype=_t.float32),
+                size=resized, mode="bicubic", align_corners=False, antialias=True)
+            ch, cw = int(ip.crop_size["height"]), int(ip.crop_size["width"])
+            pad_h, pad_w = max(0, ch - resized[0]), max(0, cw - resized[1])
+            px = _t.nn.functional.pad(px, (pad_w // 2, pad_w - pad_w // 2,
+                                           pad_h // 2, pad_h - pad_h // 2))
+            top, left = (px.shape[-2] - ch) // 2, (px.shape[-1] - cw) // 2
+            px = px[:, :, top:top + ch, left:left + cw]
+            mean = px.new_tensor(ip.image_mean).view(1, 3, 1, 1)
+            std = px.new_tensor(ip.image_std).view(1, 3, 1, 1)
+            return clip_image_embed(clip, ((px - mean) / std).to(clip_dtype))[0]
 
         def batch_fn(frame: Tensor, masks):
             """All regions of one frame in a single DINOv2 + CLIP forward (§P2-8)."""
@@ -604,6 +628,7 @@ class ModelPerception(PerceptionProvider):
         self = cls(
             segment_fn, identity_fn, clip_image_fn, clip_text_fn, flow_fn,
             d_id=d_id, d_clip=d_clip, device=device, batch_fn=batch_fn,
+            clip_grad_fn=clip_grad_fn,
         )
         # Publish the loaded backbones so a co-resident consumer can reuse them.
         # DINOv2 + CLIP is ~1 GB, and Stage A builds *both* this and the metric

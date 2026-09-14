@@ -47,9 +47,11 @@ _log = get_logger(__name__)
 # Scenes that §2.3 force-keeps as "hard" (multi-subject / occlusion / text / face)
 # plus fast motion; these are never dropped and seed the hard-sample test list.
 _HARD_SCENES = ("multi", "occlusion", "text", "face")
-# strip a trailing OpenVid segment suffix ``_<start>_<end>`` so clips cut from the
-# same source video share a base id and never split across train/val/test.
-_SEGMENT_SUFFIX = re.compile(r"_\d+_\d+$")
+# strip a trailing OpenVid segment suffix so clips cut from the same source video
+# share a base id and never split across train/val/test. Real OpenVid segment names
+# use ``_<idx>_<start>to<end>`` (e.g. ``AG-rnTlIvgM_11_29to193``); the plainer
+# ``_<start>_<end>`` form is kept for compatibility.
+_SEGMENT_SUFFIX = re.compile(r"_\d+_\d+to\d+$|_\d+_\d+$")
 
 
 def base_video_id(video_id: str) -> str:

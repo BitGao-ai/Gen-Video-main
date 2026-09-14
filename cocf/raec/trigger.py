@@ -70,6 +70,18 @@ class RiskTrigger:
     def unmeasured_steps(self, tube_id: int) -> int:
         return self._unmeasured.get(tube_id, 0)
 
+    def retain(self, live_ids) -> None:
+        """Drop bookkeeping for tubes a re-segmentation retired.
+
+        Without this a dead tube id that had reached ``max_unmeasured`` would make
+        :meth:`coverage_exhausted` true forever — silently vetoing every later
+        whole-step-skip promotion for the rest of the generation. Called alongside
+        ``AnchorStore.retain`` by the engine.
+        """
+        live = set(live_ids)
+        self._unmeasured = {tid: n for tid, n in self._unmeasured.items() if tid in live}
+        self._force_full = {tid: n for tid, n in self._force_full.items() if tid in live}
+
     # ------------------------------------------------------------------ #
     # classification
     # ------------------------------------------------------------------ #

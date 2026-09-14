@@ -7,11 +7,12 @@ the sharded writer only emits its manifest on a clean close, and §1.6 runs afte
 generation loop. Stage B then sees an empty index and loads 0 samples even though the
 shards physically hold data (exactly the state a killed run leaves behind).
 
-This script scans ``counterfactual_lmdb/shard_*.pt`` and rebuilds those artifacts by
-calling the *same* streaming finalize the full pipeline uses — cheaply, on CPU, with no
-backbone and O(1) memory in sample count. The per-clip train/val/test split is recovered
-from ``metadata/filtered_final.csv`` (each sample inherits its video's split, §1.6
-leakage-safe); clips absent there fall back to ``train``.
+This script scans the sample store (LMDB or ``shard_*.pt`` fallback) and rebuilds
+those artifacts by calling the *same* streaming finalize the full pipeline uses —
+cheaply, on CPU, with no backbone and O(1) memory in sample count. The per-clip
+train/val/test split is recovered from ``metadata/filtered_final.csv`` (each sample
+inherits its video's split, §1.6 leakage-safe); clips absent there fall back to
+``train``.
 
 It is idempotent — safe to re-run — and equally rebuilds a store written by a modern
 sharded run (``shard_sNN_*.pt``) or a legacy single-writer run (``shard_NNNNN.pt``).

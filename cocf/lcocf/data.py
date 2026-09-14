@@ -136,7 +136,7 @@ class COCFTrainingSample:
     # for the whole run (§P1-13).
     skip_residual: float = 0.0
     tube_token_count: int = 0             # |g_k| latent tokens (cost context, §2.2)
-    tube_pixels: int = 0                  # region size in pixels (diagnostic)
+    tube_pixels: int = 0                  # latent-token area of the region (diagnostic)
     tube_stability: float = 1.0           # identity stability ∈ [0,1]
 
     def damage_scalar(self, weights: Optional[Dict[str, float]] = None) -> float:
@@ -418,22 +418,35 @@ def _frames_fchw(video: Tensor) -> Tensor:
     return v.permute(1, 0, 2, 3).contiguous()
 
 
-def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube) -> Tensor:
+def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube, grid: Optional[TokenGrid] = None,
+                    *, frame_span=None, full_frame_count=None) -> Tensor:
     """``[F, Hp, Wp]`` bool: the tube's latent masks upsampled to pixel resolution.
 
     The damage extractor works on pixels while a tube carries latent-grid masks, so
     this is the bridge that lets a label be scored on the region the counterfactual
     actually intervened on (§7.1.1).
 
-    The tube's masks share one latent grid, so they upsample as a single batched
-    interpolate rather than one call per frame.
+    Each pixel frame uses the nearest representative latent slot, matching the
+    builder's evenly spaced frame sampling. Window offsets are in full-video pixel
+    coordinates. Omitting grid preserves the legacy one-slot-per-frame convention.
     """
     f, _, hp, wp = video_fchw.shape
     out = torch.zeros(f, hp, wp, dtype=torch.bool, device=video_fchw.device)
-    frames = [
-        (frame, mask) for frame, mask in tube.masks_by_frame.items()
-        if mask is not None and 0 <= frame < f
-    ]
+    start = frame_span[0] if frame_span is not None else 0
+    total = full_frame_count if full_frame_count is not None else f
+    slots = grid.t if grid is not None else f
+    if frame_span is not None and full_frame_count is None:
+        raise ValueError("Windowed tube masks require full_frame_count")
+    if total < 1 or slots < 1 or start < 0 or start + f > total:
+        raise ValueError("Invalid video/tube temporal geometry")
+    if frame_span is not None and frame_span[1] - start != f:
+        raise ValueError("frame_span length must match decoded frame count")
+    # Invert the same evenly spaced representative-frame mapping used by builders.
+    representatives = torch.linspace(0, total - 1, slots).round().long()
+    pixels = torch.arange(start, start + f)
+    owners = (pixels[:, None] - representatives[None, :]).abs().argmin(1)
+    frames = [(i, tube.masks_by_frame[int(slot)]) for i, slot in enumerate(owners)
+              if tube.masks_by_frame.get(int(slot)) is not None]
     if not frames:
         return out
     stacked = torch.stack([m.float() for _, m in frames]).unsqueeze(1)   # [n,1,h,w]
@@ -449,10 +462,11 @@ def tube_clip_embed(
     grid: TokenGrid,
     perception,
     d_v: Optional[int] = None,
+    *, differentiable: bool = False, frame_span=None, full_frame_count=None,
 ) -> Tensor:
     """Per-tube CLIP visual embed ``[d_v]`` from a representative frame (feeds CMSC).
 
-    Picks the tube's middle frame, upsamples its latent mask to pixel resolution and
+    Picks the middle visible pixel frame, maps its latent mask to pixel resolution and
     calls ``perception.clip_feature`` — the same source
     :class:`~cocf.tubes.regions.RegionExtractor` uses, so train/serve embeds match.
     Returns zeros when no perception/mask is available (e.g. a pure-mock dry run).
@@ -463,16 +477,16 @@ def tube_clip_embed(
     zeros = torch.zeros(d_v, device=video_fchw.device)
     if perception is None or not frames:
         return zeros
-    mid = frames[len(frames) // 2]
-    mask_lat = tube.masks_by_frame.get(mid)
-    if mask_lat is None:
+    masks = tube_pixel_mask(video_fchw, tube, grid, frame_span=frame_span,
+                            full_frame_count=full_frame_count)
+    visible = masks.flatten(1).any(1).nonzero().flatten()
+    if not visible.numel():
         return zeros
-    fi = min(mid, video_fchw.shape[0] - 1)
+    fi = int(visible[len(visible) // 2])
     frame = video_fchw[fi]                                   # [3, Hp, Wp]
-    mask_pix = F.interpolate(
-        mask_lat[None, None].float(), size=frame.shape[-2:], mode="nearest"
-    )[0, 0] > 0.5
-    return perception.clip_feature(frame, mask_pix).detach().float()
+    feature_fn = getattr(perception, "clip_feature_grad", perception.clip_feature) if differentiable else perception.clip_feature
+    feature = feature_fn(frame, masks[fi]).float()
+    return feature if differentiable else feature.detach()
 
 
 # ============================================================================= #
@@ -525,6 +539,21 @@ class _FullStepCache:
         self._backbone = backbone
         self._perturb_std = perturb_std
         self._entries: Dict[Tuple[int, int], Tuple[Tensor, Tensor]] = {}
+        self._references = {}
+
+    def reference(self, step_idx, seed, generator, tube, transition, damage_computer, tube_mask):
+        """Cache a paired full continuation for each perturbed starting state."""
+        key = (step_idx, seed)
+        if key not in self._references:
+            before, after = self.get(step_idx, seed)
+            video, _ = generator._rollout(before, after, step_idx, tube, Action.FULL,
+                                          self._traj, self._backbone, transition)
+            self._references[key] = (video, {})
+        video, by_tube = self._references[key]
+        if tube.tube_id not in by_tube:
+            by_tube[tube.tube_id] = damage_computer.reference_features(
+                video, self._traj.prompt, tube_masks={tube.tube_id: tube_mask})
+        return video, by_tube[tube.tube_id]
 
     def get(self, step_idx: int, seed: int) -> Tuple[Tensor, Tensor]:
         """``(z_prev, z_full)`` at ``step_idx`` under perturbation ``seed``."""
@@ -628,7 +657,7 @@ class COCFDataGenerator:
         # selected tube's localised identity reference is computed once per clip
         # rather than once per rollout (§7.1.1 / §P1-4).
         tube_masks: Dict[int, Tensor] = {
-            traj.tubes[ti].tube_id: tube_pixel_mask(traj.video_full, traj.tubes[ti])
+            traj.tubes[ti].tube_id: tube_pixel_mask(traj.video_full, traj.tubes[ti], traj.grid)
             for ti in tube_idx_sel
         }
         feats_full = self.damage_computer.reference_features(
@@ -779,13 +808,17 @@ class COCFDataGenerator:
         per_axis0: Dict[str, float] = {}
         for k in range(self.seeds_per_prompt):
             z_prev, z_full = step_cache.get(step_idx, k)
+            reference_video, reference_feats = traj.video_full, feats_full
+            if k:
+                reference_video, reference_feats = step_cache.reference(
+                    step_idx, k, self, tube, transition, self.damage_computer, tube_mask)
             y_cf, residual = self._rollout(
                 z_prev, z_full, step_idx, tube, action, traj, backbone, transition
             )
             residuals.append(residual)
             dmg, per_axis = self.damage_computer.compute_damage(
-                traj.video_full, y_cf, traj.prompt, tube_mask,
-                tube_id=tube.tube_id, feats_full=feats_full,
+                reference_video, y_cf, traj.prompt, tube_mask,
+                tube_id=tube.tube_id, feats_full=reference_feats,
             )
             dmgs.append(dmg)
             if k == 0:
@@ -930,6 +963,8 @@ class COCFDataGenerator:
     def _select_tubes(self, traj: TeacherTrajectory, max_tubes: int) -> List[int]:
         """Pick ≤``max_tubes`` tube indices spanning high/mid/low causal levels (§1.5)."""
         tubes = traj.tubes
+        if max_tubes < 1:
+            raise ValueError("max_tubes must be positive")
         if len(tubes) <= max_tubes:
             return list(range(len(tubes)))
         order = sorted(
@@ -937,6 +972,8 @@ class COCFDataGenerator:
             key=lambda i: self._strength_scalar(traj.strength_feats[tubes[i].tube_id]),
             reverse=True,
         )
+        if max_tubes == 1:
+            return order[:1]
         picks = sorted({int(round(j * (len(order) - 1) / (max_tubes - 1))) for j in range(max_tubes)})
         return [order[p] for p in picks]
 

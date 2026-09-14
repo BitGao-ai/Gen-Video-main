@@ -182,6 +182,8 @@ def main():
                         help="Compute device; auto-detects cuda when available, else cpu")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
+    if args.checkpoint_load and not args.checkpoint_load.is_file():
+        parser.error(f"Checkpoint not found: {args.checkpoint_load}")
 
     # Join the process group first: it pins this rank's CUDA device before any weight
     # is built, and settles which rank narrates. A run not launched under torchrun gets
@@ -244,6 +246,7 @@ def main():
         num_workers=args.num_workers,
         device=torch.device(args.device),
         mixed_precision=args.mixed_precision,
+        checkpoint_dir=args.checkpoint_save.parent,
     )
 
     log.info("Starting Stage B: joint training")
@@ -255,7 +258,8 @@ def main():
     # corrupt file, not a redundant one.
     if dctx.is_main:
         args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(accelerator.state_dict(), args.checkpoint_save)
+        from cocf.training.checkpoint import build_checkpoint
+        torch.save(build_checkpoint(accelerator), args.checkpoint_save)
         log.info("Saved checkpoint to %s", args.checkpoint_save)
     dist_shutdown()
 

@@ -230,10 +230,13 @@ class TubeState:
             dtype=dtype,
         )
 
-    @property
-    def is_unstable(self) -> bool:
-        """Identity confidence below 0.5 ⇒ unstable tube ⇒ force FULL (§4.3.1)."""
-        return self.identity_confidence < 0.5
+    def is_unstable(self, threshold: float = 0.5) -> bool:
+        """Identity confidence below ``threshold`` ⇒ unstable tube ⇒ force FULL (§4.3.1).
+
+        The default mirrors ``TubeConfig.identity_unstable_threshold``; callers with
+        access to the config must pass it explicitly so the two never drift.
+        """
+        return self.identity_confidence < threshold
 
 
 @dataclass
@@ -245,7 +248,7 @@ class SemanticTube:
     tokens_by_frame: Dict[int, Tensor] = field(default_factory=dict)
     # frame index -> boolean latent mask [H_l, W_l]
     masks_by_frame: Dict[int, Tensor] = field(default_factory=dict)
-    # running identity feature (EMA of per-frame DINOv2 features)
+    # pooled identity feature (mean of per-frame DINOv2 features, fixed at build)
     identity_feat: Optional[Tensor] = None
     # frame index -> that frame's own identity feature, kept *alongside* the pooled
     # ``identity_feat``. Pooling alone destroys the only signal identity confidence

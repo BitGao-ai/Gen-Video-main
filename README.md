@@ -237,8 +237,8 @@ python scripts/train/train_stage_c.py \
 **骨干参数必传**：与阶段 B 不同，阶段 C 真跑扩散（`L_pixel` 要用加速引擎渲一遍再和 `Y_full`
 比像素，梯度穿过可微解码回到插件），所以 Wan 权重必须在场。`--backbone` 的默认值是 `mock`，
 只用于 CPU 冒烟跑（`--backbone mock --device cpu --num_epochs 1`）；不传就会拿一个 32 维假
-DiT 去拟合 Wan2.2 生成的 `Y_full`，训练不报错但没有意义。`--wan-variant` 默认 `ti2v-5b`，若阶段 A
-用的是 A14B（`stage_a_env.json` 里 `token_dim=64`）必须显式写 `a14b-t2v`。
+DiT 去拟合 Wan2.2 生成的 `Y_full`，训练不报错但没有意义。`--wan-variant` 默认 `a14b-t2v`，若阶段 A
+用的是 5B，必须显式传 `--wan-variant ti2v-5b`；A14B 可沿用默认值。
 
 #### 显存档位与推荐命令（A14B @ 49×384×640）
 

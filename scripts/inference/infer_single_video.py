@@ -31,6 +31,8 @@ from cocf.common.logging import get_logger, setup_logging
 from cocf.common.vram import (
     add_backbone_args,
     add_geometry_args,
+    add_perception_args,
+    build_perception_and_metrics,
     apply_geometry,
     apply_wan_variant,
     is_real_gpu_backbone,
@@ -65,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_backbone_args(p, default_backbone="mock", default_wan_variant="a14b-t2v",
                       default_vae_tile=128)
     add_geometry_args(p)
+    add_perception_args(p, default_frame_chunk=4)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -72,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = build_parser().parse_args()
+    if args.checkpoint and not args.checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.steps is not None and args.steps < 1:
+        raise ValueError("--steps must be positive")
 
     setup_logging(level=logging.INFO)
     # Under the framework's ``cocf`` logger namespace: setup_logging attaches the
@@ -105,7 +112,13 @@ def main():
         config.engine.num_inference_steps = args.steps
 
     # -- accelerator & engine --------------------------------------------- #
-    accelerator = Accelerator.from_config(config)
+    if args.backbone != "mock":
+        args.real_perception = True
+        args.require_flow = True
+        log.info("Real backbone selected: enabling real semantic-tube perception")
+    perception, metric_extractor = build_perception_and_metrics(args, log)
+    accelerator = Accelerator.from_config(config, perception=perception,
+                                           metric_extractor=metric_extractor)
     backbone = accelerator.backbone
     # The adapter resolves an unavailable backend down to CPU; follow *its* choice so
     # the plugins, z_init and the frozen weights all land on one device.
@@ -121,13 +134,11 @@ def main():
         n = load_checkpoint(accelerator, ckpt, training_config=config.training)
         if n:
             log.info("Re-attached %d Stage-C LoRA adapter(s)", n)
-    elif args.checkpoint:
-        log.warning("checkpoint %s not found — running with cold-start plugins",
-                    args.checkpoint)
     else:
         log.info("No --checkpoint given: running with cold-start (untrained) plugins.")
 
     accelerator.to(device)
+    accelerator.eval()
     engine = InferenceEngine(accelerator, config.engine, config.trigger)
     engine.to(device)
 
