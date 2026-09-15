@@ -60,8 +60,8 @@ if (_REPO_ROOT / "cocf" / "__init__.py").is_file() and _LOADED != _REPO_ROOT:
 
 from cocf.common.types import Action, TUBE_STATE_FIELDS
 from cocf.data.processed_layout import ProcessedLayout
-from cocf.data.sample_store import _store_is_lmdb, iter_lmdb_records
-from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS
+from cocf.data.sample_store import store_is_lmdb, iter_lmdb_records
+from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS, DISABLED_DAMAGE_AXES
 
 # A FULL rollout reproduces the teacher transition, so its damage is bounded by
 # sampler noise alone. Above this the store's reference and counterfactual sides are
@@ -125,7 +125,7 @@ class Scan:
 def _iter_records(layout: ProcessedLayout):
     """Stream ``(sample_id, payload)`` — at most one record (LMDB) or one shard
     (.pt fallback) resident at a time."""
-    if _store_is_lmdb(layout.lmdb_dir):
+    if store_is_lmdb(layout.lmdb_dir):
         yield from iter_lmdb_records(layout.lmdb_dir)
     else:
         import torch
@@ -194,7 +194,7 @@ def check_full_anchor(rep: Report, dmg: np.ndarray, act: np.ndarray) -> None:
 
 
 def check_monotonicity(rep: Report, dmg: np.ndarray, act: np.ndarray) -> None:
-    """§2: damage must grow as the action removes more compute."""
+    """Compare action means as a heuristic, not a required ordering."""
     means, missing = {}, []
     for a in Action:
         sel = act == int(a)
@@ -211,18 +211,20 @@ def check_monotonicity(rep: Report, dmg: np.ndarray, act: np.ndarray) -> None:
     inversions = [i for i in range(3) if order[i] > order[i + 1] + 1e-4]
     if not inversions:
         rep.add("PASS", "动作单调性",
-                f"{line}\n      损伤随动作激进程度单调递增,符合 FULL≤LOWFREQ≤INTERP≤ANCHOR 的构造。")
+                f"{line}\n      本批数据的动作损伤均值单调递增;该顺序不是理论保证。")
     else:
         names = [f"{list(Action)[i].name}→{list(Action)[i+1].name}" for i in inversions]
         rep.add("WARN", "动作单调性",
-                f"{line}\n      在 {names} 处出现反转 —— 损伤度量可能没有真正测到退化。"
-                "\n      若同时 FULL 锚点也不通过,先修锚点再看这条。")
+                f"{line}\n      在 {names} 处出现均值反转;计算更少不保证损伤更大。"
+                "\n      此项仅作提醒,建议按同一视频和采样步配对分析,不能据此判定标签错误。")
 
 
 def check_axes(rep: Report, dmg: np.ndarray) -> None:
     """§3: a constant axis is a metric backend that silently degraded."""
     dead, saturated, healthy = [], [], []
     for i, name in enumerate(DAMAGE_DIMENSIONS):
+        if name in DISABLED_DAMAGE_AXES:
+            continue
         col = dmg[:, i]
         std = float(col.std())
         at_bounds = float(((col <= 1e-6) | (col >= 1 - 1e-6)).mean())
@@ -352,6 +354,7 @@ def main() -> int:
     act = np.array(scan.actions)
 
     rep = Report()
+    print(f"Disabled damage axes (excluded from scoring/check_axes): {DISABLED_DAMAGE_AXES}")
     check_full_anchor(rep, dmg, act)
     check_monotonicity(rep, dmg, act)
     check_axes(rep, dmg)

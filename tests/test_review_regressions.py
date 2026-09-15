@@ -47,7 +47,10 @@ class ReviewRegressions(unittest.TestCase):
             trainer.accelerator, trainer.device = acc, "cpu"
             trainer._reduce = lambda x: x
             metrics = trainer._validate([batch])
-            self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in metrics.values()))
+            self.assertTrue(torch.isfinite(torch.tensor(metrics['mae'])))
+            self.assertIn('zero_baseline_mae', metrics)
+            if metrics['temporal_pairs'] == 0:
+                self.assertTrue(torch.isnan(torch.tensor(metrics['smoothness'])))
 
     def test_nested_tuple_and_extra_preservation(self):
         data = _build_dataclass(DataConfig, {"resolution_buckets": [[49, 384, 640]]})

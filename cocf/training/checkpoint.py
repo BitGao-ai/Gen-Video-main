@@ -47,6 +47,8 @@ def build_checkpoint(
     back (see :func:`cocf.training.lora.attach_lora`).
     """
     ckpt: Dict[str, Any] = {ACCELERATOR_KEY: accelerator.state_dict()}
+    from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
+    ckpt["damage_weights"] = dict(DEFAULT_DAMAGE_WEIGHTS)
     ckpt["risk_definition"] = "neutral_centered_v1"
     ckpt["model_metadata"] = {
         "backbone": (accelerator.config.backbone.name
@@ -151,6 +153,10 @@ def load_checkpoint(
         model's — see :func:`_filter_shape_mismatch`. Set False to demand an exact
         match.
     """
+    from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
+    if ckpt.get("damage_weights") != DEFAULT_DAMAGE_WEIGHTS:
+        raise ValueError("Checkpoint damage scoring policy is missing or differs from current weights. "
+                         "Retrain Stage B with OCR disabled; do not reuse the old smoke checkpoint.")
     state = ckpt[ACCELERATOR_KEY] if is_two_part(ckpt) else ckpt
     metadata = ckpt.get("model_metadata", {}) if is_two_part(ckpt) else {}
     expected = {"backbone": accelerator.config.backbone.name,

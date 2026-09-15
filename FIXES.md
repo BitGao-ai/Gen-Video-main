@@ -65,3 +65,21 @@ perception pixel gradients, risk parity and checkpoint/batch validation. Real
 SAM/CLIP/Wan weights, GPU peak memory, LoRA and multi-GPU execution require separate
 hardware validation. The tensor CLIP resize can differ numerically from legacy
 PIL preprocessing, so old feature stores should not be assumed identical.
+# Non-OCR scoring and Stage B diagnostics
+
+- `DISABLED_DAMAGE_AXES` in `cocf/lcocf/damage.py` explicitly disables OCR
+  project-wide. The eight-axis schema remains unchanged; active weights sum to
+  one. Stage B, Stage C, data scoring and diagnostics share these weights.
+- Existing zero-OCR Stage A payloads remain usable without regeneration. Do not
+  rerun finalize just for this change. Start Stage B from scratch: targets are
+  rescaled by 1/0.92, and new checkpoints record/check the scoring weights.
+  Legacy checkpoints without scoring metadata are rejected, including in inference.
+  Fixed certificate thresholds still require calibration on the new scale.
+- Validation logs zero-prediction MAE, per-action MAE/counts, non-FULL MAE,
+  mean sigma and temporal pair counts. No temporal pairs means NaN smoothness,
+  not demonstrated perfect smoothness. Sampling itself has not been changed.
+- Temporal smoothing averages same-step duplicates before comparing distinct
+  sampled steps. These pairs are not necessarily consecutive diffusion steps.
+- CPU tests cover scoring invariance to OCR, normalized weights, same-step
+  exclusion and rejection of old scoring checkpoints. Real GPU validation remains
+  necessary.

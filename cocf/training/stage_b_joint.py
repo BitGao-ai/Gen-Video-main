@@ -178,6 +178,8 @@ class JointTrainingStage:
     def run(self) -> Accelerator:
         """Execute Stage B and return the trained accelerator."""
         _log.info("=== Stage B: Joint Module Training (§4.1) ===")
+        from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
+        _log.info("Damage scoring weights: %s", DEFAULT_DAMAGE_WEIGHTS)
         if self.dctx.is_main:
             self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,6 +330,10 @@ class JointTrainingStage:
 
         n = 0
         abs_err = cert_viol = budget_hit = smooth = 0.0
+        zero_err = sigma_sum = 0.0
+        pair_count = 0
+        action_errors = [0.0] * 4
+        action_counts = [0] * 4
         action_cost = torch.tensor(acc.allocator.action_cost, device=self.device)
         for batch in loader:
             tube_features = batch["tube_features"].to(self.device).float()
@@ -356,18 +362,41 @@ class JointTrainingStage:
 
             bs = mu_a.shape[0]
             abs_err += float((mu_a - damage_true).abs().sum())
+            zero_err += float(damage_true.abs().sum())
+            sigma_sum += float(sigma_a.sum())
+            for action in range(4):
+                selected = actions == action
+                action_counts[action] += int(selected.sum())
+                action_errors[action] += float((mu_a[selected] - damage_true[selected]).abs().sum())
             cert_viol += float((e_cert < damage_true).sum())   # cert failed to upper-bound
             budget_hit += float((expected_cost <= budget + 1e-6).sum())
-            smooth += float(tube_temporal_smoothness(acc, probs, batch)) * bs
+            temporal, pairs = tube_temporal_smoothness(acc, probs, batch, return_pairs=True)
+            smooth += float(temporal) * pairs
+            pair_count += pairs
             n += bs
 
         n = max(1, n)
-        return {
+        # Reduce sums and counts separately so uneven rank populations remain weighted.
+        global_n = self._reduce(n)
+        global_pairs = self._reduce(pair_count)
+        world_size = getattr(getattr(self, "dctx", None), "world_size", 1)
+        metrics = {
             "mae": self._reduce(abs_err / n),
             "cert_violation": self._reduce(cert_viol / n),
             "budget_hit": self._reduce(budget_hit / n),
-            "smoothness": self._reduce(smooth / n),
+            "zero_baseline_mae": self._reduce(zero_err) / global_n,
+            "sigma_mean": self._reduce(sigma_sum) / global_n,
+            "smoothness": self._reduce(smooth) / global_pairs if global_pairs else float("nan"),
+            "temporal_pairs": global_pairs * world_size,
         }
+        counts = [self._reduce(v) for v in action_counts]
+        errors = [self._reduce(v) for v in action_errors]
+        for i, name in enumerate(("full", "lowfreq", "interp", "anchor")):
+            metrics[f"mae_{name}"] = errors[i] / counts[i] if counts[i] else float("nan")
+            metrics[f"n_{name}"] = counts[i] * world_size
+        nonfull_count = sum(counts[1:])
+        metrics["mae_nonfull"] = sum(errors[1:]) / nonfull_count if nonfull_count else float("nan")
+        return metrics
 
     @staticmethod
     def _fmt(d: Dict[str, float]) -> str:

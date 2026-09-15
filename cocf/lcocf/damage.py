@@ -47,6 +47,8 @@ NUM_DAMAGE_DIMS = len(DAMAGE_DIMENSIONS)
 
 # Default perceptual weights for reducing the vector to a scalar μ-target. They
 # emphasise the failure modes the doc calls out (identity drift, flicker, OCR).
+DISABLED_DAMAGE_AXES = ("ocr_accuracy",)
+
 DEFAULT_DAMAGE_WEIGHTS: Dict[str, float] = {
     "subject_consistency": 0.18,
     "background_consistency": 0.08,
@@ -56,6 +58,14 @@ DEFAULT_DAMAGE_WEIGHTS: Dict[str, float] = {
     "dino_identity": 0.16,
     "raft_motion": 0.08,
     "ocr_accuracy": 0.08,
+}
+
+# Keep the eight-axis storage contract, but exclude unsupported supervision.
+_active_weight_sum = sum(w for axis, w in DEFAULT_DAMAGE_WEIGHTS.items()
+                         if axis not in DISABLED_DAMAGE_AXES)
+DEFAULT_DAMAGE_WEIGHTS = {
+    axis: (0.0 if axis in DISABLED_DAMAGE_AXES else w / _active_weight_sum)
+    for axis, w in DEFAULT_DAMAGE_WEIGHTS.items()
 }
 
 

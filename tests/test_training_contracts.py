@@ -40,6 +40,12 @@ class TrainingContractsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_checkpoint(self.acc, checkpoint)
 
+    def test_checkpoint_rejects_old_scoring(self):
+        checkpoint = build_checkpoint(self.acc)
+        checkpoint.pop('damage_weights')
+        with self.assertRaisesRegex(ValueError, 'scoring policy'):
+            load_checkpoint(self.acc, checkpoint)
+
     def test_batch_rejected_before_render(self):
         engine = InferenceEngine(self.acc, self.config.engine, self.config.trigger)
         grid = TokenGrid(t=1, h=2, w=2)

@@ -137,8 +137,8 @@ def per_sample_budget(accelerator, batch: Dict[str, object], device=None) -> Ten
 
 
 def tube_temporal_smoothness(
-    accelerator, probs: Tensor, batch: Dict[str, object]
-) -> Tensor:
+    accelerator, probs: Tensor, batch: Dict[str, object], *, return_pairs=False
+):
     """STA temporal term: mean action-prob change for a tube across adjacent steps.
 
     Groups the batch by ``(video_id, tube_id)``, orders each group by timestep and
@@ -160,13 +160,17 @@ def tube_temporal_smoothness(
     for (_vid, tid), idxs in groups.items():
         if len(idxs) < 2:
             continue
-        idxs.sort(key=lambda j: int(timestep[j]))
-        for a, b in zip(idxs[:-1], idxs[1:]):
+        by_step = defaultdict(list)
+        for j in idxs:
+            by_step[int(timestep[j])].append(j)
+        states = [probs[by_step[step]].mean(0) for step in sorted(by_step)]
+        for a, b in zip(states[:-1], states[1:]):
             total = total + accelerator.tube_smoothing(
-                {tid: probs[b]}, {tid: probs[a]}
+                {tid: b}, {tid: a}
             )
             pairs += 1
-    return total / pairs if pairs else total
+    value = total / pairs if pairs else total
+    return (value, pairs) if return_pairs else value
 
 
 def batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
