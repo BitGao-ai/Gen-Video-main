@@ -176,11 +176,34 @@ def main():
                         help="0 keeps the LMDB handle single-process safe")
     parser.add_argument("--lr", type=float, default=None,
                         help="Override config.training.optim.lr")
+    parser.add_argument("--early_stop_patience", type=int, default=None,
+                        help="Override config.training.early_stop_patience (default 3). "
+                             "Phased mode applies the patience per phase; a slow-converging "
+                             "mean phase needs a larger value to avoid stopping at its "
+                             "first plateau.")
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Compute device; auto-detects cuda when available, else cpu")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--predictor_mean_steps", type=int, default=0,
+                        help="Phase 1 length in optimiser steps: scaled MSE/Huber on the "
+                             "predictor mean, variance excluded from the loss. "
+                             "0 (default) keeps the classic single-phase joint NLL.")
+    parser.add_argument("--predictor_var_steps", type=int, default=0,
+                        help="Phase 2 length in optimiser steps: only predictor.var_head "
+                             "trains, on the plain Gaussian NLL.")
+    parser.add_argument("--predictor_joint_lr_scale", type=float, default=0.0,
+                        help="If > 0, a phase 3 follows: full joint loss at lr×this scale. "
+                             "num_epochs is a budget cap once phases are configured.")
+    parser.add_argument("--predictor_mean_objective", choices=["mse", "huber"], default="mse",
+                        help="Phase 1 regression form (targets inflated by the scale below).")
+    parser.add_argument("--predictor_target_scale", type=float, default=100.0,
+                        help="Phase 1 target inflation factor for numerical comfort.")
+    parser.add_argument("--predictor_aux_isolation", type=int, choices=[0, 1], default=1,
+                        help="1 (default): certificate gets detached mu/sigma in every "
+                             "phase and the mean phase drops STA/budget — a pure "
+                             "regression control. 0 restores auxiliary gradients.")
     args = parser.parse_args()
     if args.checkpoint_load and not args.checkpoint_load.is_file():
         parser.error(f"Checkpoint not found: {args.checkpoint_load}")
@@ -217,6 +240,10 @@ def main():
     config.seed = args.seed
     if args.lr is not None:
         config.training.optim.lr = args.lr
+    if args.early_stop_patience is not None:
+        if args.early_stop_patience < 1:
+            parser.error("--early_stop_patience must be a positive integer")
+        config.training.early_stop_patience = args.early_stop_patience
     # Size the plugins from the geometry the *store* was generated with, not from
     # whatever backbone default this process happens to construct.
     _apply_stage_a_geometry(config, layout, log)
@@ -233,9 +260,10 @@ def main():
         log.info("Loading checkpoint from %s", args.checkpoint_load)
         ckpt = torch.load(args.checkpoint_load, map_location=args.device,
                           weights_only=False)
-        # Either layout: a bare state_dict, or Stage C's {"accelerator", "lora"}.
-        # Stage B trains the plugins only, so any LoRA in the checkpoint is loaded
-        # into the backbone but not touched by this stage's optimiser.
+        # Two-part {"accelerator", ...} payloads only; bare state_dicts are rejected
+        # for lacking damage_weights. Stage B trains the plugins only, so any LoRA
+        # in the checkpoint is loaded into the backbone but not touched by this
+        # stage's optimiser.
         load_checkpoint(accelerator, ckpt, training_config=config.training)
 
     stage_b_config = StageBConfig(
@@ -247,6 +275,12 @@ def main():
         device=torch.device(args.device),
         mixed_precision=args.mixed_precision,
         checkpoint_dir=args.checkpoint_save.parent,
+        predictor_mean_steps=args.predictor_mean_steps,
+        predictor_var_steps=args.predictor_var_steps,
+        predictor_joint_lr_scale=args.predictor_joint_lr_scale,
+        predictor_mean_objective=args.predictor_mean_objective,
+        predictor_target_scale=args.predictor_target_scale,
+        predictor_aux_isolation=bool(args.predictor_aux_isolation),
     )
 
     log.info("Starting Stage B: joint training")
@@ -259,7 +293,12 @@ def main():
     if dctx.is_main:
         args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
         from cocf.training.checkpoint import build_checkpoint
-        torch.save(build_checkpoint(accelerator), args.checkpoint_save)
+        ckpt = build_checkpoint(accelerator)
+        if stage_b.phase_state is not None:
+            # Phased run: carry the completion record so load_checkpoint rejects
+            # this file downstream while the variance calibration is unfinished.
+            ckpt["phase_state"] = stage_b.phase_state
+        torch.save(ckpt, args.checkpoint_save)
         log.info("Saved checkpoint to %s", args.checkpoint_save)
     dist_shutdown()
 

@@ -18,14 +18,16 @@ so no payload is read to assemble a batch.
 Validation (§4.1 验证环节) runs on the ``val`` split each epoch: degradation-prediction
 MAE, certificate-violation rate, budget-hit rate and tube action smoothness; the best
 model by MAE is checkpointed and training early-stops after
-``training.early_stop_patience`` epochs without improvement.
+``training.early_stop_patience`` epochs without improvement. Phased mode scores each
+phase on the metric it actually optimises (see ``_monitor_for``).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.optim as optim
@@ -56,6 +58,7 @@ from cocf.training.stage_b_losses import (
     action_probs,
     compute_joint_loss,
     damage_scalar_batch,
+    gaussian_nll,
     per_sample_budget,
     tube_temporal_smoothness,
     batch_float,
@@ -81,9 +84,34 @@ class StageBConfig:
     checkpoint_dir: Path = Path("./checkpoints/stage_b")
     log_every: int = 20
 
+    # Phased predictor training (optional; ``predictor_mean_steps == 0`` keeps the
+    # classic single-phase joint NLL). Stage lengths are optimiser *steps*, not
+    # epochs, and ``num_epochs`` then acts as a pure budget cap. Phase 1 regresses
+    # μ with a scaled MSE/Huber (σ excluded from the loss); phase 2 freezes
+    # everything except ``predictor.var_head`` and calibrates σ on the plain NLL;
+    # phase 3 (only when ``predictor_joint_lr_scale > 0``) resumes the full joint
+    # loss at a reduced LR. Early-stop patience and the best-checkpoint tracker
+    # restart at every phase switch, and each phase keeps its own best file.
+    predictor_mean_steps: int = 0
+    predictor_var_steps: int = 0
+    predictor_joint_lr_scale: float = 0.0
+    predictor_mean_objective: str = "mse"       # "mse" | "huber"
+    predictor_target_scale: float = 100.0
+    # Auxiliary-gradient isolation for the experiment: the certificate gets
+    # detached (mu, sigma) in *every* phase (it cannot resume pushing them when
+    # the joint phase starts), and the mean phase drops the STA/budget terms,
+    # making it a pure regression control. Classic single-phase runs ignore this.
+    predictor_aux_isolation: bool = True
+
     def __post_init__(self) -> None:
         self.processed_root = Path(self.processed_root)
         self.checkpoint_dir = Path(self.checkpoint_dir)
+        if self.predictor_mean_steps < 0 or self.predictor_var_steps < 0:
+            raise ValueError("phase step counts must be nonnegative")
+        if self.predictor_mean_steps == 0 and (
+            self.predictor_var_steps or self.predictor_joint_lr_scale
+        ):
+            raise ValueError("phased training requires predictor_mean_steps > 0")
 
 
 class JointTrainingStage:
@@ -114,6 +142,12 @@ class JointTrainingStage:
         self.optimizer = optim.AdamW(
             self.trainable_params, lr=opt.lr, betas=opt.betas, weight_decay=opt.weight_decay
         )
+        # The parameter set the current phase actually optimises: gradient sync,
+        # clipping and the finite-check all walk this list, and the optimizer is
+        # rebuilt from it at every phase switch (frozen parameters must leave the
+        # optimizer entirely — AdamW's stale momentum and weight decay would keep
+        # moving them on zero gradients).
+        self.active_params: List[torch.nn.Parameter] = list(self.trainable_params)
         # AMP needs *both* halves: an autocast region for the forward (where the
         # memory/throughput saving actually comes from) and a loss scaler for the
         # backward. Only the scaler existed, so --mixed-precision bought scaling
@@ -128,6 +162,11 @@ class JointTrainingStage:
             and resolve_dtype(self._amp_dtype) is torch.float16
         )
         self.scaler = torch.amp.GradScaler("cuda") if use_scaler else None
+        # Completion record of the last run() (phased mode only); the entry point
+        # merges it into the final checkpoint so load_checkpoint can gate on it.
+        self.phase_state: Optional[Dict[str, Any]] = None
+        # Flipped only when the variance phase verifiably completes; reset by run().
+        self._var_calibrated = False
 
     # ------------------------------------------------------------------ #
     # data
@@ -208,12 +247,40 @@ class JointTrainingStage:
 
         sampler = train_loader.batch_sampler
         opt = self.train_cfg.optim
+        # ``global_step`` counts *successful* optimiser updates only: a step skipped
+        # over nonfinite gradients must not consume the phase or warmup budget.
         global_step = 0
-        best_metric = float("inf")
-        epochs_no_improve = 0
+        self._updates = 0
+        self._best_metric = float("inf")
+        self._epochs_no_improve = 0
+        self._best_state: Optional[Dict[str, Tensor]] = None
+        # Set only when the variance phase verifiably completes (left via a phase
+        # transition, or its step budget found fully spent at close-out). This —
+        # not the current phase name — is what ``calibration_complete`` records.
+        self._var_calibrated = False
+        self._phased = phased = self.config.predictor_mean_steps > 0
+        phase = "mean" if phased else "joint"
+        phases_done = False
+        if phased:
+            self._phase_bounds = self._build_phase_schedule()
+            _log.info(
+                "Phased predictor training: mean=%d steps (%s, scale=%g) → var=%d steps"
+                "%s; num_epochs=%d is a budget cap only; auxiliary isolation %s",
+                self.config.predictor_mean_steps, self.config.predictor_mean_objective,
+                self.config.predictor_target_scale, self.config.predictor_var_steps,
+                f" → joint at lr×{self.config.predictor_joint_lr_scale:g}"
+                if self.config.predictor_joint_lr_scale > 0 else " (no joint phase)",
+                self.config.num_epochs,
+                "ON" if self.config.predictor_aux_isolation else "OFF",
+            )
 
         for epoch in range(self.config.num_epochs):
-            self.accelerator.train()
+            # The variance phase freezes the mean path; keep it in eval mode so a
+            # non-default dropout cannot keep its outputs stochastic.
+            if phased and phase == "var":
+                self.accelerator.eval()
+            else:
+                self.accelerator.train()
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
             running: Dict[str, float] = {}
@@ -221,16 +288,42 @@ class JointTrainingStage:
             n_text_missing = 0
 
             for batch_idx, batch in enumerate(train_loader):
-                global_step += 1
-                if global_step <= opt.warmup_steps:  # include the target-LR boundary
+                if phased:
+                    next_phase = self._phase_for_step(global_step)
+                    if next_phase is None or next_phase != phase:
+                        # A phase boundary reached mid-epoch: close the phase out
+                        # *now* — validate, checkpoint its best, restore those best
+                        # weights — instead of losing all three to the epoch
+                        # boundary. Then advance (or finish).
+                        self._finalize_phase(phase, val_loader)
+                        self._restore_best()
+                        if phase == "var":
+                            self._var_calibrated = True
+                            self._restamp_best("var", global_step)
+                        if next_phase is None:
+                            phases_done = True
+                            break
+                        self._rebase_schedule(phase, global_step)
+                        phase = next_phase
+                        self._enter_phase(phase)   # also sets train/eval mode
+                        self._best_metric = float("inf")
+                        self._epochs_no_improve = 0
+                        self._best_state = None
+
+                if global_step + 1 <= opt.warmup_steps and not (phased and phase == "joint"):
                     for g in self.optimizer.param_groups:
-                        g["lr"] = opt.lr * global_step / max(1, opt.warmup_steps)
-                    if global_step == opt.warmup_steps:
-                        _log.info("Stage B warmup complete: step=%d lr=%.8g", global_step, opt.lr)
+                        g["lr"] = opt.lr * (global_step + 1) / max(1, opt.warmup_steps)
+                    if global_step + 1 == opt.warmup_steps:
+                        _log.info("Stage B warmup complete: step=%d lr=%.8g",
+                                  global_step + 1, opt.lr)
 
                 with autocast(str(self.device), self._amp_dtype):
                     total, comps = compute_joint_loss(
-                        self.accelerator, batch, training_cfg=self.train_cfg
+                        self.accelerator, batch, training_cfg=self.train_cfg,
+                        phase=phase,
+                        mean_objective=self.config.predictor_mean_objective,
+                        target_scale=self.config.predictor_target_scale,
+                        isolate_aux=phased and self.config.predictor_aux_isolation,
                     )
                 n_text_missing += int(batch.get("text_missing", 0) or 0)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -239,7 +332,7 @@ class JointTrainingStage:
                     self.scaler.scale(total).backward()
                     self.scaler.unscale_(self.optimizer)
                     finite = all_agree(
-                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.trainable_params),
+                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.active_params),
                         self.dctx, device=torch.device(self.device))
                     if not finite:
                         self.scaler.update(new_scale=self.scaler.get_scale() * self.scaler.get_backoff_factor())
@@ -248,23 +341,25 @@ class JointTrainingStage:
                         continue
                     # Average across ranks *before* clipping, so every rank clips the
                     # same gradient and therefore takes an identical step.
-                    average_gradients(self.trainable_params, self.dctx)
+                    average_gradients(self.active_params, self.dctx)
                     finite = all_agree(
-                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.trainable_params),
+                        all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in self.active_params),
                         self.dctx, device=torch.device(self.device))
                     if not finite:
                         self.scaler.update(new_scale=self.scaler.get_scale() * self.scaler.get_backoff_factor())
                         self.optimizer.zero_grad(set_to_none=True)
                         _log.warning("Stage B step %d: gradient reduction overflow; all ranks skip update", global_step)
                         continue
-                    torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm)
+                    torch.nn.utils.clip_grad_norm_(self.active_params, max_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     total.backward()
-                    average_gradients(self.trainable_params, self.dctx)
-                    torch.nn.utils.clip_grad_norm_(self.trainable_params, max_norm)
+                    average_gradients(self.active_params, self.dctx)
+                    torch.nn.utils.clip_grad_norm_(self.active_params, max_norm)
                     self.optimizer.step()
+                global_step += 1
+                self._updates = global_step
 
                 for k, v in comps.items():
                     running[k] = running.get(k, 0.0) + v
@@ -276,6 +371,10 @@ class JointTrainingStage:
 
             avg = {k: self._reduce(v / max(1, n_batches)) for k, v in running.items()}
             _log.info("epoch %d done  avg_total=%.4f", epoch + 1, avg.get("total", 0.0))
+            if phases_done:
+                _log.info("Phased predictor training complete after %d successful "
+                          "updates; final phase best restored", global_step)
+                break
             if n_text_missing:
                 _log.warning(
                     "epoch %d: %d sample(s) had no prompt embedding, so their CMSC "
@@ -284,7 +383,7 @@ class JointTrainingStage:
                 )
 
             # --- validation & early stopping (§4.1) --------------------- #
-            # One monitored quantity for the whole run: mixing the training total with
+            # One monitored quantity per phase: mixing the training total with
             # the validation MAE (they differ by an order of magnitude) made every
             # non-validation epoch score as "no improvement" and tripped the patience
             # counter on a run that was still converging.
@@ -293,26 +392,273 @@ class JointTrainingStage:
                     continue
                 metrics = self._validate(val_loader)
                 _log.info("  val  %s", self._fmt(metrics))
-                monitor = metrics["mae"]
+                monitor = self._monitor_for(phase, metrics)
             else:
                 monitor = avg.get("total", float("inf"))
 
-            if monitor < best_metric - 1e-5:
-                best_metric = monitor
-                epochs_no_improve = 0
-                if self.dctx.is_main:
-                    torch.save(build_checkpoint(self.accelerator),
-                               self.config.checkpoint_dir / "stage_b_best.pt")
-                _log.info("  new best (%.4f) → stage_b_best.pt", best_metric)
+            if monitor < self._best_metric - 1e-5:
+                self._best_metric = monitor
+                self._epochs_no_improve = 0
+                self._save_best(phase)
             else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= self.train_cfg.early_stop_patience:
-                    _log.info("early stop after %d evaluations without improvement",
-                              epochs_no_improve)
-                    break
+                self._epochs_no_improve += 1
+                if self._epochs_no_improve >= self.train_cfg.early_stop_patience:
+                    if not phased:
+                        _log.info("early stop after %d evaluations without improvement",
+                                  self._epochs_no_improve)
+                        break
+                    # Phased mode: an exhausted phase is *finished early*, not a
+                    # failed run — restore its best and advance, so a mean-phase
+                    # plateau can never skip the variance calibration outright.
+                    _log.info("phase %s early-stopped after %d evaluations; restoring "
+                              "its best and advancing", phase, self._epochs_no_improve)
+                    self._restore_best()
+                    if phase == "var":
+                        self._var_calibrated = True
+                        self._restamp_best("var", global_step)
+                    successor = self._successor_phase(phase)
+                    if successor is None:
+                        phases_done = True
+                        _log.info("all phases complete (final phase early-stopped; its "
+                                  "best restored)")
+                        break
+                    self._rebase_schedule(phase, global_step)
+                    phase = successor
+                    self._enter_phase(phase)
+                    self._best_metric = float("inf")
+                    self._epochs_no_improve = 0
+                    self._best_state = None
 
-        _log.info("Stage B training complete (best=%.4f)", best_metric)
+        if phased and not phases_done:
+            # The loop can end with the very last batch *exactly* exhausting the
+            # schedule — the mid-epoch boundary check only runs before the *next*
+            # batch, which never comes. Detect completion here instead of relying
+            # on that check, so a fully-spent budget still gets its close-out.
+            if self._phase_for_step(global_step) is None:
+                phases_done = True
+                _log.info("all phases complete: schedule exhausted at %d successful "
+                          "updates", global_step)
+            # Whatever the cause (budget cap or just-spent schedule), the phase in
+            # progress never saw the epoch-boundary validation on its final weights.
+            # Close it out now: validate, checkpoint its best and restore it.
+            self._finalize_phase(phase, val_loader)
+            self._restore_best()
+            # The loop can also end *exactly* on the variance phase's last step
+            # (a later joint phase configured but never entered): σ calibration
+            # is complete even though no transition away from "var" ever fired.
+            if phase == "var" and self._var_budget_spent(global_step):
+                self._var_calibrated = True
+                self._restamp_best("var", global_step)
+        if phased and not phases_done:
+            if self._var_calibrated:
+                _log.info("Stage B stopped at the epoch budget after variance "
+                          "calibration (phase %s); optional later phases did not "
+                          "run — the checkpoint is calibration-complete", phase)
+            else:
+                _log.warning("Stage B stopped at the epoch budget mid-phase (%s); "
+                             "variance calibration did NOT finish — the checkpoint "
+                             "is gated as phase-incomplete", phase)
+        self.phase_state = (
+            self._phase_state_dict(phase, global_step) if phased else None
+        )
+        _log.info("Stage B training complete (best=%.4f)", self._best_metric)
         return self.accelerator
+
+    # ------------------------------------------------------------------ #
+    # phased predictor training (mean → variance → optional joint)
+    # ------------------------------------------------------------------ #
+
+    def _build_phase_schedule(self) -> List[list]:
+        """Phase boundaries as cumulative successful-update counts; ``None`` = open-ended."""
+        c = self.config
+        bounds: List[list] = [["mean", c.predictor_mean_steps]]
+        if c.predictor_var_steps:
+            bounds.append(["var", bounds[-1][1] + c.predictor_var_steps])
+        if c.predictor_joint_lr_scale > 0:
+            bounds.append(["joint", None])
+        return bounds
+
+    def _phase_for_step(self, steps_completed: int) -> Optional[str]:
+        """Which phase ``steps_completed`` optimiser updates places us in.
+
+        ``None`` means every configured phase has run its step budget — training
+        stops regardless of the remaining epoch count.
+        """
+        bounds = getattr(self, "_phase_bounds", None) or self._build_phase_schedule()
+        for name, end in bounds:
+            if end is None or steps_completed < end:
+                return name
+        return None
+
+    def _rebase_schedule(self, phase: str, steps_completed: int) -> None:
+        """End ``phase`` at ``steps_completed`` and re-anchor the later phases.
+
+        Used when a phase finishes *early* (early stopping): the remaining phases
+        keep their configured lengths, counted from now, instead of waiting for
+        the original boundary that will never be reached.
+        """
+        bounds = getattr(self, "_phase_bounds", None)
+        if not bounds:
+            return
+        for i, (name, end) in enumerate(bounds):
+            if name != phase:
+                continue
+            old_prev = end
+            bounds[i][1] = steps_completed
+            for j in range(i + 1, len(bounds)):
+                _, e = bounds[j]
+                if e is None:
+                    continue
+                length = e - old_prev
+                bounds[j][1] = bounds[j - 1][1] + length
+                old_prev = e
+            return
+
+    def _successor_phase(self, phase: str) -> Optional[str]:
+        names = [n for n, _ in getattr(self, "_phase_bounds", None) or self._build_phase_schedule()]
+        if phase not in names:
+            return None
+        i = names.index(phase)
+        return names[i + 1] if i + 1 < len(names) else None
+
+    @staticmethod
+    def _monitor_for(phase: str, metrics: Dict[str, float]) -> float:
+        # Each phase is scored on what it actually optimises. The variance phase:
+        # non-FULL NLL (FULL's pinned-zero NLL would fake calibration). The mean
+        # phase: non-FULL MAE — FULL rows are pinned at zero error, so the
+        # all-sample MAE dilutes every real improvement by their share of the
+        # split and trips the absolute (1e-5) early-stop threshold while the
+        # regression is still converging. The joint phase keeps the classic
+        # all-sample MAE.
+        if phase == "var":
+            return metrics["nll_nonfull"]
+        if phase == "mean":
+            return metrics["mae_nonfull"]
+        return metrics["mae"]
+
+    def _finalize_phase(self, phase: str, val_loader: Optional[DataLoader]) -> None:
+        """Close a phase out mid-epoch: validate and checkpoint *now*.
+
+        Phase budgets are counted in optimiser steps, so a phase can end anywhere
+        inside an epoch. Deferring its validation to the epoch boundary would
+        score a stale model — or none at all when the run stops first.
+        """
+        if val_loader is None:
+            return
+        metrics = self._validate(val_loader)
+        _log.info("  val (phase %s final)  %s", phase, self._fmt(metrics))
+        monitor = self._monitor_for(phase, metrics)
+        if monitor < self._best_metric - 1e-5:
+            self._best_metric = monitor
+            self._epochs_no_improve = 0
+            self._save_best(phase)
+
+    def _phase_state_dict(self, phase: str, updates: int) -> Dict[str, Any]:
+        """Completion record written into every phased-mode checkpoint.
+
+        ``calibration_complete`` is the load-time gate (:func:`load_checkpoint`
+        rejects phased checkpoints without it). It mirrors the explicitly
+        tracked ``self._var_calibrated`` flag — set only when the variance phase
+        verifiably completes (a transition away from it, or its step budget
+        found fully spent at close-out). Inferring it from the current phase
+        name or from schedule exhaustion mislabels both directions: a mean-only
+        experiment has no variance calibration to complete, and a run stopped
+        exactly on the variance phase's last step *is* calibrated even though
+        the phase name still reads "var".
+        """
+        bounds = getattr(self, "_phase_bounds", None) or self._build_phase_schedule()
+        return {
+            "phased": True,
+            "phase": phase,
+            "updates": int(updates),
+            "schedule": [(n, e) for n, e in bounds],
+            "calibration_complete": bool(getattr(self, "_var_calibrated", False)),
+        }
+
+    def _var_budget_spent(self, updates: int) -> bool:
+        """True when ``updates`` has reached the variance phase's end boundary."""
+        for name, end in getattr(self, "_phase_bounds", None) or []:
+            if name == "var":
+                return end is not None and updates >= end
+        return False
+
+    def _restamp_best(self, phase: str, updates: int) -> None:
+        """Re-write a completed phase's best file with its final phase_state.
+
+        Phase-best files are written *during* the phase, when the completion
+        record still says ``calibration_complete=False``. Once the variance
+        phase has completed and its best weights are restored (which is when
+        this runs — the accelerator holds exactly those weights), the file must
+        be re-stamped or the default loader keeps rejecting the checkpoint the
+        run just certified.
+        """
+        if not self._phased or self._best_state is None or not self.dctx.is_main:
+            return
+        ckpt = build_checkpoint(self.accelerator)
+        ckpt["phase_state"] = self._phase_state_dict(phase, updates)
+        torch.save(ckpt, self.config.checkpoint_dir / f"stage_b_best_{phase}.pt")
+
+    def _save_best(self, phase: str) -> None:
+        # Every rank keeps its own in-memory copy (weights are identical across
+        # ranks by construction), so the phase switch can restore without a
+        # filesystem round-trip that only the main rank could serve.
+        self._best_state = {k: v.detach().clone() for k, v in self.accelerator.state_dict().items()}
+        if self.dctx.is_main:
+            name = f"stage_b_best_{phase}.pt" if self._phased else "stage_b_best.pt"
+            ckpt = build_checkpoint(self.accelerator)
+            if self._phased:
+                # A phase-best file is a mid-run artefact: record how far the run
+                # had gotten so a mean-only best cannot masquerade as a calibrated
+                # model downstream. The variance phase's file is re-stamped with
+                # the completion mark when the phase actually finishes
+                # (_restamp_best).
+                ckpt["phase_state"] = self._phase_state_dict(
+                    phase, getattr(self, "_updates", 0))
+            torch.save(ckpt, self.config.checkpoint_dir / name)
+            _log.info("  new best (%.4f) → %s", self._best_metric, name)
+
+    def _restore_best(self) -> None:
+        if self._best_state is None:
+            return
+        self.accelerator.load_state_dict(self._best_state)
+        _log.info("restored best weights of the completed phase (%.4f)", self._best_metric)
+
+    def _enter_phase(self, phase: str) -> None:
+        """Switch trainable set, module mode and optimizer for the new phase.
+
+        Mode is set here, uniformly — variance phase in eval (the frozen mean
+        path must not stay stochastic under a non-default dropout), everything
+        else in train — because phase boundaries cross mid-epoch, where the
+        epoch-start mode switch cannot see them.
+
+        Rebuilding (rather than reusing) the optimizer is what actually stops
+        frozen parameters from moving: with stale AdamW momentum and weight
+        decay, a zero-filled gradient still changes the weights every step.
+        Gradient sync and clipping likewise walk the active set only.
+        """
+        opt = self.train_cfg.optim
+        self._set_var_head_only(phase == "var")
+        self.active_params = [p for p in self.trainable_params if p.requires_grad]
+        lr = opt.lr if phase != "joint" else opt.lr * self.config.predictor_joint_lr_scale
+        self.optimizer = optim.AdamW(self.active_params, lr=lr, betas=opt.betas,
+                                     weight_decay=opt.weight_decay)
+        if phase == "var":
+            self.accelerator.eval()
+        else:
+            self.accelerator.train()
+        _log.info("phase %s: %d trainable parameter(s), lr=%.8g",
+                  phase, sum(p.numel() for p in self.active_params), lr)
+
+    def _set_var_head_only(self, var_only: bool) -> None:
+        """Freeze every plugin parameter except ``predictor.var_head`` (or restore).
+
+        Freezing parameters (rather than masking gradients) keeps phase 2 honest:
+        σ = var_head(h) still moves with the hidden layers, and only an explicit
+        requires_grad wall stops that drift from being learned behaviour.
+        """
+        var_params = {id(p) for p in self.accelerator.lcocf.predictor.var_head.parameters()}
+        for p in self.trainable_params:
+            p.requires_grad_(not var_only or id(p) in var_params)
 
     def _reduce(self, value: float) -> float:
         """Mean of a per-rank scalar across the job (identity when single-process)."""
@@ -335,6 +681,15 @@ class JointTrainingStage:
         action_errors = [0.0] * 4
         action_counts = [0] * 4
         action_cost = torch.tensor(acc.allocator.action_cost, device=self.device)
+        # The σ parameterisation's effective floor: exp-parameterised heads clamp the
+        # log-variance at -10 ⇒ σ_min = exp(-5); softplus heads bottom out near 1e-4.
+        # ``sigma_floor_frac`` reports how much of the split sits on that floor — the
+        # signature of the variance head pinning itself against the clamp.
+        pcfg = acc.config.lcocf.predictor
+        sigma_floor = math.exp(-5.0) * 1.05 if pcfg.predict_log_variance else 1.05e-4
+        nll_sum = floor_hits = 0.0
+        n_nf = 0
+        nll_nf = cover_nf = floor_nf = 0.0
         for batch in loader:
             tube_features = batch["tube_features"].to(self.device).float()
             strength_features = batch["strength_features"].to(self.device).float()
@@ -364,6 +719,20 @@ class JointTrainingStage:
             abs_err += float((mu_a - damage_true).abs().sum())
             zero_err += float(damage_true.abs().sum())
             sigma_sum += float(sigma_a.sum())
+            nll_sum += float(gaussian_nll(damage_true, mu_a, sigma_a)) * bs
+            floor_hits += float((sigma_a <= sigma_floor).sum())
+            nonfull = actions != 0
+            nf = int(nonfull.sum())
+            if nf:
+                # Non-FULL-only calibration view: FULL's label and pinned prediction
+                # are both zero, so its NLL/coverage would dilute the numbers the
+                # variance phase is actually scored on.
+                nll_nf += float(gaussian_nll(
+                    damage_true[nonfull], mu_a[nonfull], sigma_a[nonfull])) * nf
+                cover_nf += float(((mu_a[nonfull] - damage_true[nonfull]).abs()
+                                   <= 2 * sigma_a[nonfull]).sum())
+                floor_nf += float((sigma_a[nonfull] <= sigma_floor).sum())
+                n_nf += nf
             for action in range(4):
                 selected = actions == action
                 action_counts[action] += int(selected.sum())
@@ -378,14 +747,20 @@ class JointTrainingStage:
         n = max(1, n)
         # Reduce sums and counts separately so uneven rank populations remain weighted.
         global_n = self._reduce(n)
+        global_nf = self._reduce(max(1, n_nf))
         global_pairs = self._reduce(pair_count)
         world_size = getattr(getattr(self, "dctx", None), "world_size", 1)
         metrics = {
-            "mae": self._reduce(abs_err / n),
-            "cert_violation": self._reduce(cert_viol / n),
-            "budget_hit": self._reduce(budget_hit / n),
+            "mae": self._reduce(abs_err) / global_n,
+            "cert_violation": self._reduce(cert_viol) / global_n,
+            "budget_hit": self._reduce(budget_hit) / global_n,
             "zero_baseline_mae": self._reduce(zero_err) / global_n,
             "sigma_mean": self._reduce(sigma_sum) / global_n,
+            "nll": self._reduce(nll_sum) / global_n,
+            "sigma_floor_frac": self._reduce(floor_hits) / global_n,
+            "nll_nonfull": self._reduce(nll_nf) / global_nf,
+            "coverage_nonfull": self._reduce(cover_nf) / global_nf,
+            "sigma_floor_frac_nonfull": self._reduce(floor_nf) / global_nf,
             "smoothness": self._reduce(smooth) / global_pairs if global_pairs else float("nan"),
             "temporal_pairs": global_pairs * world_size,
         }

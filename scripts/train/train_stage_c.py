@@ -335,9 +335,10 @@ def main():
         log.info("Loading checkpoint from %s", args.checkpoint_load)
         ckpt = torch.load(args.checkpoint_load, map_location=args.device,
                           weights_only=False)
-        # Either layout: a bare Stage-B state_dict, or a Stage-C checkpoint whose
-        # LoRA adapters are re-attached here so a resumed run continues training them
-        # (FinettuneStage's injection below finds and re-arms the restored wrappers).
+        # Two-part build_checkpoint payload (bare state_dicts are rejected for
+        # lacking damage_weights). The checkpoint's LoRA adapters are re-attached
+        # here so a resumed run continues training them (FinettuneStage's injection
+        # below finds and re-arms the restored wrappers).
         load_checkpoint(accelerator, ckpt, training_config=config.training)
 
     stage_c_config = StageCConfig(

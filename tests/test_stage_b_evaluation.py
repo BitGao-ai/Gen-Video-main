@@ -9,6 +9,7 @@ import torch
 
 from scripts.diagnose.evaluate_stage_b import (
     predict, summarize, collect_inputs, shuffle_inputs, input_statistics, audit_fields,
+    canonical_split,
 )
 from cocf.common.config import Config
 from cocf.common.types import TokenGrid
@@ -19,6 +20,20 @@ from cocf.training.stage_a_data_gen import DataGenerationStage, StageAConfig
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_evaluation_split_alias_matches_store(self):
+        import argparse
+        from cocf.data.processed_layout import ProcessedLayout
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--split', type=canonical_split, choices=['val', 'test_hard'])
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = ProcessedLayout(Path(tmp))
+            layout.write_splits(['train_sample'], ['val_sample'], ['heldout_sample'])
+            for name, expected in [('val', 'val_sample'), ('test', 'heldout_sample'),
+                                   ('test_hard', 'heldout_sample')]:
+                split = parser.parse_args(['--split', name]).split
+                self.assertEqual(layout.read_split(split), [expected])
+                self.assertNotEqual(split, 'test')
+
     def test_training_only_baselines(self):
         rows = [dict(action=1, target=1., mu=.5, sigma=.2, certificate=1.1)]
         result = summarize(rows, {1: [0., 0.]})['all']

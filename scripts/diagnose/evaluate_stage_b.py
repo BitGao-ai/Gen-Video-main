@@ -170,6 +170,10 @@ def predict(acc, loader, device, *, inputs=None, zero_state=False):
     return rows
 
 
+def canonical_split(name):
+    return 'test_hard' if name == 'test' else name
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--processed-root', type=Path, required=True)
@@ -177,7 +181,8 @@ def main():
     parser.add_argument('--compare-checkpoint', type=Path, help='Optional final checkpoint to compare')
     parser.add_argument('--diagnostics', action='store_true', help='Also evaluate train and input sensitivity')
     parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--split', choices=['val', 'test'], default='val')
+    parser.add_argument('--split', type=canonical_split, choices=['val', 'test_hard'],
+                        default='val', help='Evaluation split; test is an alias for test_hard')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
     parser.add_argument('--batch-size', type=int, default=16)
@@ -225,7 +230,7 @@ def main():
     text_dim, visual_dim = _infer_dims_from_store(layout, log)
     acc = Accelerator.from_config(config, text_dim=text_dim, visual_dim=visual_dim)
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    load_checkpoint(acc, checkpoint)
+    load_checkpoint(acc, checkpoint, allow_incomplete=True)
     acc.to(args.device).eval()
     rows = predict(acc, loader(eval_ids), torch.device(args.device))
     if len(rows) != len(eval_ids):
@@ -249,7 +254,8 @@ def main():
         )
         for label, path in [('best', args.checkpoint)] + ([('compare', args.compare_checkpoint)] if args.compare_checkpoint else []):
             log.info('Diagnostics checkpoint=%s path=%s', label, path)
-            load_checkpoint(acc, torch.load(path, map_location='cpu', weights_only=False))
+            load_checkpoint(acc, torch.load(path, map_location='cpu', weights_only=False),
+                            allow_incomplete=True)
             acc.eval()
             splits = {}
             for split, ids in [('train', train_ids), (args.split, eval_ids)]:

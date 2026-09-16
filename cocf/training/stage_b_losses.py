@@ -93,6 +93,50 @@ def gaussian_nll(target: Tensor, mu: Tensor, sigma: Tensor) -> Tensor:
     return (0.5 * ((target - mu).pow(2) / var + torch.log(2 * math.pi * var))).mean()
 
 
+def predictor_regression_loss(
+    target: Tensor,
+    mu: Tensor,
+    actions: Optional[Tensor] = None,
+    *,
+    objective: str = "mse",
+    scale: float = 100.0,
+) -> Tensor:
+    """Phase-1 mean pretraining loss: scaled MSE/Huber on ``mu`` — no variance term.
+
+    NLL couples ``mu`` and ``sigma`` through ``1/σ²``: while ``sigma`` is far from the
+    residual scale the mean's gradient is either suppressed (large σ) or exploded
+    (small σ), and the fit stalls at a per-action constant. Regressing ``mu`` alone
+    first gives the hidden layers a stable, well-scaled signal; ``sigma`` is
+    calibrated afterwards in the variance phase. FULL rows (action 0, label pinned
+    at zero by construction) are excluded when ``actions`` is given, matching the
+    fit-probe protocol this phased scheme is derived from. ``scale`` inflates the
+    tiny (~1e-2) targets so the loss lives in a numerically comfortable range.
+    """
+    if actions is not None:
+        keep = actions != 0
+        if not bool(keep.any()):
+            return mu.new_zeros(())
+        target, mu = target[keep], mu[keep]
+    if objective == "mse":
+        return torch.nn.functional.mse_loss(mu * scale, target * scale)
+    if objective == "huber":
+        return torch.nn.functional.smooth_l1_loss(mu * scale, target * scale)
+    raise ValueError(f"unknown mean-phase objective: {objective!r}")
+
+
+def _nonfull_nll(target: Tensor, mu: Tensor, sigma: Tensor, actions: Tensor) -> Tensor:
+    """Gaussian NLL over non-FULL rows only (differentiable zero when none).
+
+    FULL's label and its (structurally pinned) prediction are both zero, so its
+    NLL term 0.5·log(2πσ²) decreases monotonically with σ — including it lets the
+    variance head "improve" by shrinking σ where there is nothing to calibrate.
+    """
+    keep = actions != 0
+    if not bool(keep.any()):
+        return sigma.sum() * 0.0
+    return gaussian_nll(target[keep], mu[keep], sigma[keep])
+
+
 def budget_penalty(probs: Tensor, action_cost: Tensor, budget: Tensor) -> Tensor:
     """Mean over-budget penalty ``relu(E[cost] − B_t)`` (§4.1 预算约束)."""
     expected_cost = (probs * action_cost).sum(-1)        # [B]
@@ -246,6 +290,10 @@ def compute_joint_loss(
     batch: Dict[str, object],
     *,
     training_cfg: Optional[TrainingConfig] = None,
+    phase: str = "joint",
+    mean_objective: str = "mse",
+    target_scale: float = 100.0,
+    isolate_aux: bool = False,
 ) -> Tuple[Tensor, Dict[str, float]]:
     """Assemble ``L_total`` and its (unweighted) components for one batch (§4.1).
 
@@ -260,6 +308,23 @@ def compute_joint_loss(
     training_cfg
         Loss weights (λ_sta/λ_cert/λ_cmsc/λ_cost); defaults to
         ``accelerator.config.training``.
+    phase
+        ``"joint"`` (default) is the classic combined objective. ``"mean"``
+        (phased mode, phase 1) replaces L_cocf with a scaled regression on ``mu``
+        and feeds the certificate **detached** ``mu``/``sigma`` — during the
+        controlled phases the certificate loss must not push the mean or the
+        variance. ``"var"`` (phase 2) returns the plain Gaussian NLL over
+        **non-FULL rows only** — FULL's target and (pinned) prediction are both
+        zero, so its NLL would keep rewarding a shrinking σ and masquerade as
+        calibration. The caller freezes everything except ``predictor.var_head``,
+        so the other terms would contribute no gradient anyway.
+    isolate_aux
+        Phased-mode auxiliary-gradient isolation. When True, the certificate
+        receives detached ``mu``/``sigma`` in **every** phase (not just the mean
+        phase — the isolation must not silently lapse at the joint phase), and
+        the mean phase drops the STA/budget terms from the total, making it a
+        pure regression control. Classic single-phase training passes False and
+        is unchanged.
 
     Returns
     -------
@@ -293,8 +358,25 @@ def compute_joint_loss(
     sigma_a = pred.sigma.gather(-1, idx).squeeze(-1)                 # [B]
     damage_true = damage_scalar_batch(damage_label)                 # [B]
 
-    # --- L_cocf: Gaussian NLL of the executed action's damage ---------------- #
-    l_cocf = gaussian_nll(damage_true, mu_a, sigma_a)
+    # --- L_cocf: phase-dependent predictor loss ------------------------------- #
+    if phase == "var":
+        # Variance-calibration phase: non-FULL NLL only. The caller has frozen
+        # every parameter except predictor.var_head, so the remaining joint
+        # terms have no trainable path and are skipped outright.
+        l_cocf = _nonfull_nll(damage_true, mu_a, sigma_a, actions)
+        return l_cocf, {"cocf": float(l_cocf.detach()), "total": float(l_cocf.detach())}
+    if phase == "mean":
+        l_cocf = predictor_regression_loss(
+            damage_true, mu_a, actions, objective=mean_objective, scale=target_scale
+        )
+    elif isolate_aux:
+        # The experiment's joint fine-tune keeps FULL out of the NLL too —
+        # re-admitting it would re-create the "σ[FULL] keeps shrinking for free"
+        # gradient the variance phase was insulated from. Classic training
+        # (isolate_aux=False) keeps the original all-sample NLL.
+        l_cocf = _nonfull_nll(damage_true, mu_a, sigma_a, actions)
+    else:
+        l_cocf = gaussian_nll(damage_true, mu_a, sigma_a)
 
     # --- L_tube: STA temporal action-prob smoothness ------------------------- #
     probs = action_probs(pred.mu)                                   # [B, A]
@@ -309,8 +391,17 @@ def compute_joint_loss(
     # text-alignment violation from the stored CMSC embeds.
     residual = batch_float(batch, "skip_residual", mu_a)
     local_cmsc = _local_cmsc_violation(accelerator, batch, mu_a)
+    if phase == "mean" or isolate_aux:
+        # The certificate's own coefficients still calibrate, but against a
+        # read-only (mu, sigma): during the controlled phases nothing outside the
+        # regression term may push the mean or the variance. ``isolate_aux``
+        # extends that wall into the joint phase so the isolation cannot lapse
+        # silently at the phase switch.
+        mu_cert, sigma_cert = mu_a.detach(), sigma_a.detach()
+    else:
+        mu_cert, sigma_cert = mu_a, sigma_a
     e_cert = accelerator.raec.certificate.value(
-        mu_a, sigma_a,
+        mu_cert, sigma_cert,
         residual=residual,
         boundary=tube_features[:, _BOUNDARY_IDX],
         anchor_age=tube_features[:, _AGE_IDX],
@@ -329,12 +420,16 @@ def compute_joint_loss(
     )
     l_budget = budget_penalty(probs, action_cost, budget)
 
+    # Mean phase under auxiliary isolation: a pure regression control — the STA
+    # and budget terms stay out of the total so nothing but the regression shapes
+    # mu. (Their raw values remain in the components for logging.)
+    skip_aux = phase == "mean" and isolate_aux
     total = (
         l_cocf
-        + cfg.lambda_sta * l_tube
+        + (0.0 if skip_aux else cfg.lambda_sta * l_tube)
         + cfg.lambda_cert * l_cert
         + cfg.lambda_cmsc * l_cmsc
-        + cfg.lambda_cost * l_budget
+        + (0.0 if skip_aux else cfg.lambda_cost * l_budget)
     )
     components = {
         "cocf": float(l_cocf.detach()),

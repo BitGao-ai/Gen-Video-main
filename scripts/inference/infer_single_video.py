@@ -129,8 +129,9 @@ def main():
     if args.checkpoint and args.checkpoint.exists():
         log.info("Loading checkpoint from %s", args.checkpoint)
         ckpt = torch.load(args.checkpoint, map_location=str(device), weights_only=False)
-        # Either layout: Stage B's bare state_dict or Stage C's two-part mapping;
-        # any LoRA the checkpoint carries is re-injected into the frozen backbone.
+        # Two-part build_checkpoint payload only: bare state_dicts and pre-policy
+        # checkpoints carry no damage_weights and are rejected by load_checkpoint.
+        # Any LoRA the checkpoint carries is re-injected into the frozen backbone.
         n = load_checkpoint(accelerator, ckpt, training_config=config.training)
         if n:
             log.info("Re-attached %d Stage-C LoRA adapter(s)", n)

@@ -10,12 +10,22 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0}}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-./LCOCF_OpenVid1M_Processed}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
-NUM_EPOCHS="${NUM_EPOCHS:-2}"
+# Budget cap, not a promise: classic mode still early-stops on validation
+# stagnation, and phased mode stops when its step budgets are spent.
+NUM_EPOCHS="${NUM_EPOCHS:-50}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 SEED="${SEED:-1234}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-}"
 LOG_DIR="${LOG_DIR:-logs}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints}"
 DRY_RUN="${DRY_RUN:-0}"
+# Optional phased predictor training (mean → variance → joint). All unset = classic.
+PHASE_MEAN_STEPS="${PHASE_MEAN_STEPS:-}"
+PHASE_VAR_STEPS="${PHASE_VAR_STEPS:-}"
+PHASE_JOINT_LR_SCALE="${PHASE_JOINT_LR_SCALE:-}"
+PHASE_MEAN_OBJECTIVE="${PHASE_MEAN_OBJECTIVE:-}"
+PHASE_TARGET_SCALE="${PHASE_TARGET_SCALE:-}"
+PHASE_AUX_ISOLATION="${PHASE_AUX_ISOLATION:-}"
 
 die() { echo "[error] $*" >&2; exit 1; }
 command -v "$PYTHON_BIN" >/dev/null || die "Python not found: $PYTHON_BIN"
@@ -30,6 +40,21 @@ for value in "$NUM_WORKERS" "$SEED"; do
   [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || die "Expected nonnegative integer: $value"
 done
 [[ "$DRY_RUN" =~ ^[01]$ ]] || die 'DRY_RUN must be 0 or 1'
+if [[ -n $EARLY_STOP_PATIENCE ]]; then
+  [[ "$EARLY_STOP_PATIENCE" =~ ^[1-9][0-9]*$ ]] || die 'EARLY_STOP_PATIENCE must be a positive integer'
+fi
+for value in "$PHASE_MEAN_STEPS" "$PHASE_VAR_STEPS"; do
+  if [[ -n $value ]]; then
+    [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || die "Expected nonnegative integer: $value"
+  fi
+done
+if [[ -n $PHASE_MEAN_OBJECTIVE ]]; then
+  [[ "$PHASE_MEAN_OBJECTIVE" == mse || "$PHASE_MEAN_OBJECTIVE" == huber ]] \
+    || die 'PHASE_MEAN_OBJECTIVE must be mse or huber'
+fi
+if [[ -n $PHASE_AUX_ISOLATION ]]; then
+  [[ "$PHASE_AUX_ISOLATION" =~ ^[01]$ ]] || die 'PHASE_AUX_ISOLATION must be 0 or 1'
+fi
 
 COMMON=(
   --processed-root "$PROCESSED_ROOT"
@@ -37,6 +62,13 @@ COMMON=(
   --num_workers "$NUM_WORKERS" --device cuda --seed "$SEED"
 )
 if [[ -n ${LR:-} ]]; then COMMON+=(--lr "$LR"); fi
+if [[ -n $EARLY_STOP_PATIENCE ]]; then COMMON+=(--early_stop_patience "$EARLY_STOP_PATIENCE"); fi
+if [[ -n $PHASE_MEAN_STEPS ]]; then COMMON+=(--predictor_mean_steps "$PHASE_MEAN_STEPS"); fi
+if [[ -n $PHASE_VAR_STEPS ]]; then COMMON+=(--predictor_var_steps "$PHASE_VAR_STEPS"); fi
+if [[ -n $PHASE_JOINT_LR_SCALE ]]; then COMMON+=(--predictor_joint_lr_scale "$PHASE_JOINT_LR_SCALE"); fi
+if [[ -n $PHASE_MEAN_OBJECTIVE ]]; then COMMON+=(--predictor_mean_objective "$PHASE_MEAN_OBJECTIVE"); fi
+if [[ -n $PHASE_TARGET_SCALE ]]; then COMMON+=(--predictor_target_scale "$PHASE_TARGET_SCALE"); fi
+if [[ -n $PHASE_AUX_ISOLATION ]]; then COMMON+=(--predictor_aux_isolation "$PHASE_AUX_ISOLATION"); fi
 if [[ "$DRY_RUN" == 1 ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q ' "$GPU_IDS"
   printf '%q ' "$PYTHON_BIN" -u scripts/train/train_stage_b.py "${COMMON[@]}" \

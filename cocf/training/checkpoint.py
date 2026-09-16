@@ -8,15 +8,20 @@ at the end of every ``--use_lora`` run.
 
 This module owns the resulting two-part layout and the tolerant reader for it::
 
-    {"accelerator": {...plugin tensors...},
-     "lora":        {"<root>.<path>.lora_A": tensor, ...},   # optional
-     "lora_config": {"rank": 8, "alpha": 16.0, "last_n_blocks": 3}}
+    {"accelerator":    {...plugin tensors...},
+     "damage_weights": {...scoring policy at train time...},
+     "lora":           {"<root>.<path>.lora_A": tensor, ...},   # optional
+     "lora_config":    {"rank": 8, "alpha": 16.0, "last_n_blocks": 3}}
 
 Both are kept in *one* place because the failure mode is silent: a writer that forgets
 the LoRA half, or a reader that assumes the old bare-``state_dict`` layout, produces a
-checkpoint that loads without error and simply lacks the fine-tune. :func:`load_checkpoint`
-therefore accepts **either** layout, so Stage-B checkpoints (bare state dicts) and
-Stage-C checkpoints stay interchangeable at every entry point.
+checkpoint that loads without error and simply lacks the fine-tune.
+
+Every checkpoint must also record the damage scoring policy it was trained against:
+:func:`load_checkpoint` rejects anything whose ``damage_weights`` differ from the
+current :data:`cocf.lcocf.damage.DEFAULT_DAMAGE_WEIGHTS`. That excludes the old
+bare-``state_dict`` layout entirely — it carries no scoring metadata, so legacy
+Stage-B state dicts fail fast here instead of silently scoring on the wrong scale.
 """
 
 from __future__ import annotations
@@ -134,14 +139,16 @@ def load_checkpoint(
     attach: bool = True,
     strict_lora: bool = True,
     allow_shape_mismatch: bool = False,
+    allow_incomplete: bool = False,
 ) -> int:
-    """Restore plugin weights from **either** checkpoint layout; return LoRA count.
+    """Restore plugin weights from a :func:`build_checkpoint` payload; return LoRA count.
 
     Parameters
     ----------
     ckpt
-        An already-``torch.load``ed object: the two-part mapping above, or a bare
-        ``state_dict`` as Stage B writes.
+        An already-``torch.load``ed object produced by :func:`build_checkpoint`.
+        Bare ``state_dict`` payloads and legacy checkpoints carry no
+        ``damage_weights`` and are rejected before anything is loaded.
     training_config
         ``Config.training``, used only for LoRA geometry defaults when a checkpoint
         predates ``lora_config``.
@@ -152,13 +159,38 @@ def load_checkpoint(
         Drop (rather than crash on) checkpoint tensors whose shape disagrees with the
         model's — see :func:`_filter_shape_mismatch`. Set False to demand an exact
         match.
+    allow_incomplete
+        Load a checkpoint whose ``phase_state`` marks it as the product of an
+        unfinished phased Stage-B run (variance calibration never completed).
+        Default False rejects such files: a mean-only model must not silently
+        enter Stage C or inference. Diagnostics pass True explicitly.
     """
     from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
     if ckpt.get("damage_weights") != DEFAULT_DAMAGE_WEIGHTS:
-        raise ValueError("Checkpoint damage scoring policy is missing or differs from current weights. "
-                         "Retrain Stage B with OCR disabled; do not reuse the old smoke checkpoint.")
-    state = ckpt[ACCELERATOR_KEY] if is_two_part(ckpt) else ckpt
-    metadata = ckpt.get("model_metadata", {}) if is_two_part(ckpt) else {}
+        raise ValueError("Checkpoint damage scoring policy is missing (legacy or bare state_dict "
+                         "layout) or differs from the current weights. Retrain Stage B under the "
+                         "current scoring policy instead of reusing this checkpoint.")
+    phase_state = ckpt.get("phase_state") if isinstance(ckpt, Mapping) else None
+    if (
+        isinstance(phase_state, Mapping)
+        and phase_state.get("phased")
+        and not phase_state.get("calibration_complete", False)
+    ):
+        if not allow_incomplete:
+            raise ValueError(
+                "Checkpoint is from an incomplete phased Stage-B run "
+                f"(phase={phase_state.get('phase')!r}, updates={phase_state.get('updates')}): "
+                "variance calibration did not finish, so this is not a deployable model. "
+                "Pass allow_incomplete=True to load it for diagnostics anyway."
+            )
+        _log.warning(
+            "loading an incomplete phased Stage-B checkpoint for diagnostics "
+            "(phase=%r, updates=%s): variance calibration did not finish — do not "
+            "treat its metrics as a deployable model's",
+            phase_state.get("phase"), phase_state.get("updates"),
+        )
+    state = ckpt[ACCELERATOR_KEY]
+    metadata = ckpt.get("model_metadata", {})
     expected = {"backbone": accelerator.config.backbone.name,
                 "text_dim": accelerator.text_dim, "visual_dim": accelerator.visual_dim,
                 "token_dim": accelerator.token_dim}
@@ -166,7 +198,7 @@ def load_checkpoint(
         for key, value in metadata.items():
             if key in expected and value is not None and value != expected[key]:
                 raise ValueError(f"Checkpoint {key}={value!r}, current model={expected[key]!r}")
-    if not is_two_part(ckpt) or ckpt.get("risk_definition") != "neutral_centered_v1":
+    if ckpt.get("risk_definition") != "neutral_centered_v1":
         _log.warning("Legacy checkpoint: certificate calibration must be validated or retrained "
                      "for neutral-centered CMSC risk inputs")
     if allow_shape_mismatch:
