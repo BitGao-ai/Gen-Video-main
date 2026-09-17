@@ -26,10 +26,15 @@ Stage A（反事实教师数据生成）→ Stage B（插件联合训练）→ S
 `ModelMetricExtractor` 的 `share_from` 只复用 DINOv2/CLIP（`metrics.py:325`），RAFT 是重新加载的；
 **Stage A 和 Stage C 都同时构建这两条**，所以两个权重必须都备齐。
 
-而 `--raft-weights` 只能接一个文件路径，同一个值会被同时喂给 large 和 small
-（`cocf/common/vram.py:320` 与 `:336`）——给了 `raft_large.pth`，small 那边就会
-`load_state_dict` 报 size mismatch，`--real-models` 下直接抛 `RaftUnavailable`。
-因此**离线机器的正确做法是预置 torch hub 缓存，然后不传 `--raft-weights`**：
+`--raft-weights` 有两种给法（`cocf/common/raft.py:_resolve_weights`）：
+
+- **单个文件**：同一个值会被同时喂给 large 和 small——给了 `raft_large.pth`，small
+  那边就会 `load_state_dict` 报 size mismatch，`--real-models` 下直接抛 `RaftUnavailable`。
+  只在**单 variant** 场景可用（例如只加 `--real-perception` 而不加 `--real-metrics`）。
+- **目录（推荐）**：每个消费方按文件名里的 variant 子串（`large`/`small`）各挑各的，
+  所以目录里放两个文件名分别带 `large` 和 `small` 的 checkpoint 即可全流程使用。
+
+若本地没有现成权重文件，备用做法是预置 torch hub 缓存（然后不传 `--raft-weights`）：
 torchvision 仅在缓存文件不存在时才联网（`torch/hub.py` 的 `if not os.path.exists(cached_file)`），
 文件名必须与 URL 的 basename 完全一致（含哈希后缀），命中缓存时不校验哈希、不发网络请求。
 
@@ -57,8 +62,10 @@ PY
 
 - **不要**用 princeton-vl 官方 RAFT 仓库的 `raft-things.pth` / `raft-sintel.pth`：那是
   DataParallel 存的（`module.` 前缀 + 不同模块命名），塞不进 torchvision 的 `raft_large`。
-- `--raft-weights` 只在**单 variant** 场景下可用（例如只加 `--real-perception` 而不加
-  `--real-metrics`），此时传 `raft_large.pth` 才是对的。全流程请走缓存预置。
+- `--raft-weights` 指**目录**时，两个 variant 各取文件名带 `large`/`small` 的那个
+  checkpoint，全流程可用；指**单文件**时只在单 variant 场景可用（例如只加
+  `--real-perception` 而不加 `--real-metrics`），此时传 `raft_large.pth` 才是对的。
+  没有本地权重文件时才需要走上面的缓存预置。
 - 缓存目录可用 `TORCH_HOME` 环境变量改写；8 个分片进程共读同一份缓存没有问题。
 
 ---
@@ -68,8 +75,8 @@ PY
 真实 backbone（Wan2.2-A14B）+ 真实感知（SAM/DINOv2/CLIP/RAFT）+ 真实损伤指标。
 只有 `--real-models` 生成的数据才可用于训练插件。
 
-> 跑之前先做完上一节的 RAFT 缓存预置，否则 `build_perception_and_metrics` 会在加载感知模型
-> 时直接抛 `RaftUnavailable`。下面所有命令都**不传** `--raft-weights`。
+> 跑之前先做完上一节的 RAFT 准备（本地目录传 `--raft-weights <dir>`，或预置 torch hub
+> 缓存后不传），否则 `build_perception_and_metrics` 会在加载感知模型时直接抛 `RaftUnavailable`。
 
 ### 单卡运行（a14b-t2v，40 GB 显卡，49×384×640）
 

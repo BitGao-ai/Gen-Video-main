@@ -66,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Pin every tube to FULL *through the engine* (correctness "
                         "control: output must match --full-compute; any difference "
                         "incriminates the transition machinery, not the action plan)")
+    p.add_argument("--lowfreq-to-full", action="store_true",
+                   help="Diagnostic: replace LOWFREQ allocations with FULL")
+    p.add_argument("--disable-velocity-cache", action="store_true",
+                   help="Diagnostic: use fresh velocities, retaining action reconstruction")
+    p.add_argument("--lowfreq-fill", action="store_true",
+                   help="Ablation: overwrite LOWFREQ holes with the lattice "
+                        "reconstruction instead of the default ride-through "
+                        "(known to corrupt Wan2.2 trajectories; kept for comparison)")
+    p.add_argument("--lowfreq-refresh-every", type=int, default=None,
+                   help="Override engine.lowfreq_refresh_every (0 disables the cadence)")
     p.add_argument("--fps", type=int, default=16, help="Frame rate of the written file")
     # Backbone selection, §9.1 residency and render geometry come from the shared
     # helpers, so a render reproduces what Stage A/C were configured with rather than
@@ -118,6 +128,15 @@ def main():
         config.engine.num_inference_steps = args.steps
     if args.force_all_full:
         config.engine.force_all_full = True
+    config.engine.diagnostic_lowfreq_full = args.lowfreq_to_full
+    config.engine.diagnostic_no_cache = args.disable_velocity_cache
+    config.engine.lowfreq_fill = args.lowfreq_fill
+    if args.lowfreq_refresh_every is not None:
+        config.engine.lowfreq_refresh_every = args.lowfreq_refresh_every
+    log.info("Inference controls: all_full=%s lowfreq_to_full=%s no_velocity_cache=%s "
+             "lowfreq_fill=%s lowfreq_refresh_every=%d",
+             args.force_all_full, args.lowfreq_to_full, args.disable_velocity_cache,
+             config.engine.lowfreq_fill, config.engine.lowfreq_refresh_every)
 
     # -- accelerator & engine --------------------------------------------- #
     if args.backbone != "mock":

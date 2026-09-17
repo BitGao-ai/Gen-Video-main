@@ -12,6 +12,28 @@ from cocf.engine.state import StepTrace, EngineState
 
 
 class GradientWindowTest(unittest.TestCase):
+    def test_no_cache_control_discards_cache_before_execution(self):
+        from cocf.backbones.base import BackboneCache
+        config = Config()
+        config.backbone.device = "cpu"
+        config.engine.diagnostic_no_cache = True
+        acc = Accelerator.from_config(config)
+        engine = InferenceEngine(acc, config.engine, config.trigger)
+        grid = TokenGrid(t=1, h=2, w=2)
+        state = EngineState(
+            z=torch.ones(1, 4, acc.token_dim, requires_grad=True), grid=grid,
+            cond=acc.backbone.encode_text(["test"]), subgraph=None,
+            anchor_store=acc.raec.new_anchor_store(),
+            tubes=[SemanticTube(0, tokens_by_frame={0: torch.arange(4)})],
+            cache=BackboneCache(model_output=torch.full((1, 4, acc.token_dim), 999.0)),
+            grad_window=1, retained_computed=1,
+        )
+        from unittest.mock import patch
+        with patch.object(acc.transition, "step", wraps=acc.transition.step) as spy:
+            engine._execute_transition(state, 2, AllocationDecision(0, {0: Action.ANCHOR}, 0, 0), acc.backbone)
+        self.assertIsNone(spy.call_args.kwargs["cache"])
+        self.assertEqual(state.graph_cuts, 1)
+
     def run_trajectory(self, window, computed_steps):
         torch.manual_seed(7)
         config = Config()

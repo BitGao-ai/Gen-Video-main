@@ -895,12 +895,14 @@ class COCFDataGenerator:
         if action == Action.INTERP:
             # temporal interpolation via the shared inference realisation (it returns
             # its own copy, so do not pre-clone: these rollouts run ~90× per clip and
-            # a full-latent clone each is pure waste). ``freeze_to=z_prev`` mirrors the
-            # executor's single-frame fallback — without it a one-frame tube's INTERP
-            # label would be identical to FULL (zero damage) while inference freezes it.
+            # a full-latent clone each is pure waste). ``freeze_to=z_prev`` keeps the
+            # single-frame fallback at freeze semantics on the label side, while
+            # inference lets such a tube ride the spliced-ε step — so a one-frame
+            # tube's INTERP μ is a conservative overestimate of the served damage.
             return transition.interp_temporal(z_full, tube, grid, freeze_to=z_prev)
         if action == Action.LOWFREQ:
-            # strided subsample + nearest upsample via the shared inference realisation
+            # strided lattice + nearest-anchor value fill via the shared inference
+            # realisation (coarsens the latent itself, not the step increment)
             return transition.coarsen_lowfreq(z_full, tube, grid)
         z_cf = z_full.clone()
         if action == Action.ANCHOR:

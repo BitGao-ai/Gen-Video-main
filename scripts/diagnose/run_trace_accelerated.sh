@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Single-video accelerated inference smoke test, not a full-compute benchmark.
-# Preview: DRY_RUN=1 bash scripts/inference/run_stage_b_probe.sh
+# Trajectory tracer for the accelerated path (per-step latent stats by action
+# group + mid-trajectory decodes + action map). Diagnostic, not a benchmark.
+# Preview: DRY_RUN=1 bash scripts/diagnose/run_trace_accelerated.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -16,13 +17,12 @@ CLIP_MODEL="${CLIP_MODEL:-$WEIGHTS_ROOT/Clip}"
 RAFT_WEIGHTS="${RAFT_WEIGHTS:-$WEIGHTS_ROOT/raft}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/stage_b.20260916_114011.LVJjMI/stage_b_final.pt}"
 PROMPT="${PROMPT:-A person walks slowly across a park, with trees in the background, steady camera.}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/stage_b_probe}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/trace_accelerated}"
 QUALITY="${QUALITY:-quality}"
 SEED="${SEED:-1234}"
-DRY_RUN="${DRY_RUN:-0}"
-MODE="${MODE:-accelerated}"
+DECODE_STEPS="${DECODE_STEPS:-1,2,3,5,10,15,20}"
 VAE_TILE="${VAE_TILE:-128}"
-LOWFREQ_REFRESH="${LOWFREQ_REFRESH:-}"
+DRY_RUN="${DRY_RUN:-0}"
 
 die() { echo "[error] $*" >&2; exit 1; }
 command -v "$PYTHON_BIN" >/dev/null || die "Python not found: $PYTHON_BIN"
@@ -31,15 +31,12 @@ if [[ ${CUDA_VISIBLE_DEVICES+x} ]]; then
   [[ ",$CUDA_VISIBLE_DEVICES," == *",$GPU_IDS,"* ]] || die 'GPU_IDS is outside CUDA_VISIBLE_DEVICES'
 fi
 [[ "$DRY_RUN" =~ ^[01]$ ]] || die 'DRY_RUN must be 0 or 1'
-[[ "$MODE" == accelerated || "$MODE" == full || "$MODE" == allfull || "$MODE" == lowfreq_full || "$MODE" == no_cache || "$MODE" == fill ]] || die 'MODE must be accelerated, full, allfull, lowfreq_full, no_cache or fill'
 [[ "$SEED" =~ ^(0|[1-9][0-9]*)$ ]] || die 'SEED must be a nonnegative integer'
 [[ "$QUALITY" == quality || "$QUALITY" == balanced || "$QUALITY" == fast ]] || die 'Invalid QUALITY'
-[[ "$VAE_TILE" =~ ^[0-9]+$ ]] || die 'VAE_TILE must be a nonnegative integer'
 
-# Keep geometry and flow shift consistent with the Stage A store used for training.
-# Shared CLI defaults retain CPU offload, idle-expert offload and VAE tiling.
+# Keep geometry and flow shift consistent with the probe script and the Stage A store.
 ARGS=(
-  scripts/inference/infer_single_video.py
+  scripts/diagnose/trace_accelerated.py
   --prompt "$PROMPT" --checkpoint "$CHECKPOINT"
   --backbone wan22 --wan-variant a14b-t2v --model-path "$MODEL_PATH"
   --backbone-dtype bfloat16 --perception-dtype bfloat16
@@ -47,16 +44,11 @@ ARGS=(
   --raft-weights "$RAFT_WEIGHTS" --flow-shift 5
   --steps 20 --num-frames 49 --height 384 --width 640 --vae-tile "$VAE_TILE"
   --quality "$QUALITY" --seed "$SEED" --device cuda
+  --decode-steps "$DECODE_STEPS"
 )
-if [[ "$MODE" == full ]]; then ARGS+=(--full-compute); fi
-if [[ "$MODE" == allfull ]]; then ARGS+=(--force-all-full); fi
-if [[ "$MODE" == lowfreq_full ]]; then ARGS+=(--lowfreq-to-full); fi
-if [[ "$MODE" == no_cache ]]; then ARGS+=(--disable-velocity-cache); fi
-if [[ "$MODE" == fill ]]; then ARGS+=(--lowfreq-fill); fi
-if [[ -n "$LOWFREQ_REFRESH" ]]; then ARGS+=(--lowfreq-refresh-every "$LOWFREQ_REFRESH"); fi
 if [[ "$DRY_RUN" == 1 ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q ' "$GPU_IDS"
-  printf '%q ' "$PYTHON_BIN" -u "${ARGS[@]}" --output "$OUTPUT_ROOT/<unique-run>/$MODE.mp4"
+  printf '%q ' "$PYTHON_BIN" -u "${ARGS[@]}" --output-dir "$OUTPUT_ROOT/<unique-run>"
   printf '\n[preview] No model loaded or files written.\n'
   exit 0
 fi
@@ -67,9 +59,9 @@ done
 [[ -e "$RAFT_WEIGHTS" ]] || die "RAFT weights missing: $RAFT_WEIGHTS"
 mkdir -p "$OUTPUT_ROOT"
 run_dir="$(mktemp -d "$OUTPUT_ROOT/run.$(date +%Y%m%d_%H%M%S).XXXXXX")"
-log_file="$run_dir/inference.log"
-ARGS+=(--output "$run_dir/$MODE.mp4")
-echo "[start] mode=$MODE GPU=$GPU_IDS quality=$QUALITY seed=$SEED"
+log_file="$run_dir/trace.log"
+ARGS+=(--output-dir "$run_dir")
+echo "[start] GPU=$GPU_IDS quality=$QUALITY seed=$SEED decode_steps=$DECODE_STEPS"
 echo "[checkpoint] $CHECKPOINT"
 echo "[output] $run_dir"
 printf '[monitor] tail -f %q\n' "$log_file"
@@ -79,10 +71,10 @@ printf '[monitor] tail -f %q\n' "$log_file"
   printf '\n'
 } > "$log_file"
 if CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PYTHON_BIN" -u "${ARGS[@]}" >> "$log_file" 2>&1; then
-  echo "[done] Output and log: $run_dir"
+  echo "[done] Trace + decodes + action map: $run_dir"
 else
   status=$?
-  echo "[error] Inference exited with status $status. Log: $log_file" >&2
+  echo "[error] Trace exited with status $status. Log: $log_file" >&2
   tail -n 40 "$log_file" >&2 || true
   exit "$status"
 fi

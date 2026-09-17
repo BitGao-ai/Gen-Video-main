@@ -541,7 +541,32 @@ class InferenceEngine(nn.Module):
             action_risk=action_risk,
             step=step_idx,
         )
+        if self.engine_cfg.diagnostic_lowfreq_full:
+            changed = [tid for tid, action in decision.actions.items() if action == Action.LOWFREQ]
+            for tid in changed:
+                decision.actions[tid] = Action.FULL
+            _log.info("diagnostic: LOWFREQ -> FULL tubes=%s; allocator cost is pre-override", changed)
+        # Periodic LOWFREQ refresh: ride-through holes never see their own fresh
+        # velocity, so high-frequency residue accumulates between refreshes. Every
+        # ``lowfreq_refresh_every`` steps promote LOWFREQ tubes to FULL for one step,
+        # which both serves fresh values and re-grounds the cache they ride on.
+        refresh_every = self.engine_cfg.lowfreq_refresh_every
+        if refresh_every > 0 and (step_idx + 1) % refresh_every == 0:
+            refreshed = [tid for tid, action in decision.actions.items()
+                         if action == Action.LOWFREQ]
+            for tid in refreshed:
+                decision.actions[tid] = Action.FULL
+            if refreshed:
+                _log.info("step %d: LOWFREQ refresh — tubes %s computed FULL this step",
+                          step_idx + 1, refreshed)
         optimal_actions = decision.actions  # {tube_id: Action}
+        coverage = {}
+        for action in Action:
+            indices = [tube.all_token_indices().reshape(-1) for tube in state.tubes
+                       if decision.action_for(tube.tube_id) == action]
+            coverage[action.name] = int(torch.unique(torch.cat(indices)).numel()) if indices else 0
+        _log.info("step %d action token coverage (unique within action; overlaps across actions): %s total=%d",
+                  step_idx + 1, coverage, state.grid.num_tokens)
         trace.predicted_cost = decision.predicted_cost
         trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
 
@@ -830,12 +855,14 @@ class InferenceEngine(nn.Module):
         executor = self.accelerator.transition
         if executor.adapter is not backbone:
             raise ValueError("Transition backbone must match the engine's adapter")
+        transition_cache = None if self.engine_cfg.diagnostic_no_cache else state.cache
         masks = executor.prepare_masks(
-            decision, state.tubes, state.grid, device=state.z.device, cache=state.cache
+            decision, state.tubes, state.grid, device=state.z.device, cache=transition_cache
         )
-        will_compute = bool(masks[1].any()) or state.cache is None or state.cache.model_output is None
+        will_compute = bool(masks[1].any()) or transition_cache is None or transition_cache.model_output is None
         if will_compute:
             self._before_compute(state, t)
+            transition_cache = None if self.engine_cfg.diagnostic_no_cache else state.cache
         else:
             _log.debug("step %d: reuse cache; preserving current gradient segment",
                        T - t + 1)
@@ -847,10 +874,11 @@ class InferenceEngine(nn.Module):
             decision=decision,
             tubes=state.tubes,
             grid=state.grid,
-            cache=state.cache,
+            cache=transition_cache,
             anchor_latent=self._assemble_anchor_latent(state),
             measure_residual=self.engine_cfg.measure_residual,
             prepared_masks=masks,
+            fill_lowfreq=self.engine_cfg.lowfreq_fill,
         )
 
     def _counterfactual_check(

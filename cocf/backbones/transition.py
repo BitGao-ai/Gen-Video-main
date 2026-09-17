@@ -36,8 +36,11 @@ Design note — axis conventions
 latent), matching cache methods like DeepCache/TeaCache. ``INTERP`` reuses across
 the *frame* axis: the tube's tokens are rebuilt from the frames on either side of
 them, so the tube keeps moving with the global trajectory without being denoised.
-``LOWFREQ`` keeps the low-frequency band fresh (strided compute + upsample) and
-inherits high-frequency detail from cache. These choices are local to this file —
+``LOWFREQ`` keeps only a strided spatial lattice fresh; the rest of the tube
+rides the spliced-ε Euler step (TeaCache-style) rather than being overwritten
+with a reconstruction — reconstruction fills empirically corrupt the trajectory
+(see :meth:`TransitionExecutor.coarsen_lowfreq`). These choices are local to
+this file —
 the rest of the framework only sees "an action was executed" — but both cheap
 reconstructions (:meth:`TransitionExecutor.coarsen_lowfreq`,
 :meth:`TransitionExecutor.interp_temporal`) are *shared verbatim* with Stage-A
@@ -296,6 +299,7 @@ class TransitionExecutor:
         want_attention: bool = False,
         measure_residual: bool = False,
         prepared_masks: Optional[Tuple[Tensor, Tensor]] = None,
+        fill_lowfreq: bool = True,
     ) -> TransitionResult:
         """Advance ``z_t`` to ``z_{t_next}`` honouring the per-tube allocation.
 
@@ -308,6 +312,12 @@ class TransitionExecutor:
         measure_residual
             When True, also compute ‖z_full − z_action‖ per skipped tube against a
             *cache-reused full step* reference, feeding the error certificate.
+        fill_lowfreq
+            Ablation switch (``EngineConfig.lowfreq_fill``, default off). When
+            False — the served default — LOWFREQ holes keep their ``z_full``
+            value (riding the spliced-ε Euler step, TeaCache-style). When True
+            they are overwritten with the lattice reconstruction, which is
+            retained only for comparison runs.
         """
         device = z_t.device
         planned_mask, active_mask = prepared_masks if prepared_masks is not None else self.prepare_masks(
@@ -362,14 +372,18 @@ class TransitionExecutor:
         # (§P4-B4). The clone is only needed once a skip or a LOWFREQ fill is about to
         # mutate it — z_full has to survive intact for the certificate's residual, the
         # §3.3.4 check and RAEC's boundary fusion.
-        needs_write = bool(skips) or bool(
-            lowfreq and self.lowfreq_stride > 1 and computed
-        )
+        do_fill = fill_lowfreq and computed and self.lowfreq_stride > 1
+        needs_write = bool(skips) or bool(lowfreq and do_fill)
         z_next = z_full.clone() if needs_write else z_full
         tube_residual: Dict[int, float] = {}
-        if computed and self.lowfreq_stride > 1:
+        if do_fill:
             for tube in lowfreq:
-                self._fill_lowfreq(z_next, z_full, tube, grid)
+                reconstructed = self.coarsen_lowfreq(
+                    z_full, tube, grid, protected=active_mask
+                )
+                idx = tube.all_token_indices().to(device)
+                keep = ~active_mask.to(device).index_select(0, idx)
+                z_next.index_copy_(1, idx[keep], reconstructed.index_select(1, idx[keep]))
 
         # Skip write-backs are applied *after* every computed tube and in a fixed
         # severity order, so an overlap does not resolve by list position (§P1-6).
@@ -378,6 +392,7 @@ class TransitionExecutor:
         # skips overlap the less destructive one (INTERP, which still moves with the
         # trajectory) is written last and wins over ANCHOR's freeze.
         active_now = active_mask.to(device)
+        rode_tokens = 0
         for tube in skips:
             action = decision.action_for(tube.tube_id, default=Action.FULL)
             idx = tube.all_token_indices().to(device)
@@ -393,11 +408,13 @@ class TransitionExecutor:
                 # velocity, which is the TeaCache-style skip and always keeps σ moving.
                 rows = self.interp_rows(z_full, tube, grid)
                 if rows is None:
+                    rode_tokens += int(idx.numel())
                     continue
                 z_skip = rows
             else:
                 # ANCHOR with no stored anchor: same reasoning as the single-frame
                 # INTERP fallback above — never freeze, ride the stepped latent.
+                rode_tokens += int(idx.numel())
                 continue
             if measure_residual:
                 ref = z_full.index_select(1, idx)
@@ -415,6 +432,12 @@ class TransitionExecutor:
                     1, idx.index_select(0, sel),
                     z_skip.index_select(1, sel).to(z_next.dtype),
                 )
+
+        if rode_tokens:
+            _log.info(
+                "transition: %d token(s) rode the spliced-ε step (freeze disabled)",
+                rode_tokens,
+            )
 
         active_ratio = float(active_mask.float().mean().item())
         # Certificate coverage (§P4-A2). A tube counts as *certified* this step when its
@@ -452,19 +475,44 @@ class TransitionExecutor:
         )
 
     def coarsen_lowfreq(
-        self, z: Tensor, tube: SemanticTube, grid: TokenGrid
+        self, z: Tensor, tube: SemanticTube, grid: TokenGrid,
+        *, protected: Optional[Tensor] = None,
     ) -> Tensor:
-        """Return a copy of ``z`` with ``tube``'s tokens coarsened to the LOWFREQ lattice.
+        """Coarsen the latent itself: holes take their lattice anchor's value.
 
-        Shared by Stage-A teacher generation (`cocf.lcocf.data`) so the offline
-        LOWFREQ damage label is produced by *exactly* the inference-time
-        reconstruction (no train/serve skew). With ``lowfreq_stride == 1`` LOWFREQ
-        computes every token, so coarsening is a no-op.
+        .. deprecated:: served-path semantics
+
+        Inference now defaults to ride-through for LOWFREQ holes (they keep their
+        ``z_full`` value; see ``EngineConfig.lowfreq_fill``), because overwriting
+        holes with reconstructed values — in *any* flavour — shifts the joint
+        latent distribution that the next dense forward attends over and the
+        corruption compounds across steps (empirically: saturated noise on Wan2.2,
+        PSNR 8 dB vs 19.8 dB for ride-through against the all-FULL reference).
+        This reconstruction survives for two uses: the ``--lowfreq-fill``
+        ablation, and Stage-A LOWFREQ damage labels in `cocf.lcocf.data` — note
+        those labels therefore describe the fill, not the served ride-through,
+        until the store is regenerated.
+
+        An earlier revision coarsened the per-step *increment* instead
+        (``z_prev + anchor delta``), which preserves each hole's own noise
+        realisation. That is exactly wrong over a multi-step trajectory: a hole
+        never receives its own denoiser output, so its step-1 noise offset
+        against the anchor is frozen into the latent for the rest of the
+        trajectory (telescoping gives ``hole_T = hole_1 + anchor_T − anchor_1``,
+        and at σ≈0.95 that offset is near-full-strength noise) and decodes as
+        saturated noise blocks. Copying the anchor's value lets the hole's
+        noise die together with the anchor's; the price is stride²-token flat
+        patches, which is precisely the quality cost LOWFREQ is meant to pay.
+
+        With ``lowfreq_stride == 1`` LOWFREQ computes every token, so coarsening
+        is a no-op.
         """
         if self.lowfreq_stride <= 1:
             return z
         out = z.clone()
-        self._fill_lowfreq(out, z, tube, grid)
+        self._fill_lowfreq(out, z, tube, grid, protected=protected)
+        # Positions the fill skipped (protected, or snapped outside an irregular
+        # tube) keep their input value exactly.
         return out
 
     def interp_temporal(
@@ -540,13 +588,15 @@ class TransitionExecutor:
         return torch.cat(rows, dim=1)
 
     def _fill_lowfreq(
-        self, z_next: Tensor, z_full: Tensor, tube: SemanticTube, grid: TokenGrid
+        self, z_next: Tensor, z_full: Tensor, tube: SemanticTube, grid: TokenGrid,
+        *, protected: Optional[Tensor] = None,
     ) -> None:
-        """Reconstruct LOWFREQ tokens that were *not* computed by upsampling.
+        """Fill the uncomputed LOWFREQ positions of ``z_next`` from ``z_full``.
 
-        The strided lattice was computed in ``z_full``; the holes are filled by
-        nearest-neighbour copy from the kept lattice within the same frame (a cheap,
-        artefact-free stand-in for true bilinear interpolation on the token grid).
+        The holes of ``z_next`` are overwritten by nearest-neighbour copy of the
+        kept lattice values from ``z_full`` within the same frame. Both tensors
+        carry absolute latent values (see :meth:`coarsen_lowfreq` for why
+        coarsening increments instead is wrong).
         """
         stride = self.lowfreq_stride
         device = z_next.device
@@ -562,6 +612,10 @@ class TransitionExecutor:
             wi_a = (torch.div(wi, stride, rounding_mode="floor") * stride).clamp_max(grid.w - 1)
             src_flat = frame * grid.tokens_per_frame + hi_a * grid.w + wi_a
             holes = ~kept
+            # A snapped source outside an irregular tube was not necessarily computed.
+            holes &= torch.isin(src_flat, idx.to(device))
+            if protected is not None:
+                holes &= ~protected.to(device=device, dtype=torch.bool).index_select(0, idx.to(device))
             z_next.index_copy_(
                 1, idx[holes].to(device),
                 z_full.index_select(1, src_flat[holes].to(device)),

@@ -263,6 +263,21 @@ class EngineConfig:
     # with this on must match the full-compute trajectory; if it does not, the
     # corruption lives in the engine's transition machinery, not the action plan.
     force_all_full: bool = False
+    diagnostic_lowfreq_full: bool = False
+    diagnostic_no_cache: bool = False
+    # LOWFREQ hole semantics. Default is ride-through: holes keep their ``z_full``
+    # value (the spliced-ε Euler step, TeaCache-style). The lattice-reconstruction
+    # fill (``True``) is retained as an ablation — both its increment and value
+    # variants measurably corrupt the trajectory on Wan2.2 (saturated noise), and
+    # Stage-A LOWFREQ labels predate the switch, so they must be regenerated before
+    # the predictor can price this action honestly.
+    lowfreq_fill: bool = False
+    # Every N steps promote LOWFREQ tubes to FULL for one step: ride-through holes
+    # never see their own fresh velocity, so high-frequency residue accumulates
+    # between refreshes. N=2 (every other step) measures PSNR ≈32.5 dB against the
+    # all-FULL reference on the Wan2.2 probe; N=4 drops to ≈22 dB. 0 disables the
+    # cadence.
+    lowfreq_refresh_every: int = 2
     # Recompute the tokens no tube covers every N steps (0 = never). The background
     # is ~3/4 of the grid and is outside every RAEC guarantee — certificates, rollback
     # and repair are all tube-scoped — so leaving it on the warm-up step's ε for the
