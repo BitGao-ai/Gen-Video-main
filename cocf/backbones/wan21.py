@@ -16,7 +16,7 @@ call — is the concrete demonstration of requirement #2 (multi-model support).
 
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -55,6 +55,8 @@ class Wan21Backbone(DiffusersVideoBackbone):
     # -- text ----------------------------------------------------------- #
 
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
+        from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+
         self._ensure_loaded()
         # umT5-XXL is ~11 GB in bf16 and runs once per prompt, so under
         # ``offload_text_encoder`` it only occupies VRAM for this one forward
@@ -65,15 +67,33 @@ class Wan21Backbone(DiffusersVideoBackbone):
         # backward — it would poison the whole §4.2 loss path.
         with torch.no_grad(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
-                list(prompts), return_tensors="pt", padding="max_length",
+                [prompt_clean(prompt) for prompt in prompts],
+                return_tensors="pt", padding="max_length",
                 truncation=True, max_length=self._max_len,
+                add_special_tokens=True, return_attention_mask=True,
             ).to(self.device)
             seq = self.text_encoder(**tok).last_hidden_state  # [B, L, d_t5]
+            seq = seq.masked_fill(~tok["attention_mask"].bool().unsqueeze(-1), 0)
         return TextConditioning(
             embeds=seq, mask=tok["attention_mask"], pooled=None, prompts=tuple(prompts)
         )
 
     # -- the cross-attention DiT call ----------------------------------- #
+
+    def _text_kwargs(
+        self, cond: TextConditioning, module: Optional[torch.nn.Module]
+    ) -> Dict[str, Any]:
+        # Wan attends to the full zero-padded sequence in the stock pipeline.
+        # Trimming or attention-masking these positions changes its attention.
+        embeds = cond.embeds.to(self.device, self.dtype)
+        if cond.mask is not None:
+            mask = cond.mask.to(device=embeds.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            if mask.shape != embeds.shape[:2]:
+                raise ValueError("Wan text mask must match embedding batch and sequence dimensions")
+            embeds = embeds.masked_fill(~mask.unsqueeze(-1), 0)
+        return {"encoder_hidden_states": embeds}
 
     def _run_transformer(
         self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
@@ -82,9 +102,6 @@ class Wan21Backbone(DiffusersVideoBackbone):
         out = self.transformer(  # type: ignore[union-attr]
             hidden_states=latent_grid,
             timestep=timestep,
-            # Padding-trimmed conditioning (+ the attention mask when this model
-            # accepts one): umT5 pads every prompt to 512 tokens and cross-attention
-            # was being charged for all of them, as real text (§P1-15).
             **self._text_kwargs(cond, self.transformer),
             return_dict=True,
         )

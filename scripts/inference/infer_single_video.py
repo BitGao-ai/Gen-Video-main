@@ -60,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quality", choices=sorted(QUALITY_B_MIN), default="balanced",
                    help=f"Compute-budget floor b_min: {QUALITY_B_MIN}")
     p.add_argument("--steps", type=int, help="Override num inference steps")
+    p.add_argument("--full-compute", action="store_true",
+                   help="Use the Stage A full-compute trajectory, bypassing tube actions and output splicing")
+    p.add_argument("--force-all-full", action="store_true",
+                   help="Pin every tube to FULL *through the engine* (correctness "
+                        "control: output must match --full-compute; any difference "
+                        "incriminates the transition machinery, not the action plan)")
     p.add_argument("--fps", type=int, default=16, help="Frame rate of the written file")
     # Backbone selection, §9.1 residency and render geometry come from the shared
     # helpers, so a render reproduces what Stage A/C were configured with rather than
@@ -110,6 +116,8 @@ def main():
     config.budget.b_max = max(config.budget.b_max, config.budget.b_min)
     if args.steps:
         config.engine.num_inference_steps = args.steps
+    if args.force_all_full:
+        config.engine.force_all_full = True
 
     # -- accelerator & engine --------------------------------------------- #
     if args.backbone != "mock":
@@ -160,6 +168,20 @@ def main():
 
     # -- run ---------------------------------------------------------------- #
     log.info("Generating video: '%s'", args.prompt)
+    if args.full_compute:
+        from cocf.training.teacher_forward import TeacherForwardConfig, TeacherForwardRunner
+        log.info("Full-compute diagnostic: bypassing allocation, output splicing and repairs; "
+                 "using the project's Stage A backbone path, not an official pipeline baseline")
+        runner = TeacherForwardRunner(
+            accelerator, TeacherForwardConfig(num_inference_steps=config.engine.num_inference_steps),
+            device=device,
+        )
+        with torch.no_grad():
+            z_final, _ = runner.full_denoise(z_init, cond, grid)
+            video = backbone.decode_to_unit(backbone.to_grid(z_final, grid))
+        written, backend_name = save_video(video, args.output, fps=args.fps)
+        log.info("Full-compute video saved to %s (via %s)", written, backend_name)
+        return
     with torch.no_grad():
         result = engine.generate(
             prompts=[args.prompt],

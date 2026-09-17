@@ -20,6 +20,7 @@ error handling). All mutable state lives in :class:`EngineState`.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -242,7 +243,12 @@ class InferenceEngine(nn.Module):
                 trace.budget, trace.num_tubes, trace.rollbacks, trace.repairs,
                 trace.cf_repairs, state.z.requires_grad, state.retained_computed, state.graph_cuts,
             )
-            _log.debug("step %d actions=%s", step_idx + 1, trace.actions)
+            # The executed plan decides everything about quality; keep its histogram
+            # at the same cadence as the step line instead of burying it in DEBUG.
+            if trace.actions:
+                hist = Counter(trace.actions.values())
+                log_step("step %d actions: %s", step_idx + 1,
+                         ", ".join(f"{name}={n}" for name, n in sorted(hist.items())))
 
         # Decode final latent to video. The adapter owns the token<->grid layout
         # (`to_grid`) and the VAE decode (`decode_latent`).
@@ -495,7 +501,11 @@ class InferenceEngine(nn.Module):
         # second, inlined copy of the same policy in ``EngineState`` while that class
         # sat unused, so the two could (and did) drift apart (§P1-7).
         trigger = self.accelerator.raec.trigger
-        forced_full = trigger.forced_full_tubes()
+        forced_full = (
+            {t.tube_id for t in state.tubes}
+            if self.engine_cfg.force_all_full
+            else trigger.forced_full_tubes()
+        )
         # §6.3.1's local conservation proxy ``1 − align(tube, prompt)``: a tube the
         # prompt barely describes is one whose skip risks a semantic violation, so it
         # raises that tube's certificate through λ_cmsc (§5.3.1). One projection over

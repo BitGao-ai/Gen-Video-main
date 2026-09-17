@@ -384,17 +384,21 @@ class TransitionExecutor:
             if action == Action.ANCHOR and anchor_latent is not None:
                 z_skip = anchor_latent.index_select(1, idx)
             elif action == Action.INTERP:
-                # Real temporal interpolation (see :meth:`interp_rows`). Falls back to
-                # freezing the tube when it spans a single frame — there is nothing to
-                # interpolate between, and re-reading z_full would be the old no-op.
+                # Real temporal interpolation (see :meth:`interp_rows`). When the tube
+                # spans a single frame there is nothing to interpolate between — and
+                # freezing at ``z_t`` pins the tokens at this step's noise level for
+                # the rest of the trajectory (the plan never revisits them), which
+                # decodes as solid noise blocks. Ride the spliced-ε Euler step
+                # instead: ``z_full`` already advanced these tokens with the cached
+                # velocity, which is the TeaCache-style skip and always keeps σ moving.
                 rows = self.interp_rows(z_full, tube, grid)
-                z_skip = rows if rows is not None else z_t.index_select(1, idx)
+                if rows is None:
+                    continue
+                z_skip = rows
             else:
-                # ANCHOR with no stored anchor: *freeze* the tube at the pre-step
-                # latent, which is what "anchor" means and what Stage A labels
-                # (``z_prev``). Reading z_full back was an identity, so the action had
-                # no effect and its residual was zero.
-                z_skip = z_t.index_select(1, idx)
+                # ANCHOR with no stored anchor: same reasoning as the single-frame
+                # INTERP fallback above — never freeze, ride the stepped latent.
+                continue
             if measure_residual:
                 ref = z_full.index_select(1, idx)
                 tube_residual[tube.tube_id] = float(
@@ -475,11 +479,12 @@ class TransitionExecutor:
         the wrong μ for the action (§7.1.1 no train/serve skew).
 
         ``freeze_to`` supplies the pre-step latent used for the single-frame fallback
-        (a tube spanning one frame has nothing to interpolate *between*, so INTERP
-        degenerates to freezing it — what the executor does). Callers **must** pass it
-        or the fallback silently becomes a no-op: Stage A would then label a
-        single-frame tube's INTERP damage as exactly 0, teaching the predictor that
-        INTERP is free precisely where inference makes it a freeze.
+        (a tube spanning one frame has nothing to interpolate *between*). Inference
+        no longer freezes in that case — :meth:`TransitionExecutor.step` lets the
+        tube ride the spliced-ε step, because a freeze pins σ in place for the rest
+        of the trajectory and decodes as noise blocks. The label side keeps the
+        freeze semantics when ``freeze_to`` is passed, so for single-frame tubes the
+        predictor's INTERP μ is a conservative overestimate of the served damage.
         """
         rows = self.interp_rows(z, tube, grid)
         idx = tube.all_token_indices().to(z.device)

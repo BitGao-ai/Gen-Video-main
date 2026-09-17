@@ -39,12 +39,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from cocf.backbones.base import TextConditioning
+from cocf.backbones.base import BackboneCache, DenoiseOutput, TextConditioning
 from cocf.backbones.wan21 import Wan21Backbone
 from cocf.common.config import BackboneConfig
 from cocf.common.logging import get_logger
 from cocf.common.memory import free_memory, normal_mode
 from cocf.common.registry import register_backbone
+from cocf.common.types import TokenGrid
 
 Tensor = torch.Tensor
 _log = get_logger(__name__)
@@ -116,6 +117,10 @@ class Wan22Backbone(Wan21Backbone):
         br = extra.get("boundary_ratio", self._default_boundary_ratio)
         self.boundary_ratio: Optional[float] = None if br is None else float(br)
         self.num_train_timesteps = int(extra.get("num_train_timesteps", 1000))
+        # The expert whose forward produced the velocity the engine's cache currently
+        # holds; ``None`` until the first forward runs. Read by :meth:`denoise` to
+        # refuse cross-expert cache reuse.
+        self._eps_expert: Optional[nn.Module] = None
 
     # -- VAE geometry, read from the checkpoint's own config -------------- #
 
@@ -412,13 +417,63 @@ class Wan22Backbone(Wan21Backbone):
         out = expert(  # type: ignore[misc]
             hidden_states=latent_grid,
             timestep=timestep,
-            # Trimmed to the prompt's real length, with the mask where supported —
-            # see :meth:`DiffusersVideoBackbone._text_kwargs` (§P1-15).
             **self._text_kwargs(cond, expert),
             return_dict=True,
         )
+        # The velocity this call emits — and therefore any cache the caller builds
+        # from it — belongs to *this* expert's vector field.
+        self._eps_expert = expert
         eps = out.sample if hasattr(out, "sample") else out[0]
         return eps, {}
+
+    # -- cache reuse is only valid inside one expert's noise regime ------ #
+
+    def denoise(
+        self,
+        tokens: Tensor,
+        t: Tensor,
+        cond: TextConditioning,
+        *,
+        grid: TokenGrid,
+        active_mask: Optional[Tensor] = None,
+        cache: Optional[BackboneCache] = None,
+        want_attention: bool = False,
+    ) -> DenoiseOutput:
+        """MoE-aware guard around the base splice: never reuse the other expert's ε.
+
+        The base implementation splices ``cache.model_output`` into every inactive
+        token unconditionally (``DiffusersVideoBackbone.denoise``). That is a
+        TeaCache-style approximation *within* one denoiser, but the A14B MoE routes
+        σ ≥ boundary to ``transformer`` and σ < boundary to ``transformer_2`` — two
+        independently trained vector fields that are not interchangeable. Carrying a
+        high-noise-expert velocity into the low-noise regime integrates the wrong
+        field for every skipped token, and because the cache row is copied forward
+        verbatim each step, a token skipped at the boundary keeps the wrong expert's
+        velocity to the end of the trajectory (the "mosaic" failure).
+
+        Dropping the cache on the boundary step is nearly free on this adapter: the
+        forward is dense anyway, so the inactive tokens simply keep their *fresh*
+        outputs instead of stale ones — strictly closer to the un-accelerated
+        trajectory. Within an expert's regime, reuse is untouched.
+        """
+        if (
+            cache is not None
+            and cache.model_output is not None
+            and self._eps_expert is not None
+        ):
+            timestep = (self.model_sigma(t.to(self.device)) * 1000.0).flatten()
+            want = self._expert_for(timestep)
+            if want is not self._eps_expert:
+                _log.info(
+                    "Wan22: dropping ε cache at the MoE boundary — it was produced by "
+                    "the %s-noise expert and this step routes to the other one",
+                    "high" if self._eps_expert is self.transformer else "low",
+                )
+                cache = None
+        return super().denoise(
+            tokens, t, cond, grid=grid, active_mask=active_mask,
+            cache=cache, want_attention=want_attention,
+        )
 
     # -- Stage-C LoRA: expose *both* experts' blocks -------------------- #
 

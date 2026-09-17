@@ -258,6 +258,11 @@ class EngineConfig:
     # runs and every certificate is re-grounded against a real δ. This is what makes
     # ``dense_step_skip_below`` safe to enable (§P4-A2). 0 removes the bound.
     max_unmeasured_steps: int = 3
+    # Debug/correctness control: pin every tube to FULL through the *engine* path
+    # (unlike infer_single_video's --full-compute, which bypasses the engine). A run
+    # with this on must match the full-compute trajectory; if it does not, the
+    # corruption lives in the engine's transition machinery, not the action plan.
+    force_all_full: bool = False
     # Recompute the tokens no tube covers every N steps (0 = never). The background
     # is ~3/4 of the grid and is outside every RAEC guarantee — certificates, rollback
     # and repair are all tube-scoped — so leaving it on the warm-up step's ε for the

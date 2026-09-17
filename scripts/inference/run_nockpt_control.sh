@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Single-video accelerated inference smoke test, not a full-compute benchmark.
-# Preview: DRY_RUN=1 bash scripts/inference/run_stage_b_probe.sh
+# No-checkpoint control run: same accelerated inference as run_stage_b_probe.sh
+# but with cold-start (untrained) plugins — discriminates "engine base path
+# corruption" from "Stage-B-checkpoint-driven corruption". Expectation per the
+# allocator analysis: cold-start also stays at the prior action plan, so a
+# mosaic here too would confirm the engine base path (splice/priors) as the
+# corruptor rather than the checkpoint.
+# Preview: DRY_RUN=1 bash scripts/inference/run_nockpt_control.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -14,13 +19,11 @@ SAM_MODEL="${SAM_MODEL:-$WEIGHTS_ROOT/SAM}"
 DINO_MODEL="${DINO_MODEL:-$WEIGHTS_ROOT/DINO}"
 CLIP_MODEL="${CLIP_MODEL:-$WEIGHTS_ROOT/Clip}"
 RAFT_WEIGHTS="${RAFT_WEIGHTS:-$WEIGHTS_ROOT/raft}"
-CHECKPOINT="${CHECKPOINT:-checkpoints/stage_b.20260916_114011.LVJjMI/stage_b_final.pt}"
 PROMPT="${PROMPT:-A person walks slowly across a park, with trees in the background, steady camera.}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/stage_b_probe}"
 QUALITY="${QUALITY:-quality}"
 SEED="${SEED:-1234}"
 DRY_RUN="${DRY_RUN:-0}"
-MODE="${MODE:-accelerated}"
 VAE_TILE="${VAE_TILE:-128}"
 
 die() { echo "[error] $*" >&2; exit 1; }
@@ -30,16 +33,14 @@ if [[ ${CUDA_VISIBLE_DEVICES+x} ]]; then
   [[ ",$CUDA_VISIBLE_DEVICES," == *",$GPU_IDS,"* ]] || die 'GPU_IDS is outside CUDA_VISIBLE_DEVICES'
 fi
 [[ "$DRY_RUN" =~ ^[01]$ ]] || die 'DRY_RUN must be 0 or 1'
-[[ "$MODE" == accelerated || "$MODE" == full || "$MODE" == allfull ]] || die 'MODE must be accelerated, full or allfull'
 [[ "$SEED" =~ ^(0|[1-9][0-9]*)$ ]] || die 'SEED must be a nonnegative integer'
 [[ "$QUALITY" == quality || "$QUALITY" == balanced || "$QUALITY" == fast ]] || die 'Invalid QUALITY'
 [[ "$VAE_TILE" =~ ^[0-9]+$ ]] || die 'VAE_TILE must be a nonnegative integer'
 
-# Keep geometry and flow shift consistent with the Stage A store used for training.
-# Shared CLI defaults retain CPU offload, idle-expert offload and VAE tiling.
+# Identical to run_stage_b_probe.sh except: no --checkpoint (cold-start plugins).
 ARGS=(
   scripts/inference/infer_single_video.py
-  --prompt "$PROMPT" --checkpoint "$CHECKPOINT"
+  --prompt "$PROMPT"
   --backbone wan22 --wan-variant a14b-t2v --model-path "$MODEL_PATH"
   --backbone-dtype bfloat16 --perception-dtype bfloat16
   --sam-model "$SAM_MODEL" --dino-model "$DINO_MODEL" --clip-model "$CLIP_MODEL"
@@ -47,15 +48,12 @@ ARGS=(
   --steps 20 --num-frames 49 --height 384 --width 640 --vae-tile "$VAE_TILE"
   --quality "$QUALITY" --seed "$SEED" --device cuda
 )
-if [[ "$MODE" == full ]]; then ARGS+=(--full-compute); fi
-if [[ "$MODE" == allfull ]]; then ARGS+=(--force-all-full); fi
 if [[ "$DRY_RUN" == 1 ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q ' "$GPU_IDS"
-  printf '%q ' "$PYTHON_BIN" -u "${ARGS[@]}" --output "$OUTPUT_ROOT/<unique-run>/$MODE.mp4"
+  printf '%q ' "$PYTHON_BIN" -u "${ARGS[@]}" --output "$OUTPUT_ROOT/<unique-run>/accelerated_nockpt.mp4"
   printf '\n[preview] No model loaded or files written.\n'
   exit 0
 fi
-[[ -f "$CHECKPOINT" ]] || die "Checkpoint missing: $CHECKPOINT"
 for path in "$MODEL_PATH" "$SAM_MODEL" "$DINO_MODEL" "$CLIP_MODEL"; do
   [[ -d "$path" ]] || die "Model directory missing: $path"
 done
@@ -63,9 +61,8 @@ done
 mkdir -p "$OUTPUT_ROOT"
 run_dir="$(mktemp -d "$OUTPUT_ROOT/run.$(date +%Y%m%d_%H%M%S).XXXXXX")"
 log_file="$run_dir/inference.log"
-ARGS+=(--output "$run_dir/$MODE.mp4")
-echo "[start] mode=$MODE GPU=$GPU_IDS quality=$QUALITY seed=$SEED"
-echo "[checkpoint] $CHECKPOINT"
+ARGS+=(--output "$run_dir/accelerated_nockpt.mp4")
+echo "[start] no-checkpoint control GPU=$GPU_IDS quality=$QUALITY seed=$SEED"
 echo "[output] $run_dir"
 printf '[monitor] tail -f %q\n' "$log_file"
 {

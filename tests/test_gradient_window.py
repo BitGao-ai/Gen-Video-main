@@ -5,6 +5,7 @@ import torch
 
 from cocf.common.config import Config
 from cocf.common.types import TokenGrid, SemanticTube, AllocationDecision, Action
+from cocf.backbones.base import sigma_from_step
 from cocf.core.accelerator import Accelerator
 from cocf.engine import InferenceEngine
 from cocf.engine.state import StepTrace, EngineState
@@ -75,8 +76,17 @@ class GradientWindowTest(unittest.TestCase):
             out = engine._execute_transition(state, 3, full, acc.backbone)
             state.z, state.cache = out.z_next, out.cache
             state.retained_computed = 1
+            # ANCHOR without a saved anchor no longer freezes (a freeze pins the
+            # tokens at this step's noise level for the rest of the trajectory and
+            # decodes as noise blocks): the tube rides the cached-velocity Euler
+            # step, so z keeps advancing while compute stays 0.
             expected = state.z.detach().clone()
+            T = engine.engine_cfg.num_inference_steps
             for step in (1, 2):
+                eps_cached = state.cache.model_output
+                t_now = torch.full((1,), sigma_from_step(3 - step, T))
+                t_next = torch.full((1,), sigma_from_step(2 - step, T))
+                expected = acc.backbone.scheduler_step(eps_cached, t_now, t_next, expected)
                 skip = AllocationDecision(step, {0: Action.ANCHOR}, 0.0, 0.0)
                 out = engine._execute_transition(state, 3 - step, skip, acc.backbone)
                 state.z, state.cache = out.z_next, out.cache
