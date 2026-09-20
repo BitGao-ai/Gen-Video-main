@@ -1,16 +1,5 @@
 #!/usr/bin/env python
-"""Dump a frame grid from a stored Stage-A ``Y_full.npy`` for eyeballing.
-
-The store's ``full_baseline/<video_id>/Y_full.npy`` is the reference video the
-damage labels were measured against. If the backbone path that generated it was
-broken, these frames are the cheapest place to see it — no GPU, no model load.
-
-    python scripts/diagnose/dump_store_baseline.py \
-        --processed-root ./LCOCF_OpenVid1M_Processed \
-        --output /tmp/store_yfull.png
-
-Picks the first bucket unless --video-id (or a higher --index) says otherwise.
-"""
+"""Dump frame grid from stored Stage-A Y_full."""
 
 import argparse
 import glob
@@ -20,6 +9,7 @@ import numpy as np
 
 
 def main() -> None:
+    """Dump Y_full frame grid to PNG."""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--processed-root", default="./LCOCF_OpenVid1M_Processed")
     p.add_argument("--video-id", help="exact bucket name; overrides --index")

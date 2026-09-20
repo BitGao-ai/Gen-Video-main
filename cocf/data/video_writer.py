@@ -1,24 +1,9 @@
-"""Write a decoded video tensor to disk (§7.2 — the inference entry point's last mile).
+"""Write a decoded video tensor to disk.
 
-The framework produces ``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) float tensors in the
-VAE convention (``[-1, 1]``, or ``[0, 1]`` for the mock); turning that into a file the
-user asked for is the one step that stood between the accelerated pipeline and an
-actual artefact — ``infer_single_video.py`` used to stop at a ``# TODO: encode and
-save``.
-
-Encoding is deliberately **best-effort over whatever the environment has**, in
-descending order of usefulness:
-
-    1. ``imageio`` (+ ffmpeg)  → a real ``.mp4``
-    2. ``torchvision.io``      → a real ``.mp4``
-    3. ``cv2``                 → a real ``.mp4``
-    4. PNG frame directory     → ``<stem>_frames/frame_00000.png`` (needs Pillow)
-    5. ``.npy``                → raw ``uint8 [F, H, W, 3]``, always available
-
-The fallbacks matter: a CPU box with no codec stack (this repo's own test
-environment) must still be able to *run* the entry point and inspect its output rather
-than crash on an import, and every path returns the file it actually wrote so the
-caller can report the truth instead of the requested name.
+Turns a ``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) float tensor into a file, encoding
+best-effort over whatever the environment provides: imageio, torchvision.io, cv2, then
+a PNG frame directory, then a raw ``.npy`` dump. Every path returns the file it
+actually wrote so the caller can report the truth instead of the requested name.
 """
 
 from __future__ import annotations
@@ -39,8 +24,7 @@ def to_uint8_frames(video: Tensor) -> np.ndarray:
     """``[B,3,F,H,W]`` / ``[3,F,H,W]`` float → ``[F, H, W, 3]`` uint8.
 
     Accepts both the ``[-1, 1]`` VAE convention and an already-``[0, 1]`` tensor: the
-    range is *detected* (a min below ``-0.01`` means signed) rather than assumed, so a
-    mock render is not silently crushed to black by a rescale it did not need.
+    range is detected rather than assumed.
     """
     v = video[0] if video.dim() == 5 else video
     if v.dim() != 4:
@@ -57,8 +41,7 @@ def save_video(video: Tensor, path, fps: int = 16) -> Tuple[Path, str]:
     """Write ``video`` to ``path``. Returns ``(actual_path, backend_name)``.
 
     ``actual_path`` may differ from ``path`` when no encoder is installed and the
-    function falls back to a frame directory or a ``.npy`` dump — callers should log
-    what came back, not what they asked for.
+    function falls back to a frame directory or a ``.npy`` dump.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,11 +99,8 @@ def _save_cv2(frames: np.ndarray, path: Path, fps: int):
         raise RuntimeError(f"cv2.VideoWriter could not open {path}")
     try:
         for f in frames:
-            # ``ascontiguousarray``: the OpenCV bindings reject a negative-stride view
-            # ("Layout of the output array is incompatible with cv::Mat"), so the bare
-            # ``[..., ::-1]`` RGB→BGR flip would fail on every frame — and the generic
-            # handler upstream would quietly downgrade to the .npy fallback on a box
-            # that has a perfectly good codec.
+            # ``ascontiguousarray``: the OpenCV bindings reject a negative-stride view,
+            # so the RGB->BGR flip must be made contiguous.
             writer.write(np.ascontiguousarray(f[:, :, ::-1]))
     finally:
         writer.release()

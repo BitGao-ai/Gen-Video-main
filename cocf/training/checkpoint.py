@@ -1,27 +1,17 @@
-"""Stage checkpoint layout — plugins *plus* the adapters that live outside them.
+"""Stage checkpoint layout: plugins plus the adapters that live outside them.
 
-The accelerator's ``state_dict()`` covers the four learnable plugins and nothing
-else, by design: the frozen backbone is a plain attribute so its billions of weights
-never enter an optimiser or a checkpoint (§7.1). Stage-C LoRA, however, is injected
-*into* that backbone — so it is invisible to ``state_dict()`` and was being discarded
-at the end of every ``--use_lora`` run.
-
-This module owns the resulting two-part layout and the tolerant reader for it::
+The accelerator's ``state_dict()`` covers only the four learnable plugins (the frozen
+backbone is a plain attribute). Stage-C LoRA is injected into that backbone, so it is
+stored alongside in a two-part layout handled here::
 
     {"accelerator":    {...plugin tensors...},
      "damage_weights": {...scoring policy at train time...},
      "lora":           {"<root>.<path>.lora_A": tensor, ...},   # optional
      "lora_config":    {"rank": 8, "alpha": 16.0, "last_n_blocks": 3}}
 
-Both are kept in *one* place because the failure mode is silent: a writer that forgets
-the LoRA half, or a reader that assumes the old bare-``state_dict`` layout, produces a
-checkpoint that loads without error and simply lacks the fine-tune.
-
-Every checkpoint must also record the damage scoring policy it was trained against:
+Every checkpoint also records the damage scoring policy it was trained against:
 :func:`load_checkpoint` rejects anything whose ``damage_weights`` differ from the
-current :data:`cocf.lcocf.damage.DEFAULT_DAMAGE_WEIGHTS`. That excludes the old
-bare-``state_dict`` layout entirely — it carries no scoring metadata, so legacy
-Stage-B state dicts fail fast here instead of silently scoring on the wrong scale.
+current defaults.
 """
 
 from __future__ import annotations
@@ -48,8 +38,7 @@ def build_checkpoint(
     """Assemble the two-part checkpoint from a (possibly LoRA-injected) accelerator.
 
     The LoRA geometry is stored with the tensors because the adapters must be
-    re-injected with the *same* rank / target-block count before they can be loaded
-    back (see :func:`cocf.training.lora.attach_lora`).
+    re-injected with the same rank / target-block count before they can be loaded.
     """
     ckpt: Dict[str, Any] = {ACCELERATOR_KEY: accelerator.state_dict()}
     from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
@@ -95,19 +84,10 @@ def is_two_part(ckpt: Any) -> bool:
 def _filter_shape_mismatch(accelerator, state: Mapping[str, Any]) -> Dict[str, Any]:
     """Drop checkpoint tensors whose shape disagrees with the live module.
 
-    The case this exists for is ``cmsc_alignment.vis_proj`` (and its twin inside
-    ``cmsc_loss.alignment``): Stage B sizes that projection from the *store's*
-    ``tube_visual_embed_full`` width, while Stage C sizes it from the *live* perception
-    provider's ``d_clip``. A store written before the :mod:`cocf.common.hf_clip` fix
-    holds un-projected CLIP features (ViT-B/32 ⇒ 768) where the fixed code now yields
-    the projected joint-space vector (512), so the two disagree and
-    ``load_state_dict`` aborts the whole load over one layer.
-
-    Dropping the offender is the right resolution rather than reshaping it: a
-    projection trained on a different feature space carries no usable signal into the
-    new one, so Stage C re-learns that single 256×d layer from scratch and keeps every
-    other plugin weight Stage B produced. Loudly logged — a silent skip here would be
-    indistinguishable from a successful resume.
+    Handles ``cmsc_alignment.vis_proj``, which Stage B sizes from the store's visual
+    embed width and Stage C from the live perception provider's ``d_clip``. A mismatched
+    projection is dropped (and logged) so Stage C re-learns just that layer and keeps
+    every other plugin weight.
     """
     live = accelerator.state_dict()
     kept, dropped = {}, []
@@ -143,27 +123,10 @@ def load_checkpoint(
 ) -> int:
     """Restore plugin weights from a :func:`build_checkpoint` payload; return LoRA count.
 
-    Parameters
-    ----------
-    ckpt
-        An already-``torch.load``ed object produced by :func:`build_checkpoint`.
-        Bare ``state_dict`` payloads and legacy checkpoints carry no
-        ``damage_weights`` and are rejected before anything is loaded.
-    training_config
-        ``Config.training``, used only for LoRA geometry defaults when a checkpoint
-        predates ``lora_config``.
-    attach
-        Set False to load the plugins alone (e.g. when the caller injects LoRA itself
-        with a different geometry, as Stage C does before training).
-    allow_shape_mismatch
-        Drop (rather than crash on) checkpoint tensors whose shape disagrees with the
-        model's — see :func:`_filter_shape_mismatch`. Set False to demand an exact
-        match.
-    allow_incomplete
-        Load a checkpoint whose ``phase_state`` marks it as the product of an
-        unfinished phased Stage-B run (variance calibration never completed).
-        Default False rejects such files: a mean-only model must not silently
-        enter Stage C or inference. Diagnostics pass True explicitly.
+    Rejects bare ``state_dict`` / legacy payloads that carry no ``damage_weights``.
+    ``attach=False`` loads the plugins alone; ``allow_shape_mismatch`` drops mismatched
+    tensors instead of crashing; ``allow_incomplete`` loads a checkpoint from an
+    unfinished phased Stage-B run (rejected by default).
     """
     from cocf.lcocf.damage import DEFAULT_DAMAGE_WEIGHTS
     if ckpt.get("damage_weights") != DEFAULT_DAMAGE_WEIGHTS:
@@ -206,8 +169,7 @@ def load_checkpoint(
     accelerator.load_state_dict(state, strict=not allow_shape_mismatch)
     missing = [k for k in accelerator.state_dict() if k not in state]
     if missing:
-        # Includes anything _filter_shape_mismatch just dropped (already detailed
-        # above); a key that appears only here was never in the checkpoint at all.
+        # Includes anything _filter_shape_mismatch just dropped (detailed above).
         _log.warning("checkpoint: %d plugin tensor(s) not restored: %s",
                      len(missing), ", ".join(missing[:8]))
 

@@ -1,22 +1,4 @@
-"""Lightweight causal-strength field ``s = α·s_E + β·s_A + γ·s_T`` (§3.3.2).
-
-L-COCF's second simplification: a *first-order linear* approximation of the causal
-effect, justified by the causal-effect hierarchy axiom (§3.2.2 — quality is driven
-by entities, actions and temporal transitions; everything else is ~constant). It
-has only **three** learnable scalars, so it trains on a handful of samples and
-adds negligible cost.
-
-The three causal signals, all derived from cheap, already-available quantities:
-
-    s_E  entity strength      VLM entity importance for the entity the tube depicts
-    s_A  action strength      tube motion magnitude × text-action alignment
-    s_T  temporal strength    inter-frame semantic change (occlusion + id drift)
-
-This module separates *feature construction* (``CausalStrengthFeatureBuilder`` —
-pure, reused verbatim by the data pipeline so training/inference features match)
-from the *learnable combination* (``CausalStrengthField`` — the three weights).
-That separation is what lets §3.3.5's plugin training touch only three params.
-"""
+"""Lightweight causal-strength field s = a*s_E + b*s_A + g*s_T."""
 
 from __future__ import annotations
 
@@ -35,22 +17,19 @@ Tensor = torch.Tensor
 
 @dataclass
 class StrengthFeatures:
-    """The three causal signals for one tube (inputs to the strength field)."""
+    """Three causal signals for one tube."""
 
-    s_E: float  # entity importance ∈ [0, 1]
-    s_A: float  # action strength  ∈ [0, 1]
-    s_T: float  # temporal-transition strength ∈ [0, 1]
+    s_E: float
+    s_A: float
+    s_T: float
 
     def as_tensor(self, device=None, dtype=torch.float32) -> Tensor:
+        """Features as tensor."""
         return torch.tensor([self.s_E, self.s_A, self.s_T], device=device, dtype=dtype)
 
 
 class CausalStrengthFeatureBuilder:
-    """Derives :class:`StrengthFeatures` from a tube, its state and the sub-graph.
-
-    Stateless and dependency-free → identical features at train and inference time
-    (a common source of train/serve skew, avoided here by construction).
-    """
+    """Derives strength features from tube and sub-graph."""
 
     def build(
         self,
@@ -60,32 +39,27 @@ class CausalStrengthFeatureBuilder:
         entity_importance: Optional[float] = None,
         action_alignment: Optional[float] = None,
     ) -> StrengthFeatures:
-        # s_E: importance of the entity this tube depicts. If the caller resolved a
-        # tube→entity match, use it; else fall back to the sub-graph's mean (or a
-        # boost when the tube is flagged critical, text/face/hands).
+        """Build strength features for one tube."""
+        # s_E: importance of the entity this tube depicts. Use the resolved
+        # tube-entity match if given, else the sub-graph mean (boosted when the tube is
+        # flagged critical).
         if entity_importance is None:
             base = (
                 sum(subgraph.entity_importance.values()) / len(subgraph.entity_importance)
                 if subgraph.entity_importance else 0.5
             )
-            # No tube→entity match was resolved, so this is a *prompt-level* prior,
-            # not a per-tube one. It must not be pinned to 1.0: with normalised
-            # equal weights a hard 1.0 forces s ≥ 1/3 > θ2 for every tube, making
-            # the LOW tier (the cheapest mapping) unreachable on any prompt that
-            # names a critical-looking entity — i.e. most prompts. A bounded
-            # additive boost keeps critical prompts stronger without collapsing
-            # the tier ladder.
+            # No tube-entity match: a bounded additive boost keeps critical prompts
+            # stronger without pinning every tube to the top tier.
             entity_importance = min(1.0, base + 0.25) if subgraph.critical_entities else base
         s_E = float(min(max(entity_importance, 0.0), 1.0))
 
-        # s_A: motion magnitude (already normalised in the state) gated by how much
-        # the tube participates in a *named action* (text-action alignment).
+        # s_A: motion magnitude gated by text-action alignment.
         align = action_alignment if action_alignment is not None else (
             1.0 if any(t.action != "exists" for t in subgraph.triplets) else 0.5
         )
         s_A = float(min(max(state.motion_phase * align, 0.0), 1.0))
 
-        # s_T: inter-frame semantic change — occlusion plus identity drift.
+        # s_T: inter-frame semantic change (occlusion plus identity drift).
         s_T = float(min(max(0.5 * state.occlusion + 0.5 * (1.0 - state.identity_confidence), 0.0), 1.0))
         return StrengthFeatures(s_E=s_E, s_A=s_A, s_T=s_T)
 
@@ -93,8 +67,8 @@ class CausalStrengthFeatureBuilder:
 class CausalStrengthField(nn.Module):
     """The 3-parameter learnable combiner producing the causal strength ``s``.
 
-    ``s = softplus(α)·s_E + softplus(β)·s_A + softplus(γ)·s_T`` (softplus keeps the
-    weights non-negative so larger signals never *reduce* allocated compute), then
+    ``s = softplus(a)*s_E + softplus(b)*s_A + softplus(c)*s_T`` (softplus keeps the
+    weights non-negative so larger signals never reduce allocated compute), then
     optionally squashed to ``[0, 1]`` before tier thresholding.
     """
 
@@ -113,11 +87,11 @@ class CausalStrengthField(nn.Module):
         w = self.weights().to(features.dtype)
         s = (features * w).sum(-1)
         if self.cfg.normalize_strength:
-            s = s / w.sum().clamp_min(1e-6)  # convex combination → already in [0,1]
+            s = s / w.sum().clamp_min(1e-6)  # convex combination, already in [0, 1]
         return s
 
     def level(self, strength: Tensor) -> Tensor:
-        """Discretise strength to :class:`StrengthLevel` codes (§3.3.3 thresholds)."""
+        """Discretise strength to :class:`StrengthLevel` codes."""
         level = torch.full_like(strength, float(StrengthLevel.LOW), dtype=torch.float32)
         level = torch.where(strength > self.cfg.theta2, torch.full_like(level, float(StrengthLevel.MID)), level)
         level = torch.where(strength > self.cfg.theta1, torch.full_like(level, float(StrengthLevel.HIGH)), level)

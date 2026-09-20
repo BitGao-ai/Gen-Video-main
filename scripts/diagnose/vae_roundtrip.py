@@ -6,7 +6,7 @@ tiled decode); every good video came out of diffusers' fp32 untiled decode. This
 script removes denoising from the question entirely: it encodes a *real* mp4 and
 decodes it straight back, twice —
 
-    project : Wan22Backbone.encode_video → decode_to_unit   (bf16 VAE, tiling as given)
+    project : Wan22Backbone.encode_video -> decode_to_unit   (bf16 VAE, tiling as given)
     control : a second, fp32, untiled AutoencoderKLWan directly (official-equivalent)
 
 A faithful VAE round-trips with only mild blur. If the *project* leg is mud while
@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 
 def _read_clip(path: str, num_frames: int, height: int, width: int) -> torch.Tensor:
-    """mp4 → [1, 3, F, H, W] in [-1, 1], evenly spaced frames (decord)."""
+    """mp4 to [1, 3, F, H, W] in [-1, 1], evenly spaced frames (decord)."""
     from decord import VideoReader, cpu
 
     vr = VideoReader(path, ctx=cpu(0))

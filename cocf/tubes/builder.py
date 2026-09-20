@@ -1,20 +1,4 @@
-"""Semantic-tube builder — orchestrates the STA pipeline (§4.3.1).
-
-This is the single entry point the engine uses for tube construction/maintenance.
-It wires the four STA sub-modules together while keeping each one ignorant of the
-others:
-
-    RegionExtractor → (RAFT flow, down-sampled to latent) → AffinityComputer
-                    → TubeMatcher → TubeStateEncoder
-
-It exposes two cost tiers (matching the inference loop's needs, §7.2 step 1):
-
-    build()   full segmentation + matching from RGB frames — run once (or rarely)
-    update()  cheap per-step state refresh on existing tubes (no re-segmentation)
-
-so that the expensive SAM pass is amortised while the per-step ``s_{k,t}`` update
-stays in the inner denoising loop.
-"""
+"""Semantic-tube builder orchestrating the STA pipeline."""
 
 from __future__ import annotations
 
@@ -34,9 +18,10 @@ Tensor = torch.Tensor
 
 
 class TubeBuilder:
-    """Builds and maintains the semantic-tube set ``G_t`` across denoising."""
+    """Builds and maintains semantic tubes."""
 
     def __init__(self, config: TubeConfig, perception: PerceptionProvider) -> None:
+        """Store config and wire STA sub-modules."""
         self.cfg = config
         self.perception = perception
         self.regions = RegionExtractor(config, perception)
@@ -44,31 +29,16 @@ class TubeBuilder:
         self.matcher = TubeMatcher(config)
         self.state = TubeStateEncoder(config)
 
-    # ------------------------------------------------------------------ #
-    # Full build (run once, e.g. on a preview decode or the GT video)
-    # ------------------------------------------------------------------ #
-
     def build(
         self, frames_rgb: Tensor, grid: TokenGrid, prompt: str = ""
     ) -> List[SemanticTube]:
-        """Construct tubes from RGB frames ``[F, 3, Hp, Wp]``.
-
-        ``F`` should equal ``grid.t`` (one RGB frame per latent-temporal slot); the
-        caller decodes the latent (or uses the GT video in training).
-        """
+        """Build tubes from RGB frames."""
         return self.build_with_states(frames_rgb, grid, prompt)[0]
 
     def build_with_states(
         self, frames_rgb: Tensor, grid: TokenGrid, prompt: str = ""
     ) -> Tuple[List[SemanticTube], Dict[int, TubeState], Dict[int, Tensor]]:
-        """Like :meth:`build` but also returns the per-tube states and latent flows.
-
-        Stage-A teacher generation (``cocf.training.stage_a_data_gen``) needs the
-        7-dim tube states — and the optical flow that makes ``motion_phase`` (hence
-        the action strength ``s_A``) non-trivial — *alongside* the tubes. Calling
-        :meth:`build` then a second :meth:`update` would recompute RAFT flow; this
-        returns both from a single pass so the teacher path pays for flow once.
-        """
+        """Build tubes and return states and latent flows."""
         f = frames_rgb.shape[0]
         regions_by_frame: Dict[int, List[Region]] = {}
         for fi in range(f):
@@ -83,10 +53,6 @@ class TubeBuilder:
             )
         tubes = self.matcher.build_tubes(
             regions_by_frame, affinity_by_pair, grid,
-            # Lets the matcher bridge a missed frame: it asks for the affinity between
-            # a stalled track's last frame and the current one, which the consecutive
-            # matrices above do not contain. Computed on demand, so a run with no
-            # broken tracks pays nothing (§P1-10).
             affinity_fn=lambda fa, fb: (
                 self.affinity.matrix(
                     regions_by_frame[fa], regions_by_frame[fb], latent_flows.get(fa)
@@ -97,39 +63,31 @@ class TubeBuilder:
         states = self.update(tubes, latent_flow_by_frame=latent_flows)
         return tubes, states, latent_flows
 
-    # ------------------------------------------------------------------ #
-    # Cheap per-step state update
-    # ------------------------------------------------------------------ #
-
     def update(
         self,
         tubes: List[SemanticTube],
         latent_flow_by_frame: Optional[Dict[int, Tensor]] = None,
         causal_values: Optional[Dict[int, float]] = None,
     ) -> Dict[int, TubeState]:
-        """Refresh ``s_{k,t}`` for all tubes (cheap; called every step)."""
+        """Refresh tube states for one step."""
         return self.state.encode_all(tubes, latent_flow_by_frame, causal_values)
 
-    # ------------------------------------------------------------------ #
-    # Flow helpers
-    # ------------------------------------------------------------------ #
-
     def _latent_flows(self, frames_rgb: Tensor, grid: TokenGrid) -> Dict[int, Tensor]:
-        """Compute pixel RAFT flow per consecutive pair, down-sampled to latent res."""
+        """Compute latent-resolution flow per frame pair."""
         flows: Dict[int, Tensor] = {}
         f = frames_rgb.shape[0]
         for a in range(f - 1):
-            pix = self.perception.optical_flow(frames_rgb[a], frames_rgb[a + 1])  # [2,Hp,Wp]
+            pix = self.perception.optical_flow(frames_rgb[a], frames_rgb[a + 1])
             flows[a] = self._downsample_flow(pix, grid)
         return flows
 
     @staticmethod
     def _downsample_flow(pixel_flow: Tensor, grid: TokenGrid) -> Tensor:
-        """``[2, Hp, Wp]`` pixel flow → ``[2, H_l, W_l]`` latent flow (vectors rescaled)."""
+        """Down-sample pixel flow to latent resolution."""
         _, hp, wp = pixel_flow.shape
         down = F.interpolate(
             pixel_flow[None], size=(grid.h, grid.w), mode="bilinear", align_corners=False
         )[0]
-        down[0] *= grid.h / hp  # dy scaled to latent rows
-        down[1] *= grid.w / wp  # dx scaled to latent cols
+        down[0] *= grid.h / hp
+        down[1] *= grid.w / wp
         return down

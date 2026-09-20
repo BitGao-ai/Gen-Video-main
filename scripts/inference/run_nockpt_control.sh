@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # No-checkpoint control run: same accelerated inference as run_stage_b_probe.sh
-# but with cold-start (untrained) plugins — discriminates "engine base path
-# corruption" from "Stage-B-checkpoint-driven corruption". Expectation per the
-# allocator analysis: cold-start also stays at the prior action plan, so a
-# mosaic here too would confirm the engine base path (splice/priors) as the
-# corruptor rather than the checkpoint.
+# but with cold-start (untrained) plugins, to isolate whether artifacts come from
+# the engine base path or from the Stage-B checkpoint.
 # Preview: DRY_RUN=1 bash scripts/inference/run_nockpt_control.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."

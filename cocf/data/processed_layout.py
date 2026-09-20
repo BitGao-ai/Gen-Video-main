@@ -1,32 +1,9 @@
-"""Six-level processed-data layout — ``LCOCF_OpenVid1M_Processed`` (§3).
+"""Six-level processed-data layout for ``LCOCF_OpenVid1M_Processed``.
 
-A single helper that owns *every* path plus the small index/stat readers-writers,
-so Stage A (the writer) and Stages B/C (the readers) never hard-code a path. The
-tree matches the design document's §3 diagram verbatim::
-
-    LCOCF_OpenVid1M_Processed/
-    ├── metadata/                  # 一级 global indices (lightweight, no big files)
-    │     raw_dataset_index.csv     video_id ─ path ─ basic info        (§1.1)
-    │     filtered_final.csv        final kept samples + scene/quality   (§2.4)
-    │     sample_index.csv          sample_id, video_id, timestep, action, scene
-    │     tube_meta.csv             per-tube metadata
-    │     norm_stats.json           min-max feature normalisation stats  (§1.6)
-    ├── raw_filtered/              # 二级 kept raw clips + captions       (Stage C)
-    │     vid_000001.mp4 …          captions.jsonl
-    ├── full_baseline/vid_000001/  # 三级 teacher forward, bucketed by video_id
-    │     text_emb.npy              z_t_sampled/{t_05,t_25,t_45}.npy
-    │     Y_full.npy                kv_cache/
-    ├── tube_causal_features/vid_000001/   # 四级 tube + causal features
-    │     tube_features.npy  tube_states.npy  causal_strength.npy  tube_visual_emb.npy
-    ├── counterfactual_lmdb/       # 五级 counterfactual training samples (Stage B)
-    │     data.mdb  lock.mdb
-    └── splits/                    # 六级 video_id-disjoint dataset splits
-          train_list.txt  val_list.txt  test_hard_list.txt
-
-Heavy per-video arrays are stored as ``.npy`` (numpy); the small indices are CSV /
-JSON so dataset statistics and sampling configuration never require reading a big
-file (§3 "元数据独立管理"). The actual counterfactual samples live in the LMDB
-store (:mod:`cocf.data.sample_store`), not here.
+Owns every store path plus the small index/stat readers-writers, so Stage A (the
+writer) and Stages B/C (the readers) never hard-code a path. Heavy per-video arrays
+are stored as ``.npy``; small indices are CSV/JSON. Counterfactual samples live in the
+LMDB store (:mod:`cocf.data.sample_store`).
 """
 
 from __future__ import annotations
@@ -46,7 +23,7 @@ from cocf.common.logging import get_logger
 Tensor = torch.Tensor
 _log = get_logger(__name__)
 
-# Canonical column order for ``sample_index.csv`` (the §4.1 read entry point).
+# Canonical column order for ``sample_index.csv``.
 SAMPLE_INDEX_FIELDS: Sequence[str] = (
     "sample_id",
     "video_id",
@@ -57,18 +34,14 @@ SAMPLE_INDEX_FIELDS: Sequence[str] = (
 
 
 def video_id_str(video_id) -> str:
-    """Normalise a video id to the on-disk bucket name ``vid_000001``.
-
-    Accepts an int (``1`` → ``vid_000001``) or an already-formatted string
-    (``"vid_000001"`` / ``"000001"``) so callers can pass either freely.
-    """
+    """Normalise a video id to the on-disk bucket name ``vid_000001``."""
     if isinstance(video_id, str):
         s = video_id
         if s.startswith("vid_"):
             return s
         if s.isdigit():
             return f"vid_{int(s):06d}"
-        return s  # already an arbitrary stable id (e.g. an OpenVid file stem)
+        return s  # already an arbitrary stable id
     return f"vid_{int(video_id):06d}"
 
 
@@ -131,8 +104,7 @@ class ProcessedLayout:
 
     @property
     def stage_a_env(self) -> Path:
-        """Backbone geometry / schedule the store was generated with (see
-        :meth:`write_stage_a_env`)."""
+        """Backbone geometry / schedule the store was generated with."""
         return self.metadata_dir / "stage_a_env.json"
 
     @property
@@ -169,13 +141,7 @@ class ProcessedLayout:
 
     @property
     def text_embed_dir(self) -> Path:
-        """One prompt embedding per *clip* — not per counterfactual sample.
-
-        The umT5 sequence is a property of the caption, so storing it inside every
-        (tube, step, action) record duplicated a ~8 MiB tensor 15× per clip: ~21 TiB
-        at the §2.4 target of 180k clips, before any of it is read. Stage B joins it
-        back by ``video_id`` at load time.
-        """
+        """One prompt embedding per clip (not per counterfactual sample)."""
         return self.root / "text_embeds"
 
     def text_embed_path(self, video_id) -> Path:
@@ -192,21 +158,7 @@ class ProcessedLayout:
         kv_cache: Optional[Mapping[str, Tensor]] = None,
         y_full_dtype: Optional[np.dtype] = np.float16,
     ) -> Path:
-        """Write the §3 level-3 ``full_baseline/vid_XXXXXX/`` bucket for one video.
-
-        ``Y_full`` dominates the bucket — 49×384×640 is 144 MB in fp32 and this is the
-        per-clip cost of the whole ~TB-scale level-3 store — so it is stored in fp16 by
-        default. It is only ever read as a *reference video* (Stage C's L1 and §6.3.2
-        feature distances, both of which upcast), never re-entered into a trajectory, so
-        the half-precision round trip is below the noise floor of the comparison. The
-        latents (``z_t``, ``z_init``) stay fp32: those *are* re-entered, and Stage C's
-        cached-baseline path is only valid if the noise it replays is bit-comparable.
-
-        ``text_emb`` is optional and off by default: the prompt embedding is per-clip
-        data and lives in ``text_embeds/<video_id>.pt``, trimmed to its real length and
-        in fp16 (see :attr:`text_embed_dir`). Writing the untrimmed fp32 sequence here
-        as well duplicated ~8 MiB per clip that nothing ever read.
-        """
+        """Write the ``full_baseline/vid_XXXXXX/`` bucket for one video."""
         bucket = self.baseline_bucket(video_id)
         (bucket / "z_t_sampled").mkdir(parents=True, exist_ok=True)
         if text_emb is not None:
@@ -215,8 +167,6 @@ class ProcessedLayout:
             _save_npy(bucket / "z_t_sampled" / f"t_{int(step):02d}.npy", z)
         _save_npy(bucket / "Y_full.npy", y_full, dtype=y_full_dtype)
         if z_init is not None:
-            # Y_full is only a usable reference for a run that starts from the same
-            # noise, so the two are stored together (§P2-4).
             _save_npy(bucket / "z_init.npy", z_init)
         if kv_cache:
             kv_dir = bucket / "kv_cache"
@@ -242,26 +192,13 @@ class ProcessedLayout:
         return _load_npy(path, device)
 
     def has_y_full(self, video_id) -> bool:
-        """Whether this video's ``Y_full`` was persisted — without reading it.
-
-        Lets a caller validate a whole batch's baselines before committing to the
-        render, then read only the frames it turns out to need (see ``frames`` below).
-        """
+        """Whether this video's ``Y_full`` was persisted, without reading it."""
         return (self.baseline_bucket(video_id) / "Y_full.npy").exists()
 
     def load_y_full(self, video_id, device=None, *, frames=None) -> Optional[Tensor]:
-        """Load the §3 level-3 reference video ``Y_full`` [F,3,H,W] for Stage C.
+        """Load the reference video ``Y_full`` [F,3,H,W] for Stage C.
 
-        Stage C's main quality loss compares the accelerated render against this
-        full-compute baseline (§4.2 主损失). Returns ``None`` when the video's
-        baseline bucket was not persisted (the sample is then trained on the
-        regularisers only).
-
-        ``frames=(start, stop)`` reads only that half-open frame range, memory-mapped,
-        so the ~72 MB fp16 clip never lands on the device in full. Stage C's
-        differentiable decode covers a *window* of the clip (``decode_grad_frames``),
-        and the reference is cut to that same window before it is used — reading all 49
-        frames to score 5 of them was pure transfer and residency.
+        ``frames=(start, stop)`` reads only that half-open range, memory-mapped.
         """
         path = self.baseline_bucket(video_id) / "Y_full.npy"
         if not path.exists():
@@ -270,10 +207,8 @@ class ProcessedLayout:
             return _load_npy(path, device)
         start, stop = int(frames[0]), int(frames[1])
         arr = np.load(path, allow_pickle=False, mmap_mode="r")
-        # ``np.array`` (a copy), not ``ascontiguousarray``: the slice of a memmap is
-        # already contiguous, so the latter hands back a read-only view of the mapping
-        # and ``torch.from_numpy`` warns about wrapping a non-writable buffer — and the
-        # tensor would keep the whole file mapped for as long as it lives.
+        # Copy via ``np.array``: a memmap slice is already contiguous, so
+        # ``ascontiguousarray`` would hand back a read-only view of the mapping.
         window = np.array(arr[start:stop])
         t = torch.from_numpy(window)
         return t.to(device) if device is not None else t
@@ -287,7 +222,7 @@ class ProcessedLayout:
         causal_strength: Tensor,
         tube_visual_emb: Tensor,
     ) -> Path:
-        """Write the §3 level-4 ``tube_causal_features/vid_XXXXXX/`` bucket."""
+        """Write the ``tube_causal_features/vid_XXXXXX/`` bucket."""
         bucket = self.feature_bucket(video_id)
         bucket.mkdir(parents=True, exist_ok=True)
         _save_npy(bucket / "tube_features.npy", tube_features)
@@ -311,13 +246,7 @@ class ProcessedLayout:
 
     def write_csv(self, path: Path, rows: Sequence[Mapping[str, object]],
                   fieldnames: Optional[Sequence[str]] = None) -> Path:
-        """Write a list-of-dicts to ``path`` as CSV (fieldnames inferred if absent).
-
-        Published by an atomic rename, so a concurrent reader sees either the previous
-        file or the complete new one — never a half-written prefix. The workers of a
-        sharded Stage-A run poll ``filtered_final.csv`` to pick up shard 0's filter
-        decision, and a large CSV spends a long time being partially on disk.
-        """
+        """Write a list-of-dicts to ``path`` as CSV via atomic rename."""
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = list(rows)
         if fieldnames is None:
@@ -350,7 +279,7 @@ class ProcessedLayout:
     def write_tube_meta(self, rows: Sequence[Mapping[str, object]]) -> Path:
         return self.write_csv(self.tube_meta, rows)
 
-    # -- norm stats (§1.6) ---------------------------------------------- #
+    # -- norm stats ----------------------------------------------------- #
 
     def write_norm_stats(self, stats: Mapping[str, object]) -> Path:
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -364,24 +293,10 @@ class ProcessedLayout:
         with open(self.norm_stats, "r", encoding="utf-8") as fh:
             return json.load(fh)
 
-    # -- Stage-A generation environment (cross-stage geometry contract) --- #
+    # -- Stage-A generation environment --------------------------------- #
 
     def write_stage_a_env(self, env: Mapping[str, object]) -> Path:
-        """Record the backbone geometry and schedule this store was generated with.
-
-        Stages B and C build their plugins from the *backbone's* token width, but
-        neither loads the backbone: Stage B runs on cached labels and defaults to the
-        mock adapter (``token_dim=32``), while Stage A's real Wan2.2-A14B gives 64. The
-        residual-repair net is sized from that number, so the mismatch produced a Stage
-        B checkpoint that could not be loaded into a Stage C running the real backbone —
-        and nothing detected it until the shapes collided.
-
-        Persisting the geometry next to the data makes it a property of the *store*
-        rather than of whichever command line ran last, which is what the two later
-        stages actually need to agree with. Also carries the resolution and teacher
-        step count, because Stage C's target is the ``Y_full`` rendered here and both
-        must match for the comparison to mean anything.
-        """
+        """Record the backbone geometry and schedule this store was generated with."""
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         with open(self.stage_a_env, "w", encoding="utf-8") as fh:
             json.dump(dict(env), fh, indent=2, ensure_ascii=False)
@@ -394,7 +309,7 @@ class ProcessedLayout:
         with open(self.stage_a_env, "r", encoding="utf-8") as fh:
             return json.load(fh)
 
-    # -- splits (§3 level-6, video_id-disjoint) ------------------------- #
+    # -- splits --------------------------------------------------------- #
 
     def write_splits(
         self,
@@ -423,8 +338,7 @@ class ProcessedLayout:
 
 def _to_numpy(x: Tensor, dtype: Optional[np.dtype] = None) -> np.ndarray:
     if isinstance(x, torch.Tensor):
-        # ``.float()`` first unconditionally: numpy has no bfloat16, which is the dtype
-        # every real backbone hands us, so a direct ``.numpy()`` raises.
+        # ``.float()`` first: numpy has no bfloat16, which real backbones emit.
         arr = x.detach().to("cpu").float().numpy()
     else:
         arr = np.asarray(x)

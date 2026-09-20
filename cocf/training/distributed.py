@@ -1,34 +1,14 @@
-"""Optional data-parallel support for Stage C (§4.2), as a set of no-ops when single-process.
+"""Optional data-parallel support for Stage C; a set of no-ops when single-process.
 
-Stage C's forward is not a single ``nn.Module.forward``: one step runs the whole
-accelerated engine (20 denoise steps, tube segmentation, a windowed differentiable
-decode) and then several losses over a handful of small plugins. ``DistributedDataParallel``
-cannot wrap that — it hooks one module's autograd graph and expects every rank to
-traverse it identically — so this module implements the two pieces DDP would have
-provided, directly:
+Stage C's step runs the whole accelerated engine plus several plugin losses, so it
+cannot be wrapped in ``DistributedDataParallel``. This module provides the two pieces
+DDP would have supplied directly: gradient averaging (:func:`average_gradients`) and
+replica agreement (:func:`broadcast_parameters`). Every helper degrades to a no-op when
+the process was not launched under ``torchrun``; :func:`context` reads
+``torch.distributed``'s own state, so a single-process run is unaffected.
 
-    * **gradient averaging** — :func:`average_gradients`, an all-reduce over the
-      ~7M trainable parameters after ``backward()``. That is the whole communication
-      cost: the 27B frozen backbone never has a gradient, so a Stage-C step moves
-      ~28 MB over the interconnect regardless of how big the model is.
-    * **replica agreement** — :func:`broadcast_parameters` before the first step, so a
-      layer that was *re-initialised* rather than restored (a shape-mismatched
-      ``vis_proj``, a freshly injected LoRA) is identical on every rank rather than
-      silently diverging into eight different models.
-
-Everything here degrades to a no-op when the process was not launched under
-``torchrun`` — :func:`context` reads ``torch.distributed``'s own state rather than a
-module global, so a single-process run behaves exactly as it did before this file
-existed, with no flag to remember and no state to reset between runs.
-
-Launch (8 GPUs, one process each)::
-
-    torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_c.py ...
-
-The caller is responsible for two things this module cannot do for it: giving every
-rank the *same* seed (so the plugins start identical) and a *different* data shard
-(``DistributedSampler``). Both are wired up in ``scripts/train/train_stage_c.py`` and
-:meth:`cocf.training.stage_c_finetune.FinettuneStage.run`.
+The caller must give every rank the same seed and a different data shard
+(``DistributedSampler``).
 """
 
 from __future__ import annotations
@@ -48,9 +28,6 @@ Tensor = torch.Tensor
 _log = get_logger(__name__)
 
 # Ceiling on how long a rank waits inside a collective before the backend gives up.
-# The default is 30 minutes, which is how a job whose rank 3 died on an OOM keeps
-# eight cards at 100% utilisation for half an hour with nothing in the log. A Stage-C
-# step is minutes long, so this is comfortably above any legitimate skew.
 _COLLECTIVE_TIMEOUT = timedelta(minutes=15)
 
 __all__ = [
@@ -93,10 +70,9 @@ def _env_int(name: str, default: int = 0) -> int:
 def context() -> DistContext:
     """The current context, derived from ``torch.distributed``'s own state.
 
-    Stateless on purpose: there is no module-level flag that could go stale between a
-    pipeline's stages or be left set by a previous run in the same process (a test
-    suite, a notebook). If the process group is not initialised, this is the
-    single-process context and every helper below short-circuits.
+    Stateless on purpose, so no module-level flag can go stale between runs. When the
+    process group is not initialised this is the single-process context and every
+    helper short-circuits.
     """
     if dist.is_available() and dist.is_initialized():
         return DistContext(
@@ -120,14 +96,9 @@ def _device_index(device: str, default: int) -> int:
 def init_distributed(device: str = "cuda") -> DistContext:
     """Join the process group when launched under ``torchrun``; otherwise do nothing.
 
-    Detection is ``WORLD_SIZE > 1`` in the environment, which is what ``torchrun``
-    sets and what nothing else does — so a normal ``python scripts/...`` invocation
-    takes the single-process path with no flag and no risk of a hung collective.
-
-    The backend follows the device: NCCL for CUDA (the only sane choice for a
-    gradient all-reduce between GPUs), Gloo otherwise so a CPU smoke test can still
-    exercise this path. ``torch.cuda.set_device`` is called *here*, before any weight
-    is built, because everything downstream resolves "cuda" against the current device.
+    Detection is ``WORLD_SIZE > 1`` in the environment. The backend follows the device:
+    NCCL for CUDA, Gloo otherwise. ``torch.cuda.set_device`` is called here, before any
+    weight is built.
     """
     world_size = _env_int("WORLD_SIZE", 1)
     if world_size <= 1:
@@ -138,16 +109,13 @@ def init_distributed(device: str = "cuda") -> DistContext:
             "running as a single process (ranks will NOT share gradients).", world_size,
         )
         return DistContext()
-    if dist.is_initialized():  # already joined (nested call) — reuse it
+    if dist.is_initialized():  # already joined (nested call)
         return context()
 
     local_rank = _env_int("LOCAL_RANK", 0)
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if use_cuda:
-        # Follow an *explicit* index when the caller gave one ("--device cuda:2", the
-        # paired-GPU layout where rank r computes on 2r and parks on 2r+1). Setting the
-        # current device to LOCAL_RANK there would leave every implicit allocation —
-        # NCCL's buffers included — on a card this rank does not compute on.
+        # Follow an explicit index when the caller gave one (e.g. "--device cuda:2").
         torch.cuda.set_device(_device_index(device, local_rank))
     dist.init_process_group(backend="nccl" if use_cuda else "gloo",
                             timeout=_COLLECTIVE_TIMEOUT)
@@ -167,12 +135,7 @@ def shutdown() -> None:
 
 
 def resolve_device(device: str, ctx: Optional[DistContext] = None) -> str:
-    """Pin a bare ``"cuda"`` to *this rank's* card; leave anything explicit alone.
-
-    ``torchrun`` gives each process a ``LOCAL_RANK`` and expects it to use that device.
-    A device string that already names an index (``cuda:2``) or another backend
-    (``cpu``) is the caller being deliberate and is returned untouched.
-    """
+    """Pin a bare ``"cuda"`` to this rank's card; leave anything explicit alone."""
     ctx = ctx or context()
     if not ctx.enabled or device != "cuda" or not torch.cuda.is_available():
         return device
@@ -183,19 +146,10 @@ def average_gradients(params: Sequence[torch.nn.Parameter],
                       ctx: Optional[DistContext] = None) -> None:
     """All-reduce ``params``' gradients to their mean across ranks (DDP semantics).
 
-    Called after ``backward()`` and **before** gradient clipping, so every rank clips
-    the same averaged gradient and therefore takes an identical optimiser step.
-
-    A parameter whose gradient is ``None`` on this rank (its branch of the §4.2 loss
-    did not fire this batch — a repair that never triggered, a tube set with no
-    alignment term) is given an explicit zero first. Skipping it instead would make
-    ranks disagree about *which* tensors take part in the collective, and a mismatched
-    all-reduce order does not error — it hangs.
-
-    The gradients are flattened into one buffer for the collective. The payload is the
-    same ~28 MB either way, but Stage B's step is milliseconds long, so paying one
-    NCCL launch instead of one per tensor is the difference between communication
-    being free and being the bottleneck.
+    Called after ``backward()`` and before gradient clipping. A parameter with a
+    ``None`` gradient is given an explicit zero so every rank agrees on which tensors
+    take part in the collective. Gradients are flattened into one buffer for a single
+    NCCL launch.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
@@ -218,12 +172,9 @@ def broadcast_parameters(tensors: Iterable[Tensor],
                          ctx: Optional[DistContext] = None, *, src: int = 0) -> int:
     """Copy rank ``src``'s weights over every other rank's, in place. Returns the count.
 
-    Ranks start from the same seed and the same checkpoint, so in the normal case this
-    changes nothing. It exists for the case where they do *not*: a checkpoint tensor
-    dropped on a shape mismatch and re-initialised, a LoRA adapter injected after the
-    load, a plugin added to the accelerator later. Data parallelism silently computes
-    nonsense if the replicas differ, and the cost of ruling that out is one 28 MB
-    broadcast per run.
+    Ranks normally start identical; this covers layers re-initialised on a shape
+    mismatch, injected LoRA, or plugins added after the load, which would otherwise
+    silently diverge across replicas.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
@@ -237,18 +188,11 @@ def broadcast_parameters(tensors: Iterable[Tensor],
 
 
 def assert_same(value: int, what: str, ctx: Optional[DistContext] = None) -> None:
-    """Fail loudly, now, if ``value`` differs across ranks.
+    """Fail loudly if ``value`` differs across ranks.
 
-    Everything in this module assumes the ranks agree on *how many* collectives a step
-    performs and *in what order*: :func:`average_gradients` walks one parameter list,
-    and the epoch loop performs one all-reduce per batch. If two ranks disagree on the
-    length of that list or the number of batches, nothing raises — the shorter rank
-    simply stops calling, and the others block in a collective until the job is killed
-    hours later with no diagnostic at all.
-
-    So the two quantities that could differ (trainable-parameter count, batch count)
-    are checked once, up front, where the failure can name itself. The check is itself
-    a collective and must therefore be called by **every** rank, unconditionally.
+    Checks the two quantities that could differ (trainable-parameter count, batch
+    count) up front, so a mismatch names itself instead of deadlocking in a later
+    collective. This is itself a collective and must be called by every rank.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
@@ -284,12 +228,8 @@ def all_reduce_min(value: float, ctx: Optional[DistContext] = None,
                    device: Optional[torch.device] = None) -> float:
     """Smallest ``value`` across ranks — for settings that MUST agree.
 
-    Stage C's batch size is the case that matters: it is clamped per rank against that
-    card's free VRAM, and a rank whose card has slightly less free memory (a display
-    attached, a stray process) would clamp lower, take fewer batches per epoch, and
-    reach the end of its shard while the others are still calling all-reduce. That
-    does not fail — it hangs. Taking the minimum makes the whole job use the batch
-    size the smallest card can hold.
+    Used for Stage C's per-rank VRAM-clamped batch size so the whole job adopts the
+    size the smallest card can hold and no rank runs out of batches early.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
@@ -299,11 +239,7 @@ def all_reduce_min(value: float, ctx: Optional[DistContext] = None,
 
 def all_reduce_mean(value: float, ctx: Optional[DistContext] = None,
                     device: Optional[torch.device] = None) -> float:
-    """Mean of a scalar across ranks — for logged losses and best-checkpoint decisions.
-
-    Both uses need every rank to agree: a per-rank epoch mean would make rank 3 keep a
-    "best" checkpoint that rank 0 discarded, on a shard the other ranks never saw.
-    """
+    """Mean of a scalar across ranks — for logged losses and best-checkpoint decisions."""
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:
         return float(value)
@@ -312,16 +248,11 @@ def all_reduce_mean(value: float, ctx: Optional[DistContext] = None,
 
 def all_agree(ok: bool, ctx: Optional[DistContext] = None,
               device: Optional[torch.device] = None) -> bool:
-    """``True`` only when **every** rank passed ``ok=True``.
+    """``True`` only when every rank passed ``ok=True``.
 
-    The counterpart to :func:`assert_same` for failures that are local by nature: a
-    per-clip OOM, a reference whose geometry does not match, an unreadable baseline.
-    Such a rank cannot simply skip its batch — the others would block forever in the
-    next gradient all-reduce — and it cannot raise either, for the same reason. Turning
-    the local outcome into a shared one lets all ranks skip the batch *together*,
-    keeping the collective sequence identical.
-
-    This is itself a collective, so it must be called unconditionally by every rank.
+    Turns a locally-failing batch (OOM, geometry mismatch, unreadable baseline) into a
+    shared decision so all ranks skip it together and keep the collective sequence
+    identical. This is itself a collective and must be called by every rank.
     """
     ctx = ctx or context()
     if not ctx.enabled or ctx.world_size == 1:

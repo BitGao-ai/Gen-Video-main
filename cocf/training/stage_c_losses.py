@@ -1,36 +1,20 @@
-"""Stage-C end-to-end fine-tune losses — ``L_total`` over one accelerated render (§4.2).
+"""Stage-C end-to-end fine-tune losses: ``L_total`` over one accelerated render.
 
-Stage C runs the *full accelerated pipeline* on a real caption and tunes the
-differentiable plugins (and an optional LoRA) against the full-compute baseline
-``Y_full``. Its objective mirrors the design's §4.2 loss split::
+The pure realisation of the Stage-C objective (no IO, no optimiser, no loop), keeping
+:mod:`cocf.training.stage_c_finetune` to orchestration::
 
-    L_total = λ_pixel·L_pixel + λ_quality·L_cmsc          ← 主损失 (vs Y_full)
-            + λ_sta·L_tube + λ_cert·L_cert + λ_cost·L_budget  ← 正则 (reuse Stage B)
+    L_total = λ_pixel·L_pixel + λ_quality·L_cmsc              (main loss vs Y_full)
+            + λ_sta·L_tube + λ_cert·L_cert + λ_cost·L_budget  (regularisers, reuse B)
 
-This module is the *pure* realisation of that objective — no IO, no optimiser, no
-loop — so it is unit-testable in isolation and keeps :mod:`cocf.training.stage_c_finetune`
-to pure orchestration (the same split Stage B uses between ``stage_b_joint`` and
-``stage_b_losses``). Two groups of helpers:
+The main quality loss is :func:`pixel_quality_loss` plus :func:`cmsc_quality_loss` over
+a pair of :class:`~cocf.cmsc.losses.CMSCObservation`s built by
+:func:`build_cmsc_observation`. :func:`stage_c_regularizers` recomputes the predictor
+μ/σ with the differentiable causal strength and reuses the Stage-B building blocks so
+the scheduling logic stays calibrated.
 
-    main quality   :func:`pixel_quality_loss` (像素) and :func:`cmsc_quality_loss`
-                   over a pair of :class:`~cocf.cmsc.losses.CMSCObservation`s
-                   (语义 / 文本对齐), built by :func:`build_cmsc_observation` from the
-                   shared :class:`MetricExtractor` + per-tube CLIP embeds. The single
-                   differentiable CMSC objective serves *both* the §4.2 main-loss
-                   "语义/文本对齐" role and the §4.2 CMSC-regulariser role (not double
-                   counted).
-    regularizes   :func:`stage_c_regularizers` recomputes the predictor μ/σ with the
-                   *differentiable* causal strength (exactly as Stage B does) over the
-                   per-step (tube,step) records collected during the forward, then
-                   reuses the Stage-B building blocks verbatim — :func:`action_probs`,
-                   :func:`tube_temporal_smoothness`, :func:`budget_penalty` and the RAEC
-                   certificate hinge — so the scheduling logic is kept calibrated and
-                   does not drift (§4.2 "保证调度逻辑不偏移").
-
-Gradient targets reached (§4.2 梯度回传范围): the pixel term trains the residual-repair
-net (+ optional LoRA, both on the latent→render path); the CMSC term trains the text↔tube
-alignment; the regularisers train the damage predictor, the three strength weights and the
-certificate coefficients. The frozen backbone is never on the optimised path.
+Gradient targets: the pixel term trains the residual-repair net (+ optional LoRA); the
+CMSC term trains the text-tube alignment; the regularisers train the damage predictor,
+strength weights and certificate coefficients. The frozen backbone is never optimised.
 """
 
 from __future__ import annotations
@@ -56,24 +40,21 @@ from cocf.training.stage_b_losses import (
 
 Tensor = torch.Tensor
 
-# tube-state vector indices feeding the certificate (the 7-dim s_{k,t}); same source
-# Stage B uses, so the certificate sees identical inputs at both stages (no skew).
+# tube-state vector indices feeding the certificate; same source Stage B uses.
 _BOUNDARY_IDX = TUBE_STATE_FIELDS.index("boundary_uncertainty")
 _AGE_IDX = TUBE_STATE_FIELDS.index("anchor_age")
 
 
 # --------------------------------------------------------------------------- #
-# main quality loss — Y_acc vs Y_full (§4.2 主损失)
+# main quality loss — Y_acc vs Y_full
 # --------------------------------------------------------------------------- #
 
 
 def pixel_quality_loss(y_acc: Tensor, y_full: Tensor) -> Tensor:
-    """Frame-aligned L1 between the accelerated and full-compute renders (§4.2 像素).
+    """Frame-aligned L1 between the accelerated and full-compute renders.
 
-    Both are ``[F, 3, H, W]`` in [0,1]. Frame counts are aligned to the common
-    minimum (the two decode paths share a grid, so they normally match; this guards
-    a real causal-temporal VAE that expands slots differently). Differentiable
-    through ``y_acc`` — the gradient path to the residual-repair net and LoRA.
+    Both are ``[F, 3, H, W]`` in [0,1]; frame counts are aligned to the common
+    minimum. Differentiable through ``y_acc``.
     """
     f = min(y_acc.shape[0], y_full.shape[0])
     if f == 0:
@@ -110,50 +91,22 @@ def build_cmsc_observation(
     frame_span=None,
     full_frame_count=None,
 ) -> CMSCObservation:
-    """Assemble a :class:`CMSCObservation` from a rendered clip (§6 features).
+    """Assemble a :class:`CMSCObservation` from a rendered clip.
 
-    Populates, per §6.3.2:
+    Populates global ``video`` features, per-tube CLIP ``tube_embeds``, per-tube DINO
+    ``tube_identity`` and latent-mask ``tube_centroid``. ``tube_boundary`` is left
+    empty (no boundary descriptor exists, so ``L_bnd`` stays zero).
 
-    ``video``          global DINO/CLIP/RAFT/OCR :class:`VideoFeatures` → ``L_motion``,
-                       ``L_ocr``.
-    ``tube_embeds``    per-tube CLIP visual embeds via the shared
-                       :func:`~cocf.lcocf.data.tube_clip_embed`, so they match what
-                       Stage A and inference produce → ``L_align``.
-    ``tube_identity``  per-tube DINO identity, obtained by handing the extractor each
-                       tube's pixel mask → ``L_id``. This is the term §6.3.2 defines as
-                       ``Σ_k [1 − cos(DINO(Y_full, g_k), DINO(Y_fast, g_k))]``, i.e.
-                       explicitly *per tube* — a global feature cannot stand in for it,
-                       and leaving the field empty made ``L_id`` structurally zero. It
-                       costs one identity pass per tube per observation, which is the
-                       documented price of a localised label (§7.1.1).
-    ``tube_centroid``  latent-mask centroids → ``L_spatial``.
-
-    ``tube_boundary`` is left empty: no boundary descriptor is extracted anywhere in
-    the framework, so ``L_bnd`` (weight 0.05, marked optional in §6.3.2) stays zero
-    until one exists. ``L_spatial`` is likewise inert whenever the caller passes the
-    *same* tube set for both observations — the engine segments once, off the
-    accelerated render — and becomes informative only if the full render is segmented
-    separately. Both are stated here rather than silently contributing nothing.
-
-    ``differentiable`` **must** be set on the accelerated branch. The extractor
-    defaults to a ``no_grad`` path — the right one for the detached reference — and a
-    caller that forgets the flag gets an ``accel`` observation with no autograd graph,
-    so the §6.3.2 loss trains nothing while every log line looks healthy. That is the
-    exact failure :meth:`ModelMetricExtractor._prep` and
-    :meth:`InferenceEngine._warn_if_no_graph` exist to warn about, so it is a
-    parameter here rather than an assumption. Both branches are extracted with
-    ``offload=False``: the reference is detached but still has to sit on the render's
-    device to be compared against it.
+    ``differentiable`` must be set on the accelerated branch so the CMSC loss has an
+    autograd graph; both branches are extracted with ``offload=False`` so they stay on
+    the render's device for the element-wise comparison.
     """
     tube_masks = {t.tube_id: tube_pixel_mask(video_fchw, t, grid,
                   frame_span=frame_span, full_frame_count=full_frame_count) for t in tubes}
     feats = metric_extractor.extract(
         video_fchw, prompt, differentiable=differentiable, tube_masks=tube_masks,
-        # Both observations this builds are compared element-wise on the render's
-        # device — by ``CMSCLoss`` and by ``MultiDimDamageComputer`` — so neither may
-        # be parked on CPU. The reference branch still runs ``no_grad``; only the
-        # offload is declined. See the ``offload`` contract on
-        # :meth:`~cocf.lcocf.damage.MetricExtractor.extract`.
+        # Both observations are compared element-wise on the render's device, so
+        # neither may be parked on CPU.
         offload=False,
     )
     tube_embeds = {
@@ -176,10 +129,9 @@ def build_cmsc_observation(
 def cmsc_quality_loss(
     cmsc_loss, full_obs: CMSCObservation, accel_obs: CMSCObservation
 ) -> Tuple[Tensor, Dict[str, float]]:
-    """The §6 multi-dimensional conservation loss between the full & accel renders.
+    """The multi-dimensional conservation loss between the full & accel renders.
 
-    Thin wrapper over :meth:`CMSCLoss.forward` so the stage stays orchestration-only;
-    returns ``(scalar, per-term components)``. Trains the text↔tube alignment.
+    Thin wrapper over :meth:`CMSCLoss.forward`; returns ``(scalar, per-term components)``.
     """
     return cmsc_loss(full_obs, accel_obs)
 
@@ -193,10 +145,9 @@ def cmsc_quality_loss(
 class StepRecord:
     """One (tube, step) observation from the Stage-C accelerated forward.
 
-    Carries exactly the inputs the regularisers re-run the predictor and the
-    certificate on — no μ/σ is stored, because :func:`stage_c_regularizers` recomputes
-    them with the *grad-on* causal strength (the detached strengths used for allocation
-    would not train the strength weights).
+    Carries the inputs the regularisers re-run the predictor and certificate on; no
+    μ/σ is stored because :func:`stage_c_regularizers` recomputes them with the
+    grad-on causal strength.
     """
 
     tube_features: Tensor      # [7] tube state vector s_{k,t}
@@ -215,9 +166,8 @@ class StepRecord:
 def collate_step_records(records: Sequence[StepRecord]) -> Dict[str, object]:
     """Stack per-(tube,step) records into a pseudo-batch (keys ≡ Stage-B batch fields).
 
-    The result feeds :func:`stage_c_regularizers` and the reused Stage-B helpers
-    (:func:`tube_temporal_smoothness` reads ``video_id``/``tube_id``/``timestep``;
-    the predictor reads the stacked feature tensors). Empty input → ``{}``.
+    Feeds :func:`stage_c_regularizers` and the reused Stage-B helpers. Empty input
+    yields ``{}``.
     """
     if not records:
         return {}
@@ -243,7 +193,7 @@ def collate_step_records(records: Sequence[StepRecord]) -> Dict[str, object]:
 
 
 # --------------------------------------------------------------------------- #
-# regularisers — reuse the Stage-B terms (§4.2 正则项)
+# regularisers — reuse the Stage-B terms
 # --------------------------------------------------------------------------- #
 
 
@@ -254,23 +204,12 @@ def stage_c_regularizers(
     *,
     training_cfg: Optional[TrainingConfig] = None,
 ) -> Tuple[Tensor, Dict[str, float]]:
-    """Stage-B-style scheduling regularisers over the collected forward records (§4.2).
+    """Stage-B-style scheduling regularisers over the collected forward records.
 
-    Recomputes the predictor ``μ/σ`` with the differentiable causal strength
-    ``s = α·s_E+β·s_A+γ·s_T`` (so the strength weights train, exactly as in
-    :func:`cocf.training.stage_b_losses.compute_joint_loss`), then assembles::
-
-        λ_sta·L_tube + λ_cert·L_cert + λ_cost·L_budget
-
-    * ``L_tube``   action-probability temporal smoothness across a tube's adjacent
-                   steps (the same tube recurs every accelerated step here).
-    * ``L_cert``   certificate ``E_cert(μ,σ,boundary,age)`` calibrated to upper-bound
-                   the *realised* end-to-end damage of this render (detached target).
-    * ``L_budget`` expected per-action compute cost vs the dynamic budget ``B_t``.
-
-    ``measured_damage`` is the realised scalar (or ``[M]``) damage of ``Y_acc`` vs
-    ``Y_full`` — the certificate's calibration target. Returns ``(reg_total, comps)``;
-    ``reg_total`` carries ``grad_fn``. Empty batch → ``(0, zeros)``.
+    Recomputes the predictor ``μ/σ`` with the differentiable causal strength, then
+    assembles ``λ_sta·L_tube + λ_cert·L_cert + λ_cost·L_budget``. ``measured_damage``
+    is the realised damage of ``Y_acc`` vs ``Y_full`` (the certificate's calibration
+    target). Returns ``(reg_total, comps)``; empty batch yields ``(0, zeros)``.
     """
     cfg = training_cfg or accelerator.config.training
     device = next(accelerator.parameters()).device
@@ -308,10 +247,7 @@ def stage_c_regularizers(
     l_budget = budget_penalty(probs, action_cost, budget)
 
     # L_cert — certificate calibrated to the realised render damage. ``residual`` and
-    # ``local_cmsc`` are the values the engine actually measured this step (captured by
-    # ``record_sink``), not the hard zeros this used to pass: calibrating E_cert against
-    # the full damage while omitting two of its terms pushes the remaining coefficients
-    # up to compensate, undoing the calibration Stage B learned.
+    # ``local_cmsc`` are the values the engine measured this step (via ``record_sink``).
     idx = actions.clamp(0, pred.mu.shape[-1] - 1).unsqueeze(-1)
     mu_a = pred.mu.gather(-1, idx).squeeze(-1)                        # [M]
     sigma_a = pred.sigma.gather(-1, idx).squeeze(-1)                  # [M]

@@ -1,23 +1,4 @@
-"""Shared CLI → VRAM-policy plumbing for the Stage-A / Stage-B / Stage-C entry points.
-
-The three stages have to agree on more than they look like they do:
-
-* **Geometry.** Stage C's quality loss compares its accelerated render against the
-  ``Y_full`` Stage A persisted, so the two must render at the same frames/height/width
-  and the same teacher step count. A resolution flag on only one of them silently
-  produces a comparison between differently-shaped videos (Stage C then discards the
-  cached baseline and re-denoises it every batch, which is 2 extra trajectories and 2
-  extra decodes per step — a ~5× slowdown that looks like nothing at all in the log).
-* **Backbone identity.** ``--wan-variant`` maps to geometry through
-  :data:`cocf.backbones.wan22.WAN22_VARIANTS`; a variant that differs between stages
-  loads a different expert set. This module is the only place the mapping is applied.
-* **Residency policy.** The offload switches are what make a 14B-expert backbone fit on
-  a 40 GB device at all, and they were previously defined only in Stage A's argparse —
-  so Stage C had no way to express them and defaulted to the mock backbone entirely.
-
-Everything here is pure argparse/dataclass wiring, so it is testable without building
-an accelerator or touching a GPU.
-"""
+"""CLI to VRAM-policy wiring for Stage-A/B/C entry points."""
 
 from __future__ import annotations
 
@@ -35,11 +16,6 @@ from cocf.data.metrics import DEFAULT_FLOW_MAX_EDGE, DEFAULT_VIT_CHUNK
 _log = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# argparse groups
-# --------------------------------------------------------------------------- #
-
-
 def add_backbone_args(
     parser: argparse.ArgumentParser,
     *,
@@ -48,16 +24,7 @@ def add_backbone_args(
     default_wan_variant: str = "a14b-t2v",
     default_vae_tile: int = 256,
 ) -> None:
-    """Backbone selection + the §9.1 VRAM residency switches.
-
-    ``default_vae_tile`` differs per stage on purpose. Tiling bounds the *forward*
-    transient of a decode, but Stage C decodes **on the autograd graph**, so every
-    tile's intermediates are retained for backward and the peak climbs back past the
-    untiled figure — a small tile is genuinely cheaper there. Stage A's decode is
-    label-only, so it wants the largest tile its headroom allows: peak scales with
-    ``tile²`` while the tile *count* (and therefore the time) scales with ``1/tile²``,
-    and at 128 px a 384×640 clip needs 28 tiles against 8 at 256 px.
-    """
+    """Add backbone and VRAM residency arguments."""
     g = parser.add_argument_group("backbone")
     g.add_argument("--backbone", type=str, default=default_backbone,
                    help="Registry key: wan22 (primary) | wan21 | hunyuanvideo | mock")
@@ -99,8 +66,6 @@ def add_backbone_args(
                    action="store_false",
                    help="Keep BOTH Wan2.2 MoE experts resident (needs 56+ GB free). "
                         "Impossible on a 40 GB card.")
-    # The positive form is the default, and exists so a 40 GB recipe can *say* it
-    # relies on the swap instead of relying on a default the reader has to look up.
     v.add_argument("--offload-idle-expert", dest="offload_idle_expert",
                    action="store_true",
                    help="Keep only the current noise band's Wan2.2 expert resident "
@@ -126,12 +91,7 @@ def add_geometry_args(
     default_height: Optional[int] = None,
     default_width: Optional[int] = None,
 ) -> None:
-    """``--num-frames/--height/--width``. ``None`` defaults keep ``config.data``'s.
-
-    One flag set feeds both the teacher (``TeacherForwardConfig.from_config``) and the
-    real-clip reader (``DataGenerationStage._decode_clip``), because both read
-    ``config.data`` — so overriding it in one place covers the whole stage.
-    """
+    """Add geometry arguments."""
     g = parser.add_argument_group("geometry (must match across Stage A and Stage C)")
     g.add_argument("--num-frames", type=int, default=default_num_frames,
                    help="Frames per clip; must be 4k+1 for the 4x causal-temporal VAE")
@@ -144,7 +104,7 @@ def add_geometry_args(
 def add_perception_args(
     parser: argparse.ArgumentParser, *, default_frame_chunk: int
 ) -> None:
-    """Real SAM/DINOv2/CLIP/RAFT perception + damage-metric backends (§1.4/§7.1.1)."""
+    """Add real perception and metric arguments."""
     g = parser.add_argument_group("real perception / metrics")
     g.add_argument("--real-models", action="store_true",
                    help="Shorthand for --real-perception AND --real-metrics.")
@@ -193,17 +153,8 @@ def add_perception_args(
                         f"Default {DEFAULT_FLOW_MAX_EDGE}; 0 disables the cap.")
 
 
-# --------------------------------------------------------------------------- #
-# argparse → Config
-# --------------------------------------------------------------------------- #
-
-
 def is_real_gpu_backbone(args) -> bool:
-    """Whether the residency switches mean anything for this run.
-
-    The mock holds no weights, and on CPU an "offload" would be a no-op move that still
-    pays the transfer bookkeeping. ``--finalize-only`` (Stage A) forces the mock.
-    """
+    """Check if residency switches apply."""
     return (
         not getattr(args, "finalize_only", False)
         and args.backbone != "mock"
@@ -212,16 +163,7 @@ def is_real_gpu_backbone(args) -> bool:
 
 
 def resolve_vram_policy(config: Config, args, real_gpu_backbone: bool) -> None:
-    """Apply the §9.1 VRAM residency flags to ``config.backbone`` in place.
-
-    The contract that matters: **text-encoder offload, text-encoder exclusivity and VAE
-    tiling are independent**. Offload and tiling were once coupled behind a single
-    ``--offload``, which meant asking to keep the text encoder resident (a ~10 GiB
-    steady-state choice) silently also unbounded the VAE decode (a 7.71 GiB *transient*,
-    taken once per rollout) — the more dangerous of the two, because it OOMs mid-run
-    rather than at load. Exclusivity is a third axis: it decides what may be *awake*
-    beside the text encoder, which is the axis that actually decides 40 GB feasibility.
-    """
+    """Apply VRAM residency flags to config."""
     if not real_gpu_backbone:
         return
     config.backbone.offload_text_encoder = args.offload
@@ -230,19 +172,11 @@ def resolve_vram_policy(config: Config, args, real_gpu_backbone: bool) -> None:
     if args.vae_tiling:
         config.backbone.vae_tile_size = args.vae_tile
     config.backbone.offload_idle_expert = args.offload_idle_expert
-    # Default "cpu" => unchanged behaviour. The adapter validates the value once at
-    # load and falls back to CPU (loudly) when it is unusable, so a typo here cannot
-    # surface as a device mismatch deep inside a forward hours into the run.
     config.backbone.offload_device = getattr(args, "offload_device", "cpu") or "cpu"
 
 
 def apply_geometry(config: Config, args) -> Tuple[int, int, int]:
-    """Write ``--num-frames/--height/--width`` into ``config.data``, validated.
-
-    Rejected here rather than deep in a reshape: ``token_grid`` floor-divides by
-    ``vae_compress * patch``, so a height of 408 silently renders 400 and every latent
-    written by the run is off-geometry against the pixels it claims to describe.
-    """
+    """Write geometry flags into config."""
     d = config.data
     if getattr(args, "num_frames", None):
         d.num_frames = int(args.num_frames)
@@ -268,12 +202,7 @@ def apply_geometry(config: Config, args) -> Tuple[int, int, int]:
 
 
 def apply_wan_variant(config: Config, args) -> None:
-    """Copy the variant's geometry/MoE keys into ``config.backbone.extra``.
-
-    Only a ``wan*`` backbone reads these keys; other adapters ignore ``extra``, so this
-    is a no-op for a mock smoke run. ``--flow-shift`` overrides the variant's schedule
-    shift and is applied last.
-    """
+    """Copy variant keys into backbone extra."""
     if getattr(args, "finalize_only", False):
         return
     if str(args.backbone).startswith("wan"):
@@ -285,17 +214,7 @@ def apply_wan_variant(config: Config, args) -> None:
 
 
 def build_perception_and_metrics(args, log):
-    """Construct the real perception / metric backends when requested (§1.4/§7.1.1).
-
-    Returns ``(perception, metric_extractor)``, either of which may be ``None`` so
-    ``Accelerator.from_config`` falls back to its mock. The metric extractor is built
-    with ``share_from=perception`` so the DINOv2/CLIP pair is loaded once rather than
-    twice (§P2-7).
-
-    ``--real-models`` means "every perception model is the real one", so it also makes
-    a missing RAFT fatal: the zero-flow fallback yields labels whose ``s_A`` and two
-    damage axes are constant, which is worse than not starting.
-    """
+    """Build real perception and metric backends."""
     perception = None
     metric_extractor = None
     finalize_only = getattr(args, "finalize_only", False)
@@ -305,7 +224,7 @@ def build_perception_and_metrics(args, log):
     require_flow = bool(args.real_models or getattr(args, "require_flow", False)) and not finalize_only
     dtype = resolve_dtype(args.perception_dtype)
     if dtype is torch.float32:
-        dtype = None  # keep the checkpoints' own dtype (historical behaviour)
+        dtype = None
 
     if want_perception:
         from cocf.tubes import ModelPerception
@@ -339,12 +258,7 @@ def build_perception_and_metrics(args, log):
 
 
 def log_vram_policy(config: Config, log, alloc_conf: str) -> None:
-    """State the *resolved* policy so a run's VRAM behaviour is readable from line one.
-
-    The backbone logs its measured resident footprint against this once the weights
-    land; the pair together is what distinguishes "the flags were wrong" from "the
-    transients are too big", which the OOM traceback alone never does.
-    """
+    """Log resolved VRAM policy."""
     b = config.backbone
     log.info(
         "VRAM policy: text_encoder=%s, te_exclusive=%s, vae_tiling=%s, idle_expert=%s; "

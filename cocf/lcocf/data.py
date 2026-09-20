@@ -1,25 +1,18 @@
-"""Counterfactual teacher data generation (§1.4–§1.6 / §7.1.1).
+"""Counterfactual teacher data generation.
 
 Generates multi-dimensional training labels for L-COCF by applying tube-level
-**single-hop** counterfactual interventions. The core workflow (§1.5):
+single-hop counterfactual interventions:
 
-    1. Run full-compute model on the reference clip → Y_full, {z_t}, tubes  (Stage A)
-    2. Build semantic tubes G_t once and their 7-dim states + (s_E,s_A,s_T) features
-    3. For sampled (g_k, t, a) triplets: apply action a to *only* tube g_k at step t,
-       continue all-FULL denoising to z_0, decode → Y_cf  (no multi-hop propagation)
-    4. Compute the multi-dimensional damage D(Y_full, Y_cf), the compute-cost label
-       and the multi-seed uncertainty as the training labels (§1.5)
+    1. Run the full-compute model on the reference clip to get Y_full, {z_t}, tubes
+    2. Build semantic tubes once, with their states and (s_E, s_A, s_T) features
+    3. For sampled (tube, step, action) triplets: apply the action to only that tube,
+       continue all-FULL denoising to z_0, decode to Y_cf
+    4. Compute the multi-dimensional damage, the compute-cost label and the multi-seed
+       uncertainty as the training labels
 
-This module implements:
-    - :class:`COCFTrainingSample`: the §4.1 per-sample label record — every field
-      Stage B reads, serialised to exactly the key set
-      :func:`cocf.data.cocf_batch.collate_cocf_samples` consumes (round-trips through
-      the §3 LMDB store via ``to_dict``/``from_dict``).
-    - :class:`TeacherTrajectory`: the per-clip teacher-forward outputs the generator
-      runs counterfactuals against (assembled by Stage A).
-    - Stratified sampling: by timestep / tube causal level / action type (§1.5).
-    - :class:`COCFDataGenerator`: the single-hop intervention rollout that reuses the
-      backbone-agnostic :class:`~cocf.backbones.transition.TransitionExecutor`.
+This module implements :class:`COCFTrainingSample` (the per-sample label record),
+:class:`TeacherTrajectory` (per-clip teacher-forward outputs), stratified sampling, and
+:class:`COCFDataGenerator` (the single-hop intervention rollout).
 """
 
 from __future__ import annotations
@@ -57,11 +50,9 @@ from cocf.lcocf.strength import CausalStrengthFeatureBuilder, StrengthFeatures
 Tensor = torch.Tensor
 _log = logging.getLogger(__name__)
 
-# Per-action relative compute cost C(a) ∝ |g_k| — mirrors AllocatorConfig.action_cost
-# and the executor's FULL/LOWFREQ/INTERP/ANCHOR tiers. FULL=1; LOWFREQ=1/stride² (the
-# executor is authoritative, see ``_cost_label``); INTERP runs no denoiser but does
-# gather+blend the tube's tokens in latent space, so it is small-but-nonzero (§P4-1);
-# ANCHOR touches nothing, so 0.
+# Per-action relative compute cost, mirroring AllocatorConfig.action_cost and the
+# executor's FULL/LOWFREQ/INTERP/ANCHOR tiers (the executor is authoritative; see
+# ``_cost_label``).
 ACTION_COST: Tuple[float, float, float, float] = (1.0, 0.25, 0.02, 0.0)
 
 
@@ -75,7 +66,7 @@ def _to_np(x: Optional[Tensor]) -> Optional[np.ndarray]:
 
 
 def _to_tensor(x: object) -> Optional[Tensor]:
-    """Inverse of :func:`_to_np` — rebuild a float tensor from stored numpy/list."""
+    """Inverse of :func:`_to_np`: rebuild a float tensor from stored numpy/list."""
     if x is None:
         return None
     if isinstance(x, torch.Tensor):
@@ -84,36 +75,31 @@ def _to_tensor(x: object) -> Optional[Tensor]:
 
 
 # ============================================================================= #
-# Core data structures (§7.1.1)
+# Core data structures
 # ============================================================================= #
 
 
 @dataclass
 class COCFTrainingSample:
-    """One counterfactual training label — the §4.1 per-sample read record.
+    """One counterfactual training label: the per-sample read record for Stage B.
 
-    Carries every field Stage B reads for the joint loss (§4.1 "单样本读取字段"):
-    causal-strength features (s_E/s_A/s_T), the 7-dim tube state, timestep & action
-    encodings, tube token count, the multi-dimensional degradation label, the
-    compute-cost label, the multi-seed uncertainty, the tube visual embeddings of
-    the full & counterfactual renders, and the prompt text embedding.
-
-    :meth:`to_dict` serialises to exactly the key set
-    :func:`cocf.data.cocf_batch.collate_cocf_samples` consumes, so a sample
-    round-trips losslessly through the §3 LMDB store; :meth:`from_dict` rebuilds it.
-    Tensors are stored as small CPU numpy arrays (no autograd graph) to keep the
-    store compact.
+    Carries every field Stage B reads for the joint loss: causal-strength features, the
+    tube state, timestep and action encodings, tube token count, the multi-dimensional
+    degradation label, the compute-cost label, the multi-seed uncertainty, the tube
+    visual embeddings of the full and counterfactual renders, and the prompt embedding.
+    :meth:`to_dict` / :meth:`from_dict` round-trip it through the LMDB store; tensors
+    are stored as small CPU numpy arrays.
     """
 
-    # -- core predictor inputs ----------------------------------------------- #
-    tube_features: Tensor                 # [7]  the tube state vector s_{k,t} (§1.4)
+    # core predictor inputs
+    tube_features: Tensor                 # [7] the tube state vector
     timestep: int                         # t (countdown index over the schedule)
     action: int                           # Action {FULL=0,LOWFREQ=1,INTERP=2,ANCHOR=3}
-    damage_label: Tensor                  # [NUM_DAMAGE_DIMS] ∈ [0,1] degradation (§1.5)
+    damage_label: Tensor                  # [NUM_DAMAGE_DIMS] in [0, 1] degradation
 
-    # -- the remaining §4.1 read fields (defaulted for partial/legacy samples) - #
-    strength_features: Optional[Tensor] = None   # [3]  (s_E, s_A, s_T)  (§1.4(2))
-    cost_label: Optional[Tensor] = None          # [2]  (FLOPs frac, active-token frac)
+    # remaining read fields (defaulted for partial/legacy samples)
+    strength_features: Optional[Tensor] = None   # [3] (s_E, s_A, s_T)
+    cost_label: Optional[Tensor] = None          # [2] (FLOPs frac, active-token frac)
     uncertainty: Optional[Tensor] = None         # [NUM_DAMAGE_DIMS] multi-seed variance
     tube_visual_embed_full: Optional[Tensor] = None  # [d_v] full-render tube embed
     tube_visual_embed_cf: Optional[Tensor] = None    # [d_v] cf-render tube embed
@@ -121,23 +107,21 @@ class COCFTrainingSample:
 
     damage_per_axis: Dict[str, float] = field(default_factory=dict)
 
-    # -- auxiliary metadata -------------------------------------------------- #
+    # auxiliary metadata
     prompt: str = ""
     video_id: str = ""
     tube_id: int = -1
     scene_type: str = "dynamic"           # static/dynamic/multi/text/face/occlusion
-    interaction_density: float = 0.0      # 0-1: how much this tube interacts (§4.1)
+    interaction_density: float = 0.0      # 0-1: how much this tube interacts
     strength_level: int = 1               # StrengthLevel prior (HIGH=0/MID=1/LOW=2)
-    step_frac: float = 0.0                # t / T ∈ [0,1] (denoising phase)
-    # δ = ‖z_full − z_action‖ on the tube's tokens at the intervened step — the same
-    # quantity the inference-time certificate feeds its λ_res term. Recorded here so
-    # Stage B can calibrate that coefficient against a real signal instead of the
-    # hard zero it used to pass, which left λ_res (and λ_cmsc) stuck at their inits
-    # for the whole run (§P1-13).
+    step_frac: float = 0.0                # t / T in [0, 1] (denoising phase)
+    # Skip residual on the tube's tokens at the intervened step; the same quantity the
+    # inference-time certificate feeds its residual term, recorded so Stage B can
+    # calibrate that coefficient against a real signal.
     skip_residual: float = 0.0
-    tube_token_count: int = 0             # |g_k| latent tokens (cost context, §2.2)
+    tube_token_count: int = 0             # latent token count (cost context)
     tube_pixels: int = 0                  # latent-token area of the region (diagnostic)
-    tube_stability: float = 1.0           # identity stability ∈ [0,1]
+    tube_stability: float = 1.0           # identity stability in [0, 1]
 
     def damage_scalar(self, weights: Optional[Dict[str, float]] = None) -> float:
         """Reduce multi-dim damage to a scalar for quick sorting/filtering."""
@@ -149,7 +133,7 @@ class COCFTrainingSample:
         return min(1.0, scalar)  # clamp to [0,1]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialise to the §3 LMDB payload (keys ≡ collate_cocf_samples fields)."""
+        """Serialise to the LMDB payload (keys match collate_cocf_samples fields)."""
         return {
             # vectors (numpy, float32)
             "tube_features": _to_np(self.tube_features),
@@ -159,9 +143,7 @@ class COCFTrainingSample:
             "uncertainty": _to_np(self.uncertainty),
             "tube_visual_embed_full": _to_np(self.tube_visual_embed_full),
             "tube_visual_embed_cf": _to_np(self.tube_visual_embed_cf),
-            # ``text_embed`` is deliberately absent: it is per-*clip* data and is
-            # stored once under ``text_embeds/<video_id>.pt``, then joined back by
-            # the reader (§P2-3). Writing it here duplicated ~8 MiB per sample.
+            # text_embed is per-clip and stored separately, then joined by the reader.
             # long scalars
             "action": int(self.action),
             "timestep": int(self.timestep),
@@ -177,7 +159,7 @@ class COCFTrainingSample:
             "prompt": self.prompt,
             "scene_type": self.scene_type,
             "video_id": self.video_id,
-            # diagnostics (ignored by collate; kept for analysis/cleaning §1.6)
+            # diagnostics (ignored by collate; kept for analysis/cleaning)
             "damage_per_axis": dict(self.damage_per_axis),
             "tube_pixels": int(self.tube_pixels),
         }
@@ -217,12 +199,10 @@ class COCFTrainingSample:
 
 
 class CounterfactualDamageComputer:
-    """Orchestrates multi-dimensional damage computation (§7.1.1, steps e-f).
+    """Orchestrates multi-dimensional damage computation.
 
-    Encapsulates:
-        - Feature extraction via :class:`MetricExtractor`
-        - Damage calculation via :class:`MultiDimDamageComputer`
-        - Per-axis normalization & clamping
+    Encapsulates feature extraction (:class:`MetricExtractor`), damage calculation
+    (:class:`MultiDimDamageComputer`) and per-axis normalisation/clamping.
     """
 
     def __init__(
@@ -241,15 +221,11 @@ class CounterfactualDamageComputer:
     ) -> VideoFeatures:
         """Extract the reference-side features once, for reuse across rollouts.
 
-        ``video_full`` is fixed for a whole :class:`TeacherTrajectory` while dozens
-        of counterfactual rollouts are scored against it, so re-extracting it per
-        sample burns a full DINOv2+CLIP+RAFT pass (and its peak VRAM) every time
-        for a bit-identical result. Callers hoist this out of their loop and hand
-        it to :meth:`compute_damage`.
-
-        ``tube_masks`` requests the per-tube identity features the localised damage
-        axes need (§7.1.1). Pass every tube that will be scored against this
-        reference: they are computed once here rather than once per rollout.
+        ``video_full`` is fixed for a whole :class:`TeacherTrajectory` while many
+        counterfactual rollouts are scored against it, so callers hoist this out of
+        their loop and pass it to :meth:`compute_damage`. ``tube_masks`` requests the
+        per-tube identity features the localised damage axes need; pass every tube that
+        will be scored against this reference.
         """
         return self.metric_extractor.extract(video_full, prompt, tube_masks=tube_masks)
 
@@ -269,22 +245,18 @@ class CounterfactualDamageComputer:
             video_full: Full-compute reference video.
             video_cf: Counterfactual video (with action applied).
             prompt: Text prompt (for CLIP scoring).
-            tube_mask: Per-frame ``[F, H, W]`` mask of the intervened tube. Supplying
-                it (with ``tube_id``) localises the identity axes to that tube — the
-                §7.1.1 tube-group counterfactual. Without it the label is global, so
-                two different tubes intervened at the same step get nearly the same
-                damage and the predictor cannot learn a per-tube difference.
-            tube_id: Identifies which entry of ``feats_full.tube_dino`` to compare
-                against; must match the key used when the reference was extracted.
-            feats_full: Pre-extracted reference features from
-                :meth:`reference_features`. Extracted on demand when omitted.
+            tube_mask: Per-frame ``[F, H, W]`` mask of the intervened tube. Supplying it
+                (with ``tube_id``) localises the identity axes to that tube; without it
+                the label is global.
+            tube_id: Which entry of ``feats_full.tube_dino`` to compare against; must
+                match the key used when the reference was extracted.
+            feats_full: Pre-extracted reference features; extracted on demand if omitted.
 
         Returns:
-            damage_vector: [NUM_DAMAGE_DIMS] ∈ [0,1]
+            damage_vector: [NUM_DAMAGE_DIMS] in [0, 1]
             per_axis_dict: {axis_name: scalar_value} for diagnostics
         """
-        # Localise only when both halves are available; a tube_id whose reference
-        # features were never extracted would silently fall back to global anyway.
+        # Localise only when both halves are available.
         masks = (
             {tube_id: tube_mask}
             if (tube_mask is not None and tube_id is not None) else None
@@ -294,9 +266,7 @@ class CounterfactualDamageComputer:
         localise = tube_id if (masks and tube_id in feats_full.tube_dino) else None
         feats_cf = self.metric_extractor.extract(video_cf, prompt, tube_masks=masks)
 
-        # Compute multi-dimensional damage. ``compute`` returns the per-axis dict
-        # {axis_name: value}; convert it to the ordered [NUM_DAMAGE_DIMS] tensor via
-        # ``as_vector`` before doing any tensor ops on it.
+        # Compute the per-axis dict, then convert it to the ordered tensor.
         per_axis = self.damage_computer.compute(feats_full, feats_cf, tube_id=localise)
         damage_vec = self.damage_computer.as_vector(per_axis, device=video_full.device)
 
@@ -304,7 +274,7 @@ class CounterfactualDamageComputer:
 
 
 # ============================================================================= #
-# Stratified sampling strategies (§7.1.1 cost optimization)
+# Stratified sampling strategies
 # ============================================================================= #
 
 
@@ -325,7 +295,7 @@ class StratifiedSamplingConfig:
     )
 
     # By timestep: concentrate on mutation points (early structure + late detail)
-    # Group timesteps into early [t ∈ 0.8T..T], mid [0.3T..0.8T], late [0..0.3T]
+    # Group timesteps into early [0.8T..T], mid [0.3T..0.8T], late [0..0.3T]
     timestep_strata: Dict[str, Tuple[float, float, float]] = field(
         default_factory=lambda: {
             "early": (0.8, 1.0, 0.35),  # (tmin_frac, tmax_frac, weight)
@@ -345,16 +315,15 @@ class StratifiedSamplingConfig:
     )
 
     # General parameters
-    samples_per_prompt: int = 3  # sample 3 seeds per prompt (§7.1.1)
+    samples_per_prompt: int = 3  # sample 3 seeds per prompt
 
 
 class StratifiedSampler:
     """Generates balanced (tube, timestep, action) triplets from a video.
 
-    Implements the stratified sampling of §7.1.1 to ensure representation across:
-        - Scene types (static/dynamic/text/face)
-        - Temporal phases (early/mid/late)
-        - Action types (FULL/LOWFREQ/INTERP/ANCHOR)
+    Stratified sampling ensures representation across scene types
+    (static/dynamic/text/face), temporal phases (early/mid/late) and action types
+    (FULL/LOWFREQ/INTERP/ANCHOR).
     """
 
     def __init__(self, config: StratifiedSamplingConfig, device: torch.device):
@@ -362,31 +331,27 @@ class StratifiedSampler:
         self.device = device
 
     def sample_actions(self, num_samples: int = 4) -> List[int]:
-        """The four compute actions per tube (§1.5: 分别施加 FULL/LOWFREQ/INTERP/ANCHOR).
+        """The four compute actions per tube (FULL/LOWFREQ/INTERP/ANCHOR).
 
-        Each tube at each representative step is probed with **all four** actions.
-        Generating a FULL sample (≈zero damage, the reference) alongside the three
-        skip actions is what gives the §4.1 action-balanced (1:1:1:1) training
-        material the Stage-B :class:`~cocf.data.cocf_batch.StratifiedBatchSampler`
-        balances over. ``num_samples`` only truncates (kept for API/back-compat).
+        Each tube at each representative step is probed with all four actions, giving
+        action-balanced training material. ``num_samples`` only truncates.
         """
         actions = [int(Action.FULL), int(Action.LOWFREQ), int(Action.INTERP), int(Action.ANCHOR)]
         return actions if num_samples >= len(actions) else actions[:num_samples]
 
 
 # ============================================================================= #
-# Label interpolation (cost optimization, §7.1.1)
+# Label interpolation
 
 @dataclass
 class TeacherTrajectory:
-    """Per-clip teacher full-compute outputs assembled by Stage A (§1.3–§1.4).
+    """Per-clip teacher full-compute outputs assembled by Stage A.
 
-    One reference full-denoise trajectory: the decoded reference video ``Y_full``,
-    the latents ``z_t`` cached at the representative steps, the semantic tubes built
-    once on the reference, their 7-dim states and ``(s_E, s_A, s_T)`` features, and
-    the per-tube visual embeddings of the full render. A single-hop intervention
-    (§1.5) replays one cached ``z_t`` with one tube's action changed and continues
-    all-FULL to ``z_0``.
+    One reference full-denoise trajectory: the decoded reference video ``Y_full``, the
+    latents ``z_t`` cached at the representative steps, the semantic tubes built once on
+    the reference, their states and ``(s_E, s_A, s_T)`` features, and the per-tube
+    visual embeddings of the full render. A single-hop intervention replays one cached
+    ``z_t`` with one tube's action changed and continues all-FULL to ``z_0``.
     """
 
     video_id: str
@@ -402,14 +367,13 @@ class TeacherTrajectory:
     tube_visual_embed_full: Dict[int, Tensor]       # tube_id -> [d_v]
     num_total_steps: int
     text_embed: Optional[Tensor] = None             # [L, d_c] (cond.embeds[0])
-    # z_T the baseline was generated from. Persisted alongside Y_full so Stage C can
-    # start its accelerated run on the *same* noise and compare against the stored
-    # reference instead of re-denoising the whole trajectory itself (§P2-4).
+    # z_T the baseline was generated from, persisted so Stage C can start its
+    # accelerated run on the same noise and compare against the stored reference.
     z_init: Optional[Tensor] = None                 # [1, N, d]
 
 
 def _frames_fchw(video: Tensor) -> Tensor:
-    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) → ``[F, 3, H, W]``.
+    """``[B, 3, F, H, W]`` (or ``[3, F, H, W]``) to ``[F, 3, H, W]``.
 
     Layout only; the value range is settled at the decode by
     :meth:`~cocf.backbones.base.BackboneAdapter.decode_to_unit`.
@@ -422,13 +386,10 @@ def tube_pixel_mask(video_fchw: Tensor, tube: SemanticTube, grid: Optional[Token
                     *, frame_span=None, full_frame_count=None) -> Tensor:
     """``[F, Hp, Wp]`` bool: the tube's latent masks upsampled to pixel resolution.
 
-    The damage extractor works on pixels while a tube carries latent-grid masks, so
-    this is the bridge that lets a label be scored on the region the counterfactual
-    actually intervened on (§7.1.1).
-
-    Each pixel frame uses the nearest representative latent slot, matching the
-    builder's evenly spaced frame sampling. Window offsets are in full-video pixel
-    coordinates. Omitting grid preserves the legacy one-slot-per-frame convention.
+    The damage extractor works on pixels while a tube carries latent-grid masks, so this
+    bridges the two and lets a label be scored on the region the counterfactual
+    intervened on. Each pixel frame uses the nearest representative latent slot; window
+    offsets are in full-video pixel coordinates.
     """
     f, _, hp, wp = video_fchw.shape
     out = torch.zeros(f, hp, wp, dtype=torch.bool, device=video_fchw.device)
@@ -467,9 +428,9 @@ def tube_clip_embed(
     """Per-tube CLIP visual embed ``[d_v]`` from a representative frame (feeds CMSC).
 
     Picks the middle visible pixel frame, maps its latent mask to pixel resolution and
-    calls ``perception.clip_feature`` — the same source
-    :class:`~cocf.tubes.regions.RegionExtractor` uses, so train/serve embeds match.
-    Returns zeros when no perception/mask is available (e.g. a pure-mock dry run).
+    calls ``perception.clip_feature``, the same source
+    :class:`~cocf.tubes.regions.RegionExtractor` uses. Returns zeros when no
+    perception/mask is available.
     """
     if d_v is None:
         d_v = int(getattr(perception, "d_clip", 64)) if perception is not None else 64
@@ -490,22 +451,16 @@ def tube_clip_embed(
 
 
 # ============================================================================= #
-# Full counterfactual data generation pipeline (§1.5)
-# ============================================================================= #
-
-
+# Full counterfactual data generation pipeline
 # ============================================================================= #
 
 
 def _seeded_noise(like: Tensor, *keys) -> Tensor:
-    """Deterministic Gaussian like ``like`` — reproducible per (clip, step, seed).
+    """Deterministic Gaussian like ``like``, reproducible per (clip, step, seed).
 
-    Seeds from a *stable* hash of the keys, not Python's ``hash()`` (which is salted
-    per process via ``PYTHONHASHSEED`` for string keys like ``video_id``), so the
-    multi-seed perturbations — hence the §1.5 uncertainty labels — are byte-identical
-    across runs, processes and shards. Generated on CPU for the same reason: a CUDA
-    generator's stream is device- and driver-dependent, so a store built on one card
-    would not reproduce on another.
+    Seeds from a stable hash of the keys (not Python's salted ``hash()``) so the
+    multi-seed perturbations and uncertainty labels are identical across runs, processes
+    and shards. Generated on CPU so a store built on one card reproduces on another.
     """
     digest = hashlib.sha1("|".join(map(str, keys)).encode("utf-8")).hexdigest()
     g = torch.Generator().manual_seed(int(digest[:8], 16))
@@ -515,22 +470,12 @@ def _seeded_noise(like: Tensor, *keys) -> Tensor:
 class _FullStepCache:
     """Memoises the dense full-compute advance shared by every rollout at a step.
 
-    A single-hop rollout starts by advancing the cached ``z_t`` one *unmodified*
-    full-compute step, and only then applies the action to the intervened tube. That
-    advance is a function of ``(step_idx, seed)`` alone — it happens before any tube
-    or action is involved — so the ~12 rollouts a clip runs at one representative step
-    were each recomputing a bit-identical DiT forward.
-
-    Sharing it is what makes the perturbation seed drop ``tube_id``/``action`` from its
-    key. That is also the better label: all actions at a step now see the *same*
-    perturbation (common random numbers), so the multi-seed variance measures the
-    action's own sensitivity rather than the difference between two unrelated noise
-    draws.
-
-    Both returned tensors are read-only to callers. ``coarsen_lowfreq`` /
-    ``interp_temporal`` / the ANCHOR branch all clone before writing, and the
-    continuation loop rebinds rather than mutating, so no rollout can corrupt a
-    later one's entry.
+    A single-hop rollout first advances the cached ``z_t`` one unmodified full-compute
+    step, then applies the action to the intervened tube. That advance depends only on
+    ``(step_idx, seed)``, so it is shared across the rollouts at a step instead of
+    recomputed. All actions at a step then see the same perturbation (common random
+    numbers), so the multi-seed variance measures the action's own sensitivity. Both
+    returned tensors are read-only to callers, which clone before writing.
     """
 
     def __init__(self, traj: "TeacherTrajectory", backbone: BackboneAdapter,
@@ -583,20 +528,17 @@ class _FullStepCache:
 
 
 class COCFDataGenerator:
-    """Single-hop counterfactual training-data generation (§1.5).
+    """Single-hop counterfactual training-data generation.
 
-    For each representative (tube ``g_k``, step ``t``, action ``a``) it:
-        1. replays the cached ``z_t`` and takes one **dense** full-compute step;
-        2. applies action ``a`` to *only* ``g_k`` (FULL/LOWFREQ/INTERP/ANCHOR),
-           reusing the inference :class:`~cocf.backbones.transition.TransitionExecutor`
-           realisation for LOWFREQ so the label has no train/serve skew;
-        3. continues all-FULL to ``z_0`` (single-hop: no multi-hop propagation),
-           decodes → ``Y_cf``;
+    For each representative (tube, step, action) it:
+        1. replays the cached ``z_t`` and takes one dense full-compute step;
+        2. applies the action to only that tube, reusing the inference
+           :class:`~cocf.backbones.transition.TransitionExecutor` for LOWFREQ;
+        3. continues all-FULL to ``z_0`` and decodes to ``Y_cf``;
         4. scores the multi-dim damage vs ``Y_full``, the compute-cost label and the
            multi-seed uncertainty.
 
-    FULL is the zero-damage reference by construction (no local modification), which
-    is the clean anchor the §4.1 action-balanced sampler needs.
+    FULL is the zero-damage reference by construction.
     """
 
     def __init__(
@@ -618,15 +560,11 @@ class COCFDataGenerator:
         self.damage_computer = damage_computer
         self.sampling_config = sampling_config or StratifiedSamplingConfig()
         self.device = device
-        # perception backend supplies the per-tube CLIP visual embed feeding CMSC.
         self.perception = perception
         self.action_cost = tuple(action_cost)
         self.seeds_per_prompt = max(1, int(seeds_per_prompt))
         self.perturb_std = float(perturb_std)
-        # Return freed allocator blocks to the driver (0 disables entirely). Acts at
-        # two granularities: after every non-zeroth rollout seed in
-        # :meth:`_counterfactual_labels` — the unit that ends in a full VAE decode —
-        # and every N completed samples in :meth:`generate`.
+        # Return freed allocator blocks to the driver (0 disables).
         self.free_memory_every = max(0, int(free_memory_every))
 
         self.sampler = StratifiedSampler(self.sampling_config, device)
@@ -640,10 +578,10 @@ class COCFDataGenerator:
         max_tubes: int = 5,
         max_samples: int = 30,
     ) -> List[COCFTrainingSample]:
-        """Generate the §1.5 counterfactual samples for one teacher trajectory.
+        """Generate the counterfactual samples for one teacher trajectory.
 
-        Covers high/mid/low causal tubes (``max_tubes``) × all four actions at every
-        cached representative step, capped at ``max_samples`` labels per clip (§1.5).
+        Covers high/mid/low causal tubes (``max_tubes``) across all four actions at
+        every cached representative step, capped at ``max_samples`` labels per clip.
         """
         steps = sorted(traj.z_by_step)
         if not traj.tubes or not steps:
@@ -651,11 +589,8 @@ class COCFDataGenerator:
         tube_idx_sel = self._select_tubes(traj, max_tubes)
         actions = self.sampler.sample_actions()
         samples: List[COCFTrainingSample] = []
-        # The reference side of every damage comparison below is the same
-        # ``traj.video_full``; extract its features once instead of once per
-        # (tube, step, action, seed). The per-tube masks go in here too, so each
-        # selected tube's localised identity reference is computed once per clip
-        # rather than once per rollout (§7.1.1 / §P1-4).
+        # Extract the reference features once (with the per-tube masks) instead of once
+        # per (tube, step, action, seed).
         tube_masks: Dict[int, Tensor] = {
             traj.tubes[ti].tube_id: tube_pixel_mask(traj.video_full, traj.tubes[ti], traj.grid)
             for ti in tube_idx_sel
@@ -707,9 +642,7 @@ class COCFDataGenerator:
                 )
             )
             # Coarse backstop to the per-rollout reclaim in
-            # :meth:`_counterfactual_labels`: catches the zeroth seed's clip
-            # (held until the sample is built) and the metric backbones'
-            # residue. ``empty_cache`` is a synchronising call, hence the
+            # :meth:`_counterfactual_labels`; ``empty_cache`` synchronises, hence the
             # cadence rather than per-sample.
             if self.free_memory_every and len(samples) % self.free_memory_every == 0:
                 free_memory()
@@ -725,29 +658,12 @@ class COCFDataGenerator:
     ) -> List[Tuple[int, int, int]]:
         """``(step_idx, tube_idx, action)`` triplets ordered so truncation stays balanced.
 
-        The generator can only afford ``max_samples`` rollouts per clip, and the order
-        in which candidates are visited therefore *is* the sampling design. It has to
-        stay balanced across three axes at once, because a prefix that neglects any one
-        of them costs the predictor an input it is asked to condition on at inference.
-
-        Nested loops with an inner ``break`` visited the whole (tube × action) grid of
-        the first representative step before reaching the second, so a cap of 15 against
-        4 tubes × 4 actions drew every sample from the earliest step (§P1-5) and left
-        ``step_frac`` a constant. Interleaving across steps fixed that but made ``ti``
-        the outer loop of each step's candidate list, which merely moved the imbalance
-        onto the tube axis.
-
-        Candidates are therefore enumerated **round by round**: round ``r`` pairs tube
-        ``i`` with action ``(i + r) mod n_a``. Each round covers every tube exactly
-        once and walks a different diagonal of the (tube × action) grid, so the first
-        ``n_t`` candidates hit distinct tubes *and* distinct actions, ``n_a`` rounds
-        cover every action, and no ``(tube, action)`` pair can repeat — for *any*
-        ``n_t``, not only the square case. The previous formula indexed the action by
-        ``(j % n_a + j // n_t) % n_a``, which degenerates whenever ``n_t`` and ``n_a``
-        share no useful stride: at ``n_t = 3`` it emitted three distinct pairs across
-        twelve slots and never produced ANCHOR at all, so every clip that segmented an
-        odd number of tubes silently contributed no ANCHOR label while paying for four
-        duplicate rollouts.
+        The generator can only afford ``max_samples`` rollouts per clip, so the visit
+        order is the sampling design and must stay balanced across step, tube and action
+        at once. Candidates are enumerated round by round: round ``r`` pairs tube ``i``
+        with action ``(i + r) mod n_a``, so each round covers every tube once and walks a
+        different diagonal of the (tube, action) grid, and no pair repeats for any
+        ``n_t``.
         """
         n_t, n_a = len(tube_idx_sel), len(actions)
         if not n_t or not n_a:
@@ -766,7 +682,7 @@ class COCFDataGenerator:
         return out
 
     # ------------------------------------------------------------------ #
-    # single-hop counterfactual rollout (§1.5)
+    # single-hop counterfactual rollout
     # ------------------------------------------------------------------ #
 
     def _counterfactual_labels(
@@ -782,19 +698,15 @@ class COCFDataGenerator:
         feats_full: Optional[VideoFeatures] = None,
         tube_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, float], float]:
-        """Return ``(damage[8], uncertainty[8], cost[2], Y_cf[F,3,H,W], per_axis, δ)``.
+        """Return ``(damage, uncertainty, cost, Y_cf, per_axis, residual)``.
 
-        FULL is the reference: zero damage by construction (no local modification),
-        so its label is exact and needs no rollout. Skip actions roll out
-        ``seeds_per_prompt`` times (small seeded perturbations of ``z_t``) so the
-        per-axis variance is the §1.5 multi-seed uncertainty label; ``δ`` is the mean
-        skip residual over those seeds, which is what the certificate's λ_res term is
-        calibrated against.
+        FULL is the reference: zero damage by construction, no rollout. Skip actions roll
+        out ``seeds_per_prompt`` times (small seeded perturbations of ``z_t``) so the
+        per-axis variance is the multi-seed uncertainty label; the residual is the mean
+        skip residual over those seeds.
 
-        ``feats_full`` is the caller's hoisted reference-feature extraction (all
-        rollouts of a trajectory compare against the same ``traj.video_full``);
-        ``step_cache`` is its counterpart on the latent side, supplying the dense
-        advance every rollout at this step shares.
+        ``feats_full`` is the caller's hoisted reference-feature extraction;
+        ``step_cache`` supplies the dense advance every rollout at this step shares.
         """
         cost = self._cost_label(action, transition)
         if action == Action.FULL:
@@ -824,13 +736,8 @@ class COCFDataGenerator:
             if k == 0:
                 y_cf0, per_axis0 = y_cf, per_axis
             else:
-                # Every seed but the zeroth produces a decoded clip that dies here,
-                # alongside the VAE tile buffers and metric-backbone activations the
-                # rollout just churned through. Reclaiming per *rollout* rather than
-                # per sample matters because the rollout — not the sample — is the
-                # unit that ends in a full VAE decode: at seeds_per_prompt=3 the
-                # sample-level cadence below would let three decodes' worth of freed
-                # blocks fragment before any of them is returned to the driver.
+                # Reclaim per rollout (the unit that ends in a full VAE decode) rather
+                # than per sample, so freed blocks are returned before they fragment.
                 del y_cf
                 if self.free_memory_every:
                     free_memory()
@@ -851,15 +758,13 @@ class COCFDataGenerator:
         backbone: BackboneAdapter,
         transition: TransitionExecutor,
     ) -> Tuple[Tensor, float]:
-        """Apply the action at step ``t`` then continue all-FULL to ``z_0`` → ``Y_cf``.
+        """Apply the action at step ``t`` then continue all-FULL to ``z_0``, decode to
+        ``Y_cf``.
 
-        Returns the decoded clip and the skip residual ``δ_k`` measured on the tube's
-        tokens at the intervened step — exactly the quantity RAEC's certificate weights
-        with λ_res at inference, so Stage B can calibrate that coefficient against a
-        real signal (§P1-13).
-
-        ``z_prev``/``z_full`` are the step's shared pre- and post-advance latents
-        (:class:`_FullStepCache`); both are treated as read-only here.
+        Returns the decoded clip and the skip residual measured on the tube's tokens at
+        the intervened step, the quantity RAEC's certificate weights at inference.
+        ``z_prev``/``z_full`` are the step's shared pre- and post-advance latents, both
+        read-only here.
         """
         grid, cond, T = traj.grid, traj.cond, traj.num_total_steps
         device = z_full.device
@@ -869,7 +774,7 @@ class COCFDataGenerator:
             (z_full.index_select(1, idx) - z.index_select(1, idx))
             .pow(2).mean().sqrt().item()
         ) if idx.numel() else 0.0
-        # continue all-FULL (dense) to z_0 — single-hop: only step t was intervened
+        # continue all-FULL (dense) to z_0; single-hop, only step t was intervened
         for s in range(step_idx + 1, T):
             ts = T - s
             tn = torch.full((z.shape[0],), sigma_from_step(ts, T), device=device)
@@ -886,66 +791,48 @@ class COCFDataGenerator:
         grid: TokenGrid,
         transition: TransitionExecutor,
     ) -> Tensor:
-        """Produce ``z_t^{cf}`` by applying ``action`` to *only* this tube's tokens."""
+        """Produce the counterfactual latent by applying ``action`` to only this tube."""
         if action == Action.FULL:
             return z_full
         idx = tube.all_token_indices().to(z_full.device)
         if idx.numel() == 0:
             return z_full
         if action == Action.INTERP:
-            # temporal interpolation via the shared inference realisation (it returns
-            # its own copy, so do not pre-clone: these rollouts run ~90× per clip and
-            # a full-latent clone each is pure waste). ``freeze_to=z_prev`` keeps the
-            # single-frame fallback at freeze semantics on the label side, while
-            # inference lets such a tube ride the spliced-ε step — so a one-frame
-            # tube's INTERP μ is a conservative overestimate of the served damage.
+            # Temporal interpolation via the shared inference realisation (returns its
+            # own copy, so no pre-clone). ``freeze_to=z_prev`` keeps the single-frame
+            # fallback at freeze semantics on the label side.
             return transition.interp_temporal(z_full, tube, grid, freeze_to=z_prev)
         if action == Action.LOWFREQ:
-            # strided lattice + nearest-anchor value fill via the shared inference
-            # realisation (coarsens the latent itself, not the step increment)
+            # Strided lattice + nearest-anchor value fill via the shared inference
+            # realisation (coarsens the latent itself, not the step increment).
             return transition.coarsen_lowfreq(z_full, tube, grid)
         z_cf = z_full.clone()
         if action == Action.ANCHOR:
-            # freeze: the tube does not advance this step (reuse the pre-step latent)
+            # Freeze: the tube does not advance this step (reuse the pre-step latent).
             z_cf.index_copy_(1, idx, z_prev.index_select(1, idx).to(z_cf.dtype))
         return z_cf
 
     @staticmethod
     def _state_for(state: TubeState, action: Action) -> TubeState:
-        """The tube state to record *alongside this action's label* (§P1-3).
+        """The tube state to record alongside this action's label.
 
-        ``anchor_age`` is one of the 7 predictor inputs, so it must describe the world
-        the label was measured in. The ANCHOR rollout freezes the tube to the latent of
-        the **immediately preceding** step (``z_prev``), i.e. an anchor exactly one step
-        old — but the teacher's tube state carries the builder's default ``age = 0``,
-        teaching the predictor that this damage occurs at zero staleness.
-
-        Inference reuses an anchor that may be several steps old. That residual gap is
-        priced separately and deliberately: the certificate's ``λ_age · age/(age+τ)``
-        term (§5.3.1) models staleness on top of μ. Labelling the age the rollout
-        actually used is what makes that decomposition sound — μ becomes "the damage of
-        a one-step-old anchor" rather than "of an anchor of unknown age".
+        ``anchor_age`` is a predictor input, so it must describe the world the label was
+        measured in. The ANCHOR rollout freezes the tube to the immediately preceding
+        step's latent (an anchor one step old), so the recorded age is set to 1.0.
         """
         if action != Action.ANCHOR:
             return state
         return dataclass_replace(state, anchor_age=1.0)
 
     def _cost_label(self, action: Action, transition: TransitionExecutor) -> Tensor:
-        """``[relative compute cost, active-token fraction]`` of the action (§1.5).
+        """``[relative compute cost, active-token fraction]`` of the action.
 
-        The two fields are *distinct measurements* and were collapsed into one for a
-        while, which is how the store came to carry ``action_cost[LOWFREQ] = 0.45``
-        beside an active fraction of ``1/stride² = 0.25`` for the same sample — a cost
-        head trained on that learns an average of two incompatible claims (§P1-6).
-        They are kept distinct here and both sourced from the executor's own stride, so
-        neither can drift from what the engine performs:
+        Two distinct measurements, both sourced from the executor's own stride:
 
-        * **relative compute cost** — what the allocator's knapsack prices the action
-          at (``ACTION_COST``, LOWFREQ overridden by the real stride). INTERP is
-          non-zero because it does latent-space work even though no denoiser runs
-          (§P4-1), so this field is *not* identical to the active fraction.
-        * **active-token fraction** — the share of the tube's tokens the denoiser
-          freshly computes: 1 for FULL, ``1/stride²`` for LOWFREQ, 0 for both skips.
+        * relative compute cost: what the allocator's knapsack prices the action at
+          (``ACTION_COST``, LOWFREQ overridden by the real stride).
+        * active-token fraction: the share of the tube's tokens the denoiser freshly
+          computes (1 for FULL, ``1/stride^2`` for LOWFREQ, 0 for both skips).
         """
         stride = max(1, transition.lowfreq_stride)
         lowfreq_frac = 1.0 / float(stride * stride)
@@ -955,7 +842,7 @@ class COCFDataGenerator:
         return torch.tensor([cost[int(action)], active], dtype=torch.float32)
 
     # ------------------------------------------------------------------ #
-    # feature extraction (real, no placeholders)
+    # feature extraction
     # ------------------------------------------------------------------ #
 
     def _tube_visual_embed(self, video_fchw: Tensor, tube: SemanticTube, grid: TokenGrid) -> Tensor:
@@ -963,7 +850,7 @@ class COCFDataGenerator:
         return tube_clip_embed(video_fchw, tube, grid, self.perception)
 
     def _select_tubes(self, traj: TeacherTrajectory, max_tubes: int) -> List[int]:
-        """Pick ≤``max_tubes`` tube indices spanning high/mid/low causal levels (§1.5)."""
+        """Pick at most ``max_tubes`` tube indices spanning high/mid/low causal levels."""
         tubes = traj.tubes
         if max_tubes < 1:
             raise ValueError("max_tubes must be positive")
@@ -984,7 +871,7 @@ class COCFDataGenerator:
         return (feats.s_E + feats.s_A + feats.s_T) / 3.0
 
     def _strength_level(self, feats: StrengthFeatures) -> StrengthLevel:
-        """Map ``(s_E,s_A,s_T)`` to a HIGH/MID/LOW causal level (§3.3.3 thresholds)."""
+        """Map ``(s_E, s_A, s_T)`` to a HIGH/MID/LOW causal level."""
         s = self._strength_scalar(feats)
         if s > 0.66:
             return StrengthLevel.HIGH
@@ -994,11 +881,7 @@ class COCFDataGenerator:
 
     @staticmethod
     def _count_tube_pixels(tube: SemanticTube) -> int:
-        """Total latent-mask area spanned by the tube across its frames.
-
-        Reduced in one op: the per-frame ``int(m.sum())`` this replaces forced a
-        device sync per frame, ~50 of them per sample on a GPU run.
-        """
+        """Total latent-mask area spanned by the tube across its frames."""
         masks = [m for m in tube.masks_by_frame.values() if m is not None]
         if not masks:
             return 0

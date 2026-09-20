@@ -1,18 +1,4 @@
-"""torchvision RAFT loading — shared by the STA perception backend and the damage
-metric extractor.
-
-Both subsystems need dense optical flow and both used to build it inline behind a
-bare ``except Exception``, so a RAFT that failed to load degraded to a zero (or
-proxy) flow field with no log line at all. That failure is silent all the way down:
-``motion_phase`` — and therefore the causal action strength ``s_A`` — becomes
-identically zero, the affinity flow/IoU terms lose their warp, and two damage axes
-fall back to a descriptor difference, while the run reports nothing unusual.
-
-``DEFAULT`` weights are also a *download*, which is exactly what an air-gapped
-training box cannot do, so the failure is the expected case there rather than an
-exotic one. Hence one loader, with a local-checkpoint path, a load-time probe and a
-``required`` mode that refuses to produce unusable labels.
-"""
+"""Load and verify torchvision RAFT optical flow models."""
 
 from __future__ import annotations
 
@@ -30,27 +16,15 @@ _log = get_logger(__name__)
 
 __all__ = ["RaftUnavailable", "RAFT_MIN_EDGE", "load_raft", "raft_pad"]
 
-#: torchvision's correlation pyramid down-samples the input by 8 and then needs a
-#: feature map of at least 16x16, so *both* input edges must be >= 128 or the
-#: forward pass raises ``ValueError: Feature maps are too small…``. Every call site
-#: that sizes RAFT's input (the load-time probe, the per-frame pad in the
-#: perception backend, the resolution cap in the metric extractor) has to respect
-#: this floor, so it lives here rather than being re-derived three times.
 RAFT_MIN_EDGE = 128
 
 
 class RaftUnavailable(RuntimeError):
-    """RAFT could not be built and the caller declared flow mandatory."""
+    """Raised when RAFT is required but unavailable."""
 
 
 def raft_pad(x: torch.Tensor) -> torch.Tensor:
-    """Pad ``[N,C,H,W]`` up to RAFT's input lattice: multiples of 8, edges >= 128.
-
-    Bottom/right padding only, so the caller recovers its own field with a plain
-    ``flow[..., :h, :w]`` slice. ``reflect`` needs the pad to be smaller than the
-    dimension it mirrors, which is exactly false for the tiny inputs this floor
-    exists for, so those fall back to ``replicate``.
-    """
+    """Pad input to RAFT size requirements."""
     h, w = x.shape[-2:]
     th = max(RAFT_MIN_EDGE, -(-h // 8) * 8)
     tw = max(RAFT_MIN_EDGE, -(-w // 8) * 8)
@@ -62,14 +36,7 @@ def raft_pad(x: torch.Tensor) -> torch.Tensor:
 
 
 def _resolve_weights(variant: str, weights_path: Optional[str]) -> Optional[Path]:
-    """``--raft-weights`` → the checkpoint file for *this* variant.
-
-    The two consumers ask for different nets — the perception backend for
-    ``large``, the metric extractor for ``small`` — off the same CLI flag, so a
-    single file can only ever satisfy one of them. A *directory* is therefore the
-    useful form on an offline host: each caller picks the checkpoint whose name
-    carries its own variant.
-    """
+    """Resolve RAFT checkpoint path for variant."""
     if not weights_path:
         return None
     p = Path(weights_path).expanduser()
@@ -96,7 +63,7 @@ def _resolve_weights(variant: str, weights_path: Optional[str]) -> Optional[Path
 
 
 def _state_dict(obj) -> dict:
-    """Unwrap the usual checkpoint envelopes down to a bare state dict."""
+    """Unwrap checkpoint envelope to state dict."""
     for key in ("state_dict", "model", "model_state_dict"):
         if isinstance(obj, dict) and key in obj and isinstance(obj[key], dict):
             obj = obj[key]
@@ -105,6 +72,7 @@ def _state_dict(obj) -> dict:
 
 
 def _build(variant: str, weights_path: Optional[str]) -> nn.Module:
+    """Build RAFT model for variant."""
     from torchvision.models.optical_flow import (
         Raft_Large_Weights, Raft_Small_Weights, raft_large, raft_small,
     )
@@ -120,19 +88,8 @@ def _build(variant: str, weights_path: Optional[str]) -> nn.Module:
 
 
 def _probe(raft: nn.Module, device) -> None:
-    """One forward over a synthetic shifted pattern; raises unless the flow is real.
-
-    A checkpoint that loads but produces nothing (a mismatched state dict silently
-    accepted, a build without the correlation kernel) is indistinguishable from a
-    healthy one until the labels are already written, so the flow is required to be
-    non-zero *here* rather than assumed downstream.
-
-    The pattern is textured noise at :data:`RAFT_MIN_EDGE` — a flat shape on a flat
-    ground leaves the interior of the shift ambiguous, and anything below the floor
-    makes RAFT itself raise, which used to surface as "RAFT unavailable, needs
-    network access" for weights that had in fact loaded.
-    """
-    gen = torch.Generator().manual_seed(0)  # never touch the caller's global RNG
+    """Probe RAFT with synthetic flow."""
+    gen = torch.Generator().manual_seed(0)
     a = torch.rand(1, 3, RAFT_MIN_EDGE, RAFT_MIN_EDGE, generator=gen).to(
         device=device, dtype=next(raft.parameters()).dtype)
     b = torch.roll(a, shifts=8, dims=-1)
@@ -152,13 +109,7 @@ def load_raft(
     weights_path: Optional[str] = None,
     required: bool = False,
 ) -> Optional[nn.Module]:
-    """A frozen, probed RAFT on ``device`` — or ``None`` when unavailable.
-
-    ``required`` is set by the ``--real-models`` path, whose whole contract is that
-    every perception model is the real one: degrading to a zero flow there produces
-    labels that cannot train the plugins, so it raises instead. Without it the caller
-    keeps its own fallback and this only guarantees the failure is *reported*.
-    """
+    """Return probed RAFT model or None."""
     why = "Optical flow drives motion_phase (hence the causal action strength s_A), " \
           "the affinity flow/IoU terms and two damage axes — without it they are " \
           "constant and the labels are not trainable."
@@ -168,9 +119,6 @@ def load_raft(
             raise RaftUnavailable(f"{message} {why}") from exc
         _log.error("%s %s", message, why)
 
-    # Load and probe are reported apart: a probe failure means the weights were
-    # found and read, so pointing at the network (or at --raft-weights) there sends
-    # the reader after a problem they do not have.
     try:
         model = _build(variant, weights_path)
     except Exception as exc:

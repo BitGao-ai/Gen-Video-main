@@ -1,23 +1,4 @@
-"""L-COCF — Lightweight Counterfactual Causal Compute Field (§3).
-
-Turns the theoretically-complete-but-infeasible native COCF into an engineering-
-realisable component through four scientifically-grounded simplifications, each in
-its own module:
-
-    triplets        §3.3.1  local causal sub-graph from a frozen VLM (no NP-hard
-                            global graph learning)
-    strength        §3.3.2  first-order linear causal-strength field s=αs_E+βs_A+γs_T
-                            (3 learnable scalars)
-    mapping         §3.3.3  hierarchical discrete strength→tier→action map
-                            (no continuous-field iterative solve)
-    counterfactual  §3.3.4  local single-hop CF check at temporal mutation points
-                            (no full-domain multi-hop reasoning)
-    predictor       §3.3    the damage predictor H_φ regressing final-video damage
-    damage          §7.1.1  the multi-dimensional damage *label* definition
-    module          §3      the LCOCFModule facade wiring all of the above
-
-The public surface is re-exported here so callers import from ``cocf.lcocf``.
-"""
+"""L-COCF lightweight counterfactual causal compute field."""
 
 from __future__ import annotations
 
@@ -58,28 +39,28 @@ from cocf.lcocf.triplets import (
 __all__ = [
     # facade
     "LCOCFModule",
-    # §3.3.1 sub-graph
+    # sub-graph
     "CausalParser",
     "RuleBasedCausalParser",
     "VLMCausalParser",
     "build_parser",
     "build_subgraph",
-    # §3.3.2 strength
+    # strength
     "StrengthFeatures",
     "CausalStrengthFeatureBuilder",
     "CausalStrengthField",
-    # §3.3.3 mapping
+    # mapping
     "ComputeFieldMapping",
-    # §3.3 predictor
+    # predictor
     "DamagePredictor",
     "build_predictor_input",
     "predictor_input_dim",
     "sinusoidal_embedding",
-    # §3.3.4 counterfactual
+    # counterfactual
     "CounterfactualVerifier",
     "ResidualRepairNet",
     "VerificationResult",
-    # §7.1.1 damage label
+    # damage label
     "MultiDimDamageComputer",
     "MetricExtractor",
     "VideoFeatures",

@@ -1,17 +1,9 @@
-"""Stage C: Lightweight fine-tuning (§7.1.3).
+"""Stage C: lightweight end-to-end fine-tuning.
 
-Final training stage that fine-tunes the engine ↔ backbone interactions. Unlike
-Stage B (which only used isolated counterfactual labels), Stage C runs the full
-inference loop and tunes to minimize end-to-end video quality.
-
-Key differences from Stage B:
-    - Backbone is mostly frozen, but optionally includes LoRA adapters (rank=8)
-    - Trains residual-repair nets more heavily
-    - Includes pixel-level L1 loss as an auxiliary objective
-    - Runs for only 3 epochs over full video data (not counterfactual pairs)
-
-This stage is optional but recommended for production quality. It converges quickly
-(2-3 epochs) because the Stage B initialization is already good.
+Runs the full accelerated inference loop on real video data and tunes the plugins
+(and optional LoRA adapters) to minimise end-to-end quality loss against the
+full-compute render. The backbone stays frozen; it converges in a few epochs from
+the Stage-B initialisation.
 """
 
 from __future__ import annotations
@@ -68,21 +60,15 @@ from cocf.training.teacher_forward import TeacherForwardConfig, TeacherForwardRu
 Tensor = torch.Tensor
 _log = get_logger(__name__)
 
-# Activation headroom one Stage-C clip needs on top of the frozen weights, at the
-# §4.2 reference geometry (49×384×640 ⇒ 12480 tokens) with a 14B-class expert. The
-# three terms are the ones the graph is actually made of, and two of them are set by
-# knobs — a single constant covering "the worst configuration" told a correctly
-# configured 40 GB run to expect an OOM it was never going to hit, which is the kind
-# of warning that gets flags turned down for no reason.
+# Activation headroom one Stage-C clip needs on top of the frozen weights, split into
+# the terms the autograd graph is actually made of.
 _GIB_CHECKPOINT_STASH = 5.0   # one block input per block, per retained BPTT segment
 _GIB_BLOCK_RECOMPUTE = 3.0    # the in-block peak while a checkpointed block reruns
 _GIB_DECODE_PER_SLOT = 0.375  # retained VAE decode graph, per latent slot on the graph
 _GIB_DECODE_FULL = 12.0       # decode_grad_frames=0 ⇒ the whole clip is on the graph
 
 
-# One render is one smoothing group: :func:`tube_temporal_smoothness` keys on
-# ``(video_id, tube_id)`` to find the same tube at adjacent steps, and every record
-# here comes from the same accelerated trajectory.
+# One render is one smoothing group; every record comes from the same trajectory.
 _RENDER_GROUP = "__render__"
 
 _DAMAGE_COMPUTER = MultiDimDamageComputer()
@@ -94,12 +80,7 @@ def _step_records(
     tube_residual: Optional[Dict[int, float]] = None,
     local_cmsc: Optional[Dict[int, float]] = None,
 ) -> List[StepRecord]:
-    """Fan one ``record_sink`` callback out into per-(tube, step) :class:`StepRecord`s.
-
-    The engine reports a step at a time while the Stage-C regularisers consume the
-    same flat, per-sample shape Stage B uses. This adapter is the glue that was
-    missing — which is the direct reason ``stage_c_losses`` had no caller (§P4-A3).
-    """
+    """Fan one ``record_sink`` callback out into per-(tube, step) :class:`StepRecord`s."""
     tube_residual = tube_residual or {}
     local_cmsc = local_cmsc or {}
     out: List[StepRecord] = []
@@ -128,15 +109,9 @@ def _step_records(
 def _scalar_damage(full: VideoFeatures, accel: VideoFeatures) -> float:
     """Realised end-to-end degradation of the accelerated render, as one scalar.
 
-    The §4.2 certificate regulariser calibrates ``E_cert`` to upper-bound the damage
-    that actually occurred, so it needs the same weighted reduction of the same 8 axes
-    Stage A labels and Stage B trains on (:func:`damage_scalar_batch`) — computed here
-    from the two observations' features rather than re-derived, so the two stages
-    agree on what "damage" means.
-
-    The reference is co-located onto the accelerated branch's device first: every axis
-    is a binary reduction and :class:`MultiDimDamageComputer` carries no device logic,
-    so a reference that was extracted with the CPU offload on would fault here.
+    Uses the same weighted reduction over the damage axes as Stage A/B so the stages
+    agree on what "damage" means. The reference is co-located onto the accelerated
+    branch's device first.
     """
     accel = accel.detached()
     ref = full.detached().to(accel.dino_per_frame.device)
@@ -152,30 +127,20 @@ def _scalar_damage(full: VideoFeatures, accel: VideoFeatures) -> float:
 class StageCConfig:
     """Hyperparameters for Stage C fine-tuning.
 
-    The §4.2 data source is the processed store's ``raw_filtered/`` (preferred,
-    ``processed_root``) or a plain video/caption ``manifest_path`` fallback — both
-    optional so the pipeline (which threads ``processed_root``) and the standalone
-    script (which may pass ``--manifest``) construct this identically. ``config`` is
-    the full :class:`~cocf.common.config.Config` so the stage can size budgets / read
-    data knobs consistently with the rest of the run.
+    The data source is the processed store's ``raw_filtered/`` (``processed_root``) or a
+    plain video/caption ``manifest_path`` fallback; ``config`` is the full run config.
     """
 
-    # Data — at least one of these resolves the §4.2 source (see :meth:`run`).
+    # Data — at least one of these resolves the source (see :meth:`run`).
     manifest_path: Optional[Path] = None  # fallback video/caption manifest
-    processed_root: Optional[Path] = None  # preferred: §3 store (raw_filtered/)
+    processed_root: Optional[Path] = None  # preferred: processed store (raw_filtered/)
     config: Config = field(default_factory=Config)  # full run config
     batch_size: int = 1  # Engine owns one semantic-tube trajectory per call.
     num_workers: int = 2
     num_epochs: int = 3
-    # Denoising steps for the accelerated render. ``None`` — the default — means "match
-    # the schedule Stage A rendered Y_full with", which is what makes the persisted
-    # baseline a valid target. Set it only to deliberately render on a different
-    # schedule, accepting that the cached baseline is then discarded and re-denoised
-    # every batch (two full trajectories + two decodes per step, §P2-4).
-    #
-    # This lives here, rather than in each caller, because the two entry points had
-    # drifted: the CLI aligned the counts while ``TrainingPipeline`` did not, so the
-    # pipeline path silently paid double for every Stage-C step (§P4-3).
+    # Denoising steps for the accelerated render. ``None`` (default) matches the schedule
+    # Stage A rendered Y_full with, keeping the persisted baseline a valid target; any
+    # other value discards the cached baseline and re-denoises every batch.
     num_inference_steps: Optional[int] = None
 
     # Optimization
@@ -204,13 +169,10 @@ class StageCConfig:
 
 
 class FinettuneStage:
-    """Stage C: End-to-end lightweight fine-tuning (§7.1.3).
+    """Stage C: end-to-end lightweight fine-tuning.
 
-    Runs the full accelerated inference engine on real video data and tunes to
-    minimize end-to-end quality loss. Optional LoRA adapters on the backbone.
-
-    Key insight: Stage B training converges quickly, so this stage mainly refines
-    the residual-repair nets and boundary fusion, with minimal backbone tuning.
+    Runs the full accelerated inference engine on real video data and tunes the plugins
+    (and optional LoRA adapters) to minimise end-to-end quality loss.
     """
 
     def __init__(
@@ -228,38 +190,21 @@ class FinettuneStage:
         self._warned_baseline_mismatch = False
         self._warned_no_grad_batch = False
 
-        # Pin the accelerated render to the schedule Stage A's Y_full was generated
-        # with, unless the caller explicitly asked for another one. Doing it here — not
-        # in each entry point — is what keeps the CLI and TrainingPipeline in step
-        # (§P4-3). ``engine.engine_cfg`` is normally the *same object* as
-        # ``config.config.engine``; both are written so a caller that passed a separate
-        # EngineConfig still gets a consistent pair.
+        # Pin the accelerated render to Stage A's schedule unless the caller overrode it.
         self._resolve_inference_steps()
 
-        # Freeze the backbone before anything else (matches Stage B). Stage C tunes
-        # the plugins — and optionally LoRA — never the full backbone. But autograd
-        # still allocates gradients and retains activations for any parameter left
-        # with requires_grad=True, so an unfrozen backbone silently inflates VRAM by
-        # a large multiple even though the optimizer never sees those params. Freeze
-        # first, then add LoRA so the freshly-inserted LoRA params stay trainable.
+        # Freeze the backbone first, then add LoRA so the new LoRA params stay trainable.
         self.accelerator.freeze_backbone()
 
-        # Place the learnable plugins on the run device (mirrors JointTrainingStage,
-        # stage_b_joint.py). The engine follows ``z.device`` throughout but never
-        # *moves* the accelerator, and the frozen backbone is a plain attribute placed
-        # via ``config.backbone.device`` — so without this the plugins (strength field,
-        # damage predictor, repair net, CMSC alignment, certificate) stay on CPU while
-        # ``z_init``/backbone are on GPU, and the first plugin call inside
-        # ``engine.generate()`` (and the schedule regularisers) hit a CPU×CUDA mismatch.
+        # Place the learnable plugins on the run device to match the backbone/z_init.
         self.accelerator.to(self.device)
 
-        # Optionally add LoRA adapters to backbone (§4.2 "最后若干层 DiT 的 LoRA 适配器")
+        # Optionally add LoRA adapters to the last few DiT blocks.
         self._lora_params: list = []
         if config.use_lora:
             _log.info(f"Stage C: Adding LoRA adapters (rank={config.lora_rank})")
             self._add_lora_adapters()
-        # Unconditional: the repair net puts ``z`` on the graph, so the DiT retains
-        # block inputs with or without LoRA (see the method docstring).
+        # Unconditional: the repair net puts ``z`` on the graph even without LoRA.
         self._enable_backbone_checkpointing()
 
         free_gib = self._free_vram_gib()
@@ -310,8 +255,7 @@ class FinettuneStage:
         """
         if not str(self.device).startswith("cuda") or not torch.cuda.is_available():
             return None
-        # ``index or 0`` would read card 0 for a bare "cuda" — wrong on every rank but
-        # rank 0 under torchrun, and this figure decides the batch clamp.
+        # Read the current device, not card 0 (a bare "cuda" has index None).
         idx = torch.device(self.device).index
         idx = torch.cuda.current_device() if idx is None else idx
         total = torch.cuda.get_device_properties(idx).total_memory
@@ -333,21 +277,10 @@ class FinettuneStage:
     def _enable_backbone_checkpointing(self) -> None:
         """Turn on activation checkpointing in every DiT expert.
 
-        This used to be gated on ``use_lora``, on the reasoning that a fully frozen
-        backbone "retains nothing". That is wrong for this stage: the residual-repair
-        net edits ``z`` mid-trajectory, so from that point on ``z`` requires grad and
-        autograd retains each block's inputs to backprop *through* the DiT — whether or
-        not the DiT itself has trainable parameters. Without checkpointing a
-        Wan2.2-A14B step at 12,480 tokens keeps roughly 2 GiB per block across 40
-        blocks, which OOMs a 40 GB card long before the LoRA question arises. So it is
-        now unconditional, and ``MemoryConfig.gradient_checkpointing`` is the only
-        switch.
-
-        Applied to **every** denoiser, not ``backbone.module``: that property returns
-        the primary transformer only, so on an A14B MoE the low-noise expert — the one
-        that runs at every σ below the boundary, i.e. all of the steps inside the BPTT
-        window — was left un-checkpointed. :meth:`BackboneAdapter.lora_roots` is the
-        existing enumeration of both experts.
+        Unconditional (gated only by ``MemoryConfig.gradient_checkpointing``): the
+        residual-repair net puts ``z`` on the graph, so autograd retains block inputs
+        whether or not the DiT is trainable. Applied to every denoiser via
+        :meth:`BackboneAdapter.lora_roots`, not just the primary transformer.
         """
         if not self.config.config.memory.gradient_checkpointing:
             return
@@ -364,9 +297,7 @@ class FinettuneStage:
             params += sum(p.numel() for p in module.parameters())
             _log.info("Stage C: activation checkpointing on '%s' → %d module(s)", name, n)
         if total or params < 10 ** 8:
-            # A mock/toy adapter exposes no checkpointing hook and needs none — its
-            # activations are megabytes. Only a real DiT makes this a failure worth
-            # shouting about, so gate the alarm on there being real weights to protect.
+            # A mock/toy adapter needs no checkpointing; only warn for a real DiT.
             return
         _log.warning(
             "Stage C: a %.1fB-parameter backbone accepted no activation checkpointing. "
@@ -379,17 +310,11 @@ class FinettuneStage:
     def run(self) -> Accelerator:
         """Execute Stage C fine-tuning."""
         _log.info("=== Stage C: Lightweight Fine-tuning ===")
-        # Eval mode: the plugins carry no dropout/BN, so this only skips the predictor's
-        # gradient-checkpointing wrapper — keeping the autograd graph simple and
-        # deterministic while parameters still receive gradient.
+        # Eval mode: the plugins carry no dropout/BN; parameters still receive gradient.
         self.accelerator.eval()
 
-        # Resolve the §4.2 data source. ``RawFilteredDataset`` reads the processed
-        # store's ``raw_filtered/captions.jsonl`` (or a fallback manifest) as *metadata
-        # only* and carries each clip's ``video_id`` — two things that matter here:
-        # this stage never touches ``batch["video"]`` (it renders from the caption), so
-        # decoding clips was pure waste, and the ``video_id`` is what lets it fetch the
-        # ``Y_full`` Stage A already computed instead of re-denoising it (§P2-4).
+        # Resolve the data source. ``RawFilteredDataset`` reads captions as metadata only
+        # and carries each clip's ``video_id``, used to fetch Stage A's cached ``Y_full``.
         if self.config.manifest_path is None and self.config.processed_root is None:
             _log.warning("Stage C: no --manifest or --processed-root given; nothing to train on.")
             return self.accelerator
@@ -398,11 +323,8 @@ class FinettuneStage:
             processed_root=self.config.processed_root,
             manifest_path=self.config.manifest_path,
         )
-        # §4.2 硬样本优先: multi / occlusion / text / face clips are up-weighted so the
-        # end-to-end fine-tune spends more steps on the model's short-board scenes. The
-        # sampler draws with replacement, so it shards by rank without partitioning a
-        # pool — every rank keeps the exact boost and the same step count, which is
-        # what the gradient all-reduce after every backward requires.
+        # Hard-sample priority: multi / occlusion / text / face clips are up-weighted. The
+        # sampler draws with replacement so every rank keeps the same step count.
         dctx = dist_context()
         sampler = HardSamplePrioritySampler(
             dataset.scene_types, seed=self.config.config.seed,
@@ -419,13 +341,8 @@ class FinettuneStage:
         )
 
         if dctx.enabled:
-            # Ranks share a seed and a checkpoint, so this is normally a no-op — but a
-            # tensor the checkpoint could not restore (a shape-mismatched vis_proj) or
-            # a freshly injected LoRA would otherwise start different on every rank,
-            # and data parallelism over diverged replicas trains nothing coherent.
-            # Before the first collective of the run: the gradient all-reduce walks
-            # this exact list, and a rank with a different length would not error, it
-            # would hang. Same for the batch count, which drives one collective a step.
+            # Before the first collective: sync parameters from rank 0 and assert that all
+            # ranks agree on the parameter and batch counts (a mismatch would hang).
             assert_same(len(self.trainable_params), "trainable-parameter count", dctx)
             assert_same(len(dataloader), "batches per epoch", dctx)
             n = broadcast_parameters(
@@ -441,8 +358,7 @@ class FinettuneStage:
             _log.info("Stage C: %d clips, %d batches (hard scenes up-weighted)",
                       len(dataset), len(dataloader))
         if len(dataloader) == 0:
-            # No clips resolved (empty/missing manifest). Bail out cleanly instead of
-            # dividing by a zero batch count in the epoch-average below.
+            # No clips resolved (empty/missing manifest); bail out cleanly.
             _log.warning("Stage C: data source '%s' yielded no batches; skipping fine-tune.", source)
             return self.accelerator
 
@@ -451,17 +367,12 @@ class FinettuneStage:
         for epoch in range(self.config.num_epochs):
             epoch_loss = 0.0
             trained_batches = 0
-            # Without this every epoch draws the *same* indices, so the run sees one
-            # fixed subset of the clips however many epochs it is given.
+            # Reseed the sampler so each epoch draws different indices.
             sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(dataloader):
-                # A per-clip failure (an OOM on a tube-dense clip, a baseline that
-                # vanished, a reference whose geometry does not match) is local to one
-                # rank, but neither raising nor skipping is safe on its own: the other
-                # ranks would block in the next all-reduce until the backend times out.
-                # Fail softly, then agree — ``all_agree`` is itself a collective, so the
-                # sequence stays identical on every rank.
+                # A per-clip failure is local to one rank; fail softly then agree via
+                # ``all_agree`` so every rank runs the same collective sequence.
                 try:
                     loss = self._finetune_batch(batch)
                     ok = True
@@ -475,22 +386,12 @@ class FinettuneStage:
                 if not all_agree(ok, dctx, device=torch.device(self.device)):
                     continue
 
-                # Backward pass. set_to_none freed the grad tensors above instead of
-                # zeroing them in place — lower memory held across the step boundary.
-                # A batch can legitimately produce a loss with no autograd graph: the
-                # render skipped every repair (nothing puts z on the graph), the clip
-                # segmented no tube (no regularisers) and LoRA is off. ``backward()``
-                # on that raises "does not require grad", which used to kill the run at
-                # a random batch hours in. Skipping it is the correct no-op — there is
-                # nothing to learn from this batch — but the *decision* must be shared:
-                # a rank that skipped its collectives while the others all-reduce does
-                # not fail, it hangs.
+                # A batch can produce a loss with no autograd graph (no repair fired, no
+                # tube, LoRA off); skip backward but keep the collective sequence identical
+                # across ranks.
                 if loss.requires_grad:
                     loss.backward()
-                # Average across ranks *before* clipping, so every rank clips the same
-                # gradient and therefore takes an identical optimiser step. Called
-                # unconditionally so the collective count matches on every rank; a
-                # no-op when this is a single process.
+                # Average across ranks before clipping so all ranks step identically.
                 average_gradients(self.trainable_params, dctx)
                 trained = all_reduce_mean(
                     float(loss.requires_grad), dctx, device=torch.device(self.device)
@@ -515,8 +416,7 @@ class FinettuneStage:
                 epoch_loss += float(loss)
 
                 if batch_idx % 10 == 0 and dctx.is_main:
-                    # ``batch_idx + 1`` batches have been summed into epoch_loss;
-                    # the old ``max(1, batch_idx)`` divisor skewed the running mean.
+                    # Divide by the number of batches summed so far.
                     avg_loss = epoch_loss / (batch_idx + 1)
                     _log.info(
                         f"  Epoch {epoch+1}/{self.config.num_epochs}, "
@@ -525,8 +425,7 @@ class FinettuneStage:
                     )
 
                 if (batch_idx + 1) % self.config.save_interval == 0 and dctx.is_main:
-                    # Created on first write, not in __post_init__: building a config
-                    # object should not touch the filesystem.
+                    # Created on first write, not in __post_init__.
                     self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
                     ckpt_path = (
                         self.config.checkpoint_dir
@@ -534,15 +433,11 @@ class FinettuneStage:
                     )
                     torch.save(self.checkpoint(), ckpt_path)
 
-            # Reduced across ranks: each rank only saw its own shard, and a per-rank
-            # mean would have rank 3 keeping a "best" checkpoint rank 0 rejected.
+            # Reduced across ranks so every rank agrees on the epoch mean.
             avg_epoch_loss = all_reduce_mean(
                 epoch_loss / len(dataloader), dctx, device=torch.device(self.device)
             )
-            # Report what actually trained, not just the loss: skipping a graph-less
-            # batch is a quiet no-op, and a run where *every* batch is skipped would
-            # otherwise look identical in the log to one that is learning — the exact
-            # failure the crash this replaced used to make impossible to miss.
+            # Report how many batches actually trained, not just the loss.
             if dctx.is_main:
                 _log.info(
                     "Epoch %d complete. Average loss: %.4f (optimiser stepped on "
@@ -560,8 +455,7 @@ class FinettuneStage:
                     "turn LoRA on if the card has room.", epoch + 1, len(dataloader),
                 )
 
-            # The comparison runs on every rank (all-reduced, hence identical), but
-            # only rank 0 writes — eight processes writing one path is a corrupt file.
+            # Every rank computes the same all-reduced mean; only rank 0 writes.
             if avg_epoch_loss < best_loss:
                 best_loss = avg_epoch_loss
                 if dctx.is_main:
@@ -574,34 +468,26 @@ class FinettuneStage:
         return self.accelerator
 
     def _finetune_batch(self, batch) -> Tensor:
-        """One §4.2 end-to-end step on a batch of captions.
+        """One end-to-end step on a batch of captions.
 
-        Runs the accelerated engine, scores the render against the full-compute
-        baseline ``Y_full`` (same initial noise), and adds the schedule regularisers
-        recomputed on the engine's real per-step features::
+        Runs the accelerated engine, scores the render against the full-compute baseline
+        ``Y_full`` (same initial noise), and adds the schedule regularisers recomputed on
+        the engine's per-step features::
 
-            L = λ_pixel·L_pixel(Y_accel, Y_full)      (§4.2 主损失 — 像素)
-              + λ_quality·L_CMSC(Y_accel, Y_full)     (§4.2 主损失 — 多维语义守恒, §6.3.2)
-              + λ_sta·L_tube + λ_cert·L_cert + λ_cost·L_budget   (§4.2 正则)
+            L = λ_pixel·L_pixel + λ_quality·L_CMSC + λ_sta·L_tube + λ_cert·L_cert
+              + λ_cost·L_budget
 
-        Every term is assembled by :mod:`cocf.training.stage_c_losses`, which is also
-        where the objective is documented. This stage previously carried a hand-written
-        3-term stand-in for the §6.3.2 loss (identity / appearance / motion) while the
-        full six-term implementation sat unused, so ``λ_spatial``/``λ_ocr``/``λ_bnd``
-        never trained (§P4-A3). The pixel/CMSC terms flow gradient through the
-        differentiable decode into the residual-repair net (and any LoRA adapters); the
-        regularisers flow into the L-COCF strength field, damage predictor and the RAEC
-        certificate coefficients — exactly the §4.2 gradient scope.
+        Every term is assembled by :mod:`cocf.training.stage_c_losses`. The pixel/CMSC
+        terms flow gradient into the residual-repair net (and LoRA); the regularisers
+        into the strength field, damage predictor and certificate coefficients.
         """
         bb = self.accelerator.backbone
         captions = [item.caption for item in batch]
         if not captions:
             return torch.zeros((), device=self.device, requires_grad=True)
 
-        # Reuse Stage A's persisted baseline when it exists: it is the *same*
-        # computation, already paid for, and re-running it made every Stage-C step two
-        # full trajectories plus two decodes (§P2-4). It is only a valid reference for a
-        # run starting from the same noise, so z_T is loaded with it or neither is used.
+        # Reuse Stage A's persisted baseline when it exists (z_T and Y_full together),
+        # else recompute the full-compute reference.
         video_ids = [item.video_id for item in batch]
         grid = bb.token_grid(*self._frame_shape())
         z_init = self._cached_baseline(video_ids, grid)
@@ -622,12 +508,8 @@ class FinettuneStage:
             decode_grad=True,
         )
         y_accel = result.video
-        # A windowed differentiable decode (``engine.decode_grad_frames``) covers only
-        # part of the clip, so the reference must be cut to the *same* pixel frames —
-        # comparing a window against the whole baseline would score the accelerator on
-        # frames it did not render (§P4-B1). On the cached path the cut happens at the
-        # *read*, so the discarded frames never reach the device at all; on the
-        # recomputed path the whole clip is already in hand and is sliced here.
+        # A windowed decode covers only part of the clip, so cut the reference to the same
+        # pixel frames before comparing.
         if y_full is None:
             y_full = self._windowed_reference(video_ids, result.frame_span)
             if y_full is None:
@@ -639,10 +521,7 @@ class FinettuneStage:
             y_full = self._align_reference(y_full, result.frame_span)
         self._check_alignment(y_accel, y_full, result.frame_span)
 
-        # --- §4.2 主损失: pixel + the full §6.3.2 conservation loss ------------- #
-        # ``F.l1_loss`` rather than ``(a - b).abs().mean()``: the latter materialises
-        # two more full-size video tensors (a 49×480×832 batch is ~0.9 GB each) for a
-        # value the fused kernel produces with none (§P4-B2).
+        # --- main loss: pixel + the conservation loss --- #
         l_pixel = F.l1_loss(y_accel.float(), y_full.float().to(y_accel.device))
         l_quality, cmsc_terms = self._conservation_loss(
             y_accel, y_full, captions, result, text_embeds=cond.embeds
@@ -665,9 +544,7 @@ class FinettuneStage:
     def _align_reference(y_full: Tensor, frame_span) -> Tensor:
         """Slice ``Y_full`` ``[B,3,F,H,W]`` to the pixel frames the render covers.
 
-        ``frame_span is None`` (inference, or a full decode) leaves it untouched. The
-        span comes from the backbone's own :meth:`~cocf.backbones.base.BackboneAdapter.pixel_span`,
-        so the two sides are cut by the same arithmetic that produced the render.
+        ``frame_span is None`` leaves it untouched.
         """
         if frame_span is None:
             return y_full
@@ -678,17 +555,8 @@ class FinettuneStage:
     def _check_alignment(y_accel: Tensor, y_full: Tensor, frame_span) -> None:
         """Fail loudly when the render and its reference do not describe the same frames.
 
-        Both §4.2 main-loss terms compare these element-wise, so a geometry mismatch is a
-        wrong training objective — and one that reports itself badly if left to the loss:
-        a differing frame count surfaces as ``broadcast_tensors`` deep inside
-        ``F.l1_loss`` with no mention of the window that caused it, while a mismatch on
-        an axis that happens to be 1 would broadcast *silently* and train on nonsense.
-        Checked once per batch against tensors already in hand, so it costs nothing.
-
-        The cause is always the same shape of thing: whatever produced ``frame_span``
-        disagrees with what ``decode_latent`` actually emitted for the window (see
-        :meth:`~cocf.backbones.base.BackboneAdapter.pixel_span`'s contract), or Stage A
-        persisted ``Y_full`` at a geometry this run does not render at.
+        Both main-loss terms compare these element-wise, so a geometry mismatch would
+        otherwise surface as an opaque broadcast error (or train on nonsense silently).
         """
         if y_accel.shape == y_full.shape:
             return
@@ -703,30 +571,21 @@ class FinettuneStage:
         )
 
     # ------------------------------------------------------------------ #
-    # §4.2 forward building blocks
+    # forward building blocks
     # ------------------------------------------------------------------ #
 
     def _conservation_loss(self, y_accel, y_full, captions, result, *, text_embeds=None):
-        """§6.3.2 ``L_CMSC`` averaged over **every** clip in the batch.
+        """``L_CMSC`` averaged over every clip in the batch.
 
-        The batch is rendered in one engine call and the engine segments its tubes from
-        the first element's preview decode, so all clips share one tube set — but each
-        has its own caption and its own render, and scoring only ``[0]`` (as this stage
-        used to) threw away ``(B-1)/B`` of the signal while paying the full memory bill
-        for it (§P4-B2). Returns ``(loss, {per-term components, measured_damage})``,
-        where ``measured_damage`` is the realised end-to-end degradation the §4.2
-        certificate regulariser calibrates against.
+        Returns ``(loss, {per-term components, measured_damage})``, where
+        ``measured_damage`` is the realised degradation the certificate regulariser
+        calibrates against.
         """
         me = self.accelerator.metric_extractor
         if me is None or not result.tubes:
             return y_accel.new_zeros(()), {}
         grid = result.grid or self.accelerator.backbone.token_grid(*self._frame_shape())
-        # Reuse the conditioning the caller already encoded. Re-encoding here was the
-        # same prompts through the same frozen umT5 for the same result — and under the
-        # default residency policy (``text_encoder=cpu`` + ``te_exclusive``) each call
-        # parks the resident ~27 GiB expert on the CPU, moves the ~11 GiB text encoder
-        # onto the card and reverses it afterwards, so the duplicate cost a second
-        # ~76 GiB round trip over PCIe on *every* training step.
+        # Reuse the conditioning the caller already encoded instead of re-encoding.
         text = text_embeds if text_embeds is not None else \
             self.accelerator.backbone.encode_text(captions).embeds
 
@@ -738,9 +597,7 @@ class FinettuneStage:
                   y_accel.shape[2], self._frame_shape()[0], result.frame_span, grid.t,
                   len(result.tubes))
         for b in range(n):
-            # Accelerated branch keeps the autograd graph (``differentiable=True``);
-            # the baseline is a detached, no-grad reference — the "conserve the
-            # reference relations" semantics of §6.
+            # The accelerated branch keeps the autograd graph; the baseline is detached.
             accel_obs = build_cmsc_observation(
                 me, self.accelerator.perception, self._to_fchw(y_accel, b),
                 captions[b], result.tubes, grid, text[b], differentiable=True,
@@ -762,11 +619,8 @@ class FinettuneStage:
         return total / n, comps
 
     def _regularizers(self, records, measured_damage: float):
-        """§4.2 正则: reuse the Stage-B tube-smoothing / certificate / budget terms on
-        the engine's *actual* per-step scheduling features (captured via ``record_sink``).
-
-        Differentiable through the strength field and damage predictor, so the §4.2
-        end-to-end fine-tune shapes the scheduler on the trajectory it really produced.
+        """Reuse the Stage-B tube-smoothing / certificate / budget terms on the engine's
+        per-step scheduling features (captured via ``record_sink``).
         """
         batch = collate_step_records(records)
         if not batch:
@@ -784,28 +638,14 @@ class FinettuneStage:
     def _cached_baseline(self, video_ids, grid):
         """Stage A's cached ``z_T`` for the batch, or ``None`` to recompute.
 
-        Requires *every* clip in the batch to have **both** halves of the level-3
-        bucket, since the batch is rendered in one engine call — but only the ``z_T``
-        half is returned here. ``Y_full`` is fetched afterwards by
-        :meth:`_windowed_reference`, once the render has settled which frames the
-        differentiable decode actually covers; presence is validated now
-        (:meth:`ProcessedLayout.has_y_full`) so the decision to reuse the baseline is
-        still made *before* the render commits to ``z_T``.
-
-        Returns ``None`` — meaning "recompute" — for a store built with
-        ``--no-baseline`` (the documented way to skip the ~1 TB bucket), and for a
-        store whose geometry differs from this run's: Stage A may have generated at
-        another resolution or frame count, and a ``z_T`` of the wrong token count
-        would otherwise be reshaped into nonsense.
+        Requires every clip to have both halves of the baseline bucket; only ``z_T`` is
+        returned here and ``Y_full`` is fetched afterwards by :meth:`_windowed_reference`.
+        Returns ``None`` for a store built without a baseline or at a different geometry.
         """
         if self.config.processed_root is None:
             return None
-        # Y_full is the full-compute render of a *specific* schedule. Reusing a
-        # 20-step baseline as the target for a 30-step accelerated run would charge
-        # the schedule difference to the accelerator, so the step counts must agree.
-        # ``_resolve_inference_steps`` aligns them unless the caller overrode the
-        # count, and already said so once — this is the per-batch guard, kept silent
-        # so a deliberate override does not emit one line per batch for the whole run.
+        # The baseline is only valid for the schedule it was rendered with; require the
+        # step counts to agree.
         teacher_steps = self.config.config.teacher.num_inference_steps
         if self.engine.engine_cfg.num_inference_steps != teacher_steps:
             return None
@@ -832,15 +672,8 @@ class FinettuneStage:
     def _windowed_reference(self, video_ids, frame_span) -> Optional[Tensor]:
         """Stage A's ``Y_full`` for the batch, read at ``frame_span`` only.
 
-        Returns ``[B, 3, f, H, W]`` — already cut to the frames the differentiable
-        decode covers, so it needs no :meth:`_align_reference` afterwards — or ``None``
-        if any clip's baseline vanished between the pre-render check and here (a store
-        edited mid-run; the caller then recomputes).
-
-        Reading the window rather than the clip is what keeps the reference off the
-        card during the render: at ``decode_grad_frames=2`` the loss scores 5 of 49
-        frames, and the other 44 were being transferred and held for the whole
-        trajectory for nothing.
+        Returns ``[B, 3, f, H, W]`` already cut to the frames the decode covers (no
+        :meth:`_align_reference` needed), or ``None`` if any clip's baseline is missing.
         """
         if self.config.processed_root is None:
             return None
@@ -857,7 +690,7 @@ class FinettuneStage:
         return torch.stack(ys)
 
     def _build_inputs(self, captions, *, cond=None):
-        """Encode captions and sample the shared initial noise / token grid (§7.2)."""
+        """Encode captions and sample the shared initial noise / token grid."""
         bb = self.accelerator.backbone
         d = self.config.config.data
         grid = bb.token_grid(d.num_frames, d.height, d.width)
@@ -869,16 +702,8 @@ class FinettuneStage:
     def _cached_cond(self, video_ids, captions) -> Optional[TextConditioning]:
         """Stage A's persisted prompt embeddings for the batch, or ``None``.
 
-        Re-encoding the caption is the same frozen umT5 over the same prompt for the
-        same result, and under the default residency policy (``text_encoder=cpu`` +
-        ``te_exclusive``) each call parks the resident ~26 GiB expert on the CPU, moves
-        the ~11 GiB text encoder onto the card and reverses it afterwards — ~74 GiB
-        over PCIe on *every* training step. Stage A already wrote the sequence per clip
-        (``text_embeds/<video_id>.pt``, trimmed and fp16), so the batch is assembled
-        from disk and the encoder never wakes up.
-
-        ``None`` when any clip is missing one, so the caller falls back to encoding —
-        a partially-cached batch would mix two sources on one conditioning tensor.
+        Loads ``text_embeds/<video_id>.pt`` from disk so the text encoder never wakes up.
+        ``None`` when any clip is missing one, so the caller falls back to encoding.
         """
         if self.config.processed_root is None:
             return None
@@ -903,14 +728,11 @@ class FinettuneStage:
         )
 
     def _full_baseline(self, z_init, cond, grid) -> Tensor:
-        """Decode the un-accelerated baseline ``Y_full`` for the §4.2 main loss, on the
-        *same* initial noise as the accelerated run (label-only, no grad).
+        """Decode the un-accelerated baseline ``Y_full`` on the same initial noise as the
+        accelerated run (label-only, no grad).
 
-        Run under ``grad_mode`` + ``no_grad`` rather than ``inference_mode``: the
-        reference is a *constant*, but it still gets multiplied against the accelerated
-        render in the semantic loss, and an inference tensor cannot be saved for
-        backward — it would raise the moment the §6.3.2 terms are evaluated. ``no_grad``
-        keeps the pass graph-free all the same, so nothing is paid for the correctness.
+        Run under ``grad_mode`` + ``no_grad`` rather than ``inference_mode`` so the
+        reference can be multiplied against the accelerated render in the loss.
         """
         tf_cfg = TeacherForwardConfig.from_config(self.config.config)
         tf_cfg.num_inference_steps = self.engine.engine_cfg.num_inference_steps
@@ -924,26 +746,17 @@ class FinettuneStage:
     def _to_fchw(video: Tensor, index: int = 0) -> Tensor:
         """``[B,3,F,H,W]`` (or ``[3,F,H,W]``) → clip ``index`` as ``[F,3,H,W]``.
 
-        Slices *before* permuting: ``permute(...).contiguous()`` on the whole batch
-        materialised two more full-size, gradient-carrying copies of every clip when
-        only one of them was about to be read (§P4-B2). The render is already in
-        ``[0, 1]`` (:meth:`~cocf.backbones.base.BackboneAdapter.decode_to_unit`).
+        Slices before permuting so only the read clip is materialised.
         """
         v = video[index] if video.dim() == 5 else video
         return v.permute(1, 0, 2, 3).contiguous()
     # ------------------------------------------------------------------ #
-    # LoRA + trainable-parameter scope (§4.2)
+    # LoRA + trainable-parameter scope
     # ------------------------------------------------------------------ #
 
     def _add_lora_adapters(self) -> None:
-        """Inject LoRA into the backbone's last-``lora_layers`` DiT blocks (§4.2),
-        storing the new trainable params. A logged no-op when the backbone exposes no
-        ``dit_blocks()`` (the plugin fine-tune still runs).
-
-        ``inject_lora`` materialises the backbone first: a real adapter builds its
-        transformer lazily on the first forward, and this runs at *construction* —
-        long before any forward — so without that the injection saw no blocks and
-        ``--use_lora`` was a silent no-op.
+        """Inject LoRA into the backbone's last-``lora_layers`` DiT blocks, storing the new
+        trainable params. A logged no-op when the backbone exposes no ``dit_blocks()``.
         """
         self._lora_params, self._lora_modules = inject_lora(
             self.accelerator.backbone,
@@ -959,9 +772,8 @@ class FinettuneStage:
     def checkpoint(self) -> Dict[str, object]:
         """Full Stage-C checkpoint: plugin weights + LoRA adapters + their geometry.
 
-        The rank / target-block count are stored alongside the tensors because the
-        adapters must be re-injected with the *same* geometry before they can be
-        loaded back (see :func:`cocf.training.lora.attach_lora`).
+        The rank / target-block count are stored so the adapters can be re-injected with
+        the same geometry before loading (see :func:`cocf.training.lora.attach_lora`).
         """
         return build_checkpoint(
             self.accelerator,
@@ -971,9 +783,8 @@ class FinettuneStage:
         )
 
     def _get_trainable_params(self):
-        """The §4.2 gradient scope: the L-COCF predictor + strength field + residual
-        repair net, the RAEC certificate, the CMSC alignment head, and (optionally) the
-        last-N-DiT-block LoRA adapters. The backbone bulk stays frozen.
+        """The gradient scope: the L-COCF predictor + strength field + repair net, the RAEC
+        certificate, the CMSC alignment head, and any LoRA adapters. The backbone stays frozen.
         """
         params = [p for group in self.accelerator.parameter_groups().values() for p in group]
         params += self._lora_params

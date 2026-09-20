@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""Signal-ceiling probe for the Stage-B predictor inputs; no checkpoint needed.
-
-The phased Stage-B run calibrates σ well, but its μ ends up near-constant within
-each action (per-subset prediction_std ~1e-4). Before retraining μ harder, this
-script measures how much per-sample signal the *inputs themselves* carry about
-the damage target, using the exact feature vector the predictor is trained on
-(``[tube_state(7), strength_feats(3), budget, step_frac]``):
-
-* per-feature Pearson/Spearman correlation with the target (train split), with
-  per-feature variance so dead columns (e.g. an unpopulated ``causal_value``)
-  show up immediately;
-* three val-split reference points per action subset:
-    - the action-mean baseline (what a collapsed μ achieves),
-    - ridge regression on step_frac+budget only (what (action, step) explains),
-    - ridge regression on all 12 features (the linear signal ceiling),
-    - k-NN regression on all features (a cheap nonlinear ceiling).
-
-Interpretation: if the all-feature fits barely beat the action-mean baseline,
-μ's collapse is a *feature* problem (retraining will not fix it); if they beat
-it clearly with prediction_std well above 1e-4, it is an *optimisation* problem
-and a longer, hotter mean phase should recover per-sample variation.
-"""
+"""Probe input signal ceiling for Stage-B predictor."""
 import argparse
 import importlib.util
 import json
@@ -40,7 +19,6 @@ from cocf.core.accelerator import Accelerator
 from cocf.data import CounterfactualLMDBDataset, ProcessedLayout, collate_cocf_samples
 from cocf.training.stage_b_losses import damage_scalar_batch, per_sample_budget
 
-# `scripts` is not an installed package; an unrelated package may shadow it.
 _training_path = Path(__file__).resolve().parents[1] / 'train' / 'train_stage_b.py'
 if not _training_path.is_file():
     raise ImportError(f'Missing project training entry point: {_training_path}')
@@ -57,7 +35,7 @@ STEP_BUDGET_IDX = [FEATURE_NAMES.index('budget'), FEATURE_NAMES.index('step_frac
 
 
 def collect(acc, loader):
-    """Assemble (X, y, action) over one split with the training-time feature vector."""
+    """Collect features and targets for one split."""
     xs, ys, acts = [], [], []
     for batch in loader:
         budget = per_sample_budget(acc, batch, device=torch.device('cpu'))
@@ -74,7 +52,7 @@ def collect(acc, loader):
 
 
 def _ranks(v):
-    """Average ranks (ties share their mean rank); mergsort keeps it stable."""
+    """Compute average ranks."""
     order = np.argsort(v, kind='mergesort')
     ranks = np.empty(len(v), dtype=np.float64)
     sorted_v = v[order]
@@ -89,12 +67,14 @@ def _ranks(v):
 
 
 def _corr(a, b):
+    """Compute Pearson correlation or None."""
     if len(a) < 3 or a.std() < 1e-12 or b.std() < 1e-12:
         return None
     return float(np.corrcoef(a, b)[0, 1])
 
 
 def ridge_fit(X, y, lam):
+    """Fit ridge regression model."""
     xm, xs = X.mean(0), X.std(0)
     xs[xs < 1e-12] = 1.0
     Xs = (X - xm) / xs
@@ -103,21 +83,23 @@ def ridge_fit(X, y, lam):
 
 
 def ridge_predict(model, X):
+    """Predict with ridge model."""
     xm, xs, w, b = model
     return ((X - xm) / xs) @ w + b
 
 
 def knn_predict(X_train, y_train, X_val, k):
+    """Predict with k-NN regression."""
     xm, xs = X_train.mean(0), X_train.std(0)
     xs[xs < 1e-12] = 1.0
     tr, va = (X_train - xm) / xs, (X_val - xm) / xs
-    # Squared distances via the expansion; splits are ~1e3 rows so this is cheap.
     d2 = (va ** 2).sum(1, keepdims=True) + (tr ** 2).sum(1) - 2 * va @ tr.T
     neigh = np.argpartition(d2, k, axis=1)[:, :k]
     return y_train[neigh].mean(1)
 
 
 def _fit_report(y_val, pred, action_means):
+    """Build fit report metrics."""
     return dict(
         mae=float(np.abs(pred - y_val).mean()),
         pearson=_corr(y_val, pred),
@@ -128,6 +110,7 @@ def _fit_report(y_val, pred, action_means):
 
 
 def main():
+    """Run signal ceiling probe."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--processed-root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -149,8 +132,6 @@ def main():
     if not train_ids or not eval_ids or set(train_ids) & set(eval_ids):
         parser.error('Empty or overlapping train/evaluation splits')
 
-    # The accelerator is built only for its budget scheduler — the same one
-    # Stage B trains against (per_sample_budget is a scheduler lookup).
     config = Config()
     config.backbone.device = 'cpu'
     _apply_stage_a_geometry(config, layout, log)
@@ -158,6 +139,7 @@ def main():
     acc = Accelerator.from_config(config, text_dim=text_dim, visual_dim=visual_dim)
 
     def loader(ids):
+        """Build dataloader for given ids."""
         dataset = CounterfactualLMDBDataset(layout.lmdb_dir, ids,
                                             text_embed_dir=layout.text_embed_dir)
         if set(dataset.keys) != set(ids):
@@ -233,6 +215,7 @@ def main():
 
 
 def _fmt_r(value):
+    """Format correlation value."""
     return f'{value:+.3f}' if value is not None else ' n/a '
 
 

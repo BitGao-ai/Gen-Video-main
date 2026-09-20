@@ -1,10 +1,4 @@
-"""A tiny, type-safe registry used for pluggable backbones and components.
-
-The registry is the mechanism behind *backbone compatibility* (user requirement
-#2): a new backbone is added by writing an adapter and decorating it with
-``@register_backbone("name")`` — no other file changes. Construction is decoupled
-from the call site, which depends only on the string key in the config.
-"""
+"""String-keyed registry for pluggable components."""
 
 from __future__ import annotations
 
@@ -14,14 +8,15 @@ T = TypeVar("T")
 
 
 class Registry(Generic[T]):
-    """Maps string keys to classes (or factories) of a common base type."""
+    """Map string keys to classes."""
 
     def __init__(self, name: str) -> None:
+        """Create named registry."""
         self._name = name
         self._entries: Dict[str, Type[T]] = {}
 
     def register(self, key: str) -> Callable[[Type[T]], Type[T]]:
-        """Decorator: register a class under ``key`` (case-insensitive)."""
+        """Register class under key."""
 
         def _wrap(cls: Type[T]) -> Type[T]:
             norm = key.lower()
@@ -36,6 +31,7 @@ class Registry(Generic[T]):
         return _wrap
 
     def get(self, key: str) -> Type[T]:
+        """Look up class by key."""
         norm = key.lower()
         if norm not in self._entries:
             raise KeyError(
@@ -44,29 +40,31 @@ class Registry(Generic[T]):
         return self._entries[norm]
 
     def build(self, key: str, *args, **kwargs) -> T:
+        """Build instance by key."""
         return self.get(key)(*args, **kwargs)
 
     def keys(self) -> Iterable[str]:
+        """Return registered keys."""
         return self._entries.keys()
 
     def __contains__(self, key: str) -> bool:
+        """Check if key is registered."""
         return key.lower() in self._entries
 
 
-# The single backbone registry instance shared across the framework.
-# Concrete adapters import this and decorate themselves.
 BACKBONES: "Registry" = Registry("backbone")
 
 
 def register_backbone(key: str):
+    """Register backbone adapter class."""
     return BACKBONES.register(key)
 
 
 def get_backbone(key: str):
-    """Look up a registered backbone adapter class by name (case-insensitive)."""
+    """Look up backbone class by name."""
     return BACKBONES.get(key)
 
 
 def list_backbones() -> list:
-    """Return the sorted list of registered backbone names."""
+    """List registered backbone names."""
     return sorted(BACKBONES.keys())

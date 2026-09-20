@@ -1,29 +1,4 @@
-"""Video quality-metric extraction — the perception backend for damage & CMSC.
-
-A :class:`~cocf.lcocf.damage.MetricExtractor` turns a decoded video into the
-compact :class:`~cocf.lcocf.damage.VideoFeatures` bundle (DINO identity, CLIP
-appearance, RAFT motion, OCR fidelity) that two subsystems consume:
-
-    * the L-COCF teacher labels (§7.1.1) — damage = degradation of these features
-      in the counterfactual video vs the full-compute reference;
-    * the CMSC conservation loss (§6.3.2) — deviation of these features between the
-      full and accelerated videos.
-
-Both consumers compare *two* :class:`VideoFeatures`, so the only hard requirement
-on an extractor is **determinism and self-consistency**: the same video must map
-to the same features, and the projections must be identical across the videos
-being compared. That is exactly what lets a cheap mock stand in for the real
-DINOv2/CLIP/RAFT/OCR stack in tests and CPU demos.
-
-This module provides:
-
-    MockMetricExtractor   deterministic, content-dependent, dependency-free — the
-                          features react to freezing/blurring (what skip actions do)
-                          so counterfactual damage is non-trivially positive.
-    ModelMetricExtractor  dependency-injected real backend: you supply (or lazily
-                          build) the DINOv2/CLIP/RAFT/OCR callables; the feature
-                          assembly is shared.
-"""
+"""Video quality-metric extraction: the perception backend for damage and CMSC."""
 
 from __future__ import annotations
 
@@ -42,30 +17,14 @@ from cocf.lcocf.damage import MetricExtractor, VideoFeatures, crop_to_tube
 Tensor = torch.Tensor
 _log = get_logger(__name__)
 
-# Prompt cues that mean the scene contains rendered text → OCR fidelity matters.
+# Prompt cues implying rendered text in the scene (OCR fidelity matters).
 _TEXT_CUES = ("text", "word", "letter", "sign", "logo", "caption", "number",
               "title", "subtitle", "字", "文字", "标题")
 
-# Frame *pairs* pushed through RAFT in one forward. Sized for its per-pair
-# correlation volume of ``(H/8 · W/8)²`` floats — ~156 MB at 480×832 — so 4 pairs peak
-# around 0.6 GB instead of the ~7 GB a whole 49-frame clip would need in a single
-# batch. Reduced from 8 for 40 GB cards.
-DEFAULT_FRAME_CHUNK = 4
-# Frames per forward for the plain per-frame towers (DINOv2, CLIP). These resize to
-# 224² first and hold no correlation volume, so RAFT's bound is not theirs: sharing it
-# split a 49-frame clip into 13 batches of 4 per tower and left the GPU idle between
-# launches. At 224² under ``no_grad`` a ViT-B batch of 16 is well under 1 GB.
-DEFAULT_VIT_CHUNK = 16
-# Longest edge RAFT sees. Its output is reduced to one mean-magnitude scalar per pair,
-# and both damage axes built on it (`_jerk_increase`, `_motion_deviation`) are ratios
-# against the reference's own scale, so the statistic is invariant to a resolution the
-# full and counterfactual sides share — while the correlation volume it drives falls
-# with the fourth power of the edge.
-DEFAULT_FLOW_MAX_EDGE = 448
-# Prompt embeddings cached per text tower. Stage A scores ~20 counterfactual rollouts
-# against one caption, so a handful of entries removes essentially every repeat encode
-# while keeping the cache bounded across a million-clip run.
-_TEXT_CACHE_MAX = 32
+DEFAULT_FRAME_CHUNK = 4  # frame pairs per RAFT forward (bounds the correlation volume)
+DEFAULT_VIT_CHUNK = 16  # frames per DINOv2/CLIP forward
+DEFAULT_FLOW_MAX_EDGE = 448  # longest edge RAFT runs at
+_TEXT_CACHE_MAX = 32  # prompt embeddings cached per text tower
 
 
 def _chunks(total: int, size: int):
@@ -82,39 +41,26 @@ def _seed_from_str(s: str, salt: int = 0) -> int:
 
 
 def _pool_frames(video: Tensor, grid: int = 8) -> Tensor:
-    """``[F, 3, H, W] → [F, 3*grid*grid]`` low-res appearance descriptor (in [0,1])."""
+    """``[F, 3, H, W] -> [F, 3*grid*grid]`` low-res appearance descriptor (in [0,1])."""
     if video.dim() != 4:
         raise ValueError(f"expected video [F,3,H,W], got shape {tuple(video.shape)}")
     v = video.float().clamp(0.0, 1.0)
-    pooled = F.adaptive_avg_pool2d(v, (grid, grid))  # [F,3,g,g]
-    return pooled.reshape(pooled.shape[0], -1)        # [F, 3*g*g]
+    pooled = F.adaptive_avg_pool2d(v, (grid, grid))
+    return pooled.reshape(pooled.shape[0], -1)
 
 
 def _high_freq_energy(video: Tensor) -> Tensor:
-    """Per-frame high-frequency energy ``[F]`` (a sharpness / text-legibility proxy).
-
-    Skip actions (freeze/interpolate) blur high-frequency detail, so a drop here is
-    the signal behind the mock's OCR-fidelity degradation.
-    """
-    v = video.float().mean(1, keepdim=True)  # [F,1,H,W] luminance
-    # Build the Laplacian kernel on the video's device (not just its dtype) so a GPU
-    # render does not hit a CPU-weight × CUDA-input conv2d mismatch.
+    """Per-frame high-frequency energy ``[F]`` (a sharpness / text-legibility proxy)."""
+    v = video.float().mean(1, keepdim=True)
     k = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
                      device=v.device, dtype=v.dtype)
     k = k.view(1, 1, 3, 3)
     lap = F.conv2d(v, k, padding=1)
-    return lap.abs().flatten(1).mean(1)  # [F]
+    return lap.abs().flatten(1).mean(1)
 
 
 class MockMetricExtractor(MetricExtractor):
-    """Deterministic, content-dependent stand-in for the DINO/CLIP/RAFT/OCR stack.
-
-    Features are fixed linear projections of a low-res frame descriptor, so they are
-    reproducible and *react to video content*: a frozen or interpolated frame yields
-    a near-duplicate descriptor (low flicker / low flow), a blurred frame loses
-    high-frequency energy (lower OCR). That makes the counterfactual damage signal
-    meaningful end-to-end on CPU without any model download.
-    """
+    """Deterministic, content-dependent stand-in for the DINO/CLIP/RAFT/OCR stack."""
 
     def __init__(self, d_dino: int = 64, d_clip: int = 64, grid: int = 8,
                  seed: int = 1234) -> None:
@@ -123,7 +69,6 @@ class MockMetricExtractor(MetricExtractor):
         self.grid = grid
         feat_dim = 3 * grid * grid
         g = torch.Generator().manual_seed(seed)
-        # Fixed projection matrices (the "frozen perception model" weights).
         self._w_dino = torch.randn(feat_dim, d_dino, generator=g) / (feat_dim ** 0.5)
         self._w_clip = torch.randn(feat_dim, d_clip, generator=g) / (feat_dim ** 0.5)
         self._text_basis = torch.randn(d_clip, generator=g)
@@ -134,35 +79,23 @@ class MockMetricExtractor(MetricExtractor):
         tube_masks: Optional[Dict[int, Tensor]] = None,
         offload: bool = True,
     ) -> VideoFeatures:
-        # The fixed projection matrices live on CPU; follow the video's device so a
-        # GPU render (Stage C runs the full pipeline on GPU) does not hit a CPU×GPU
-        # matmul. The mock is already grad-transparent, so ``differentiable`` only needs
-        # to govern device here (no ``no_grad`` to lift).
-        device = video.device
-        desc = _pool_frames(video, self.grid)             # [F, feat_dim]
-        dino = desc @ self._w_dino.to(device)             # [F, d_dino]
-        clip = desc @ self._w_clip.to(device)             # [F, d_clip]
+        device = video.device  # follow the video's device (projections live on CPU)
+        desc = _pool_frames(video, self.grid)
+        dino = desc @ self._w_dino.to(device)
+        clip = desc @ self._w_clip.to(device)
 
-        # CLIPScore: cosine of the mean appearance to a prompt-conditioned direction.
-        # ``detach`` before the scalar cast: this field is a plain float on
-        # VideoFeatures, so it leaves the graph regardless — and once Stage C's decode
-        # became differentiable, the implicit cast started warning on every call.
-        prompt_dir = self._prompt_direction(prompt).to(device)   # [d_clip]
+        prompt_dir = self._prompt_direction(prompt).to(device)
         clip_mean = F.normalize(clip.mean(0), dim=-1)
         clip_text_score = float(
             ((clip_mean @ prompt_dir).clamp(-1, 1) * 0.5 + 0.5).detach()
         )
 
-        # RAFT motion proxy: appearance change magnitude between consecutive frames.
         if desc.shape[0] >= 2:
-            flow_mag = (desc[1:] - desc[:-1]).abs().mean(-1)  # [F-1]
+            flow_mag = (desc[1:] - desc[:-1]).abs().mean(-1)  # motion proxy
         else:
             flow_mag = torch.zeros(0, device=video.device)
 
         ocr = self._ocr_fidelity(video, prompt)
-        # Per-tube identity features: the same projection applied to the tube's own
-        # frames/region, so a tube-group counterfactual is scored where it intervened
-        # rather than on the whole clip (§7.1.1).
         tube_dino = {
             tid: (_pool_frames(crop_to_tube(video, m), self.grid)
                   @ self._w_dino.to(device)).float()
@@ -177,8 +110,6 @@ class MockMetricExtractor(MetricExtractor):
             tube_dino=tube_dino,
         )
 
-    # -- pieces ---------------------------------------------------------- #
-
     def _prompt_direction(self, prompt: str) -> Tensor:
         g = torch.Generator().manual_seed(_seed_from_str(prompt))
         v = torch.randn(self.d_clip, generator=g) + 0.3 * self._text_basis
@@ -189,34 +120,21 @@ class MockMetricExtractor(MetricExtractor):
         if not any(cue in prompt.lower() for cue in _TEXT_CUES):
             return 1.0
         energy = _high_freq_energy(video).mean()
-        # Map sharpness to [0,1] with a soft saturating curve; blurred → lower OCR.
         return float(torch.tanh(8.0 * energy).clamp(0.0, 1.0))
 
 
 class ModelMetricExtractor(MetricExtractor):
-    """Real perception backend, assembled from injected feature callables.
+    """Real perception backend assembled from injected per-feature callables.
 
-    Each callable is optional and dependency-injected, so this class wires the
-    *assembly* (the :class:`VideoFeatures` contract) without hard-coding any model.
-    Supply your own, or use :meth:`from_pretrained` to lazily build the standard
-    DINOv2 + CLIP + RAFT + OCR stack.
-
-    Parameters
-    ----------
-    dino_fn(video)->[F,d]        per-frame subject/identity features (DINOv2)
-    clip_fn(video)->[F,d]        per-frame appearance features (CLIP image encoder)
-    clip_text_fn(clip_feats,prompt)->float  CLIPScore in [0,1] from the *already
-                                 computed* per-frame image features (not the video —
-                                 taking the video made it re-encode every frame)
-    flow_fn(video)->[F-1]        per-pair mean RAFT flow magnitude
-    ocr_fn(video,prompt)->float  OCR fidelity in [0,1] (1.0 if no text)
+    ``clip_text_fn`` scores from the already-computed per-frame CLIP features,
+    not from the video.
     """
 
     def __init__(
         self,
         dino_fn: Callable[[Tensor], Tensor],
         clip_fn: Callable[[Tensor], Tensor],
-        clip_text_fn: Callable[[Tensor, str], float],  # (clip_feats, prompt)
+        clip_text_fn: Callable[[Tensor, str], float],
         flow_fn: Callable[[Tensor], Tensor],
         ocr_fn: Optional[Callable[[Tensor, str], float]] = None,
     ) -> None:
@@ -232,32 +150,17 @@ class ModelMetricExtractor(MetricExtractor):
         tube_masks: Optional[Dict[int, Tensor]] = None,
         offload: bool = True,
     ) -> VideoFeatures:
-        # Label/metric path: no grad, and — when the caller will consume the features
-        # off-device — offload to CPU (cheap, features are detached references).
-        # Stage-C accelerated branch (differentiable=True): keep the graph so the §6.3.2
-        # quality loss reaches the render, and keep the input device so it composes with
-        # the on-device pixel loss without a CPU×GPU mismatch.
+        # differentiable=True keeps the graph and the input device for Stage C.
         grad_ctx = torch.enable_grad() if differentiable else torch.no_grad()
         with grad_ctx:
             dino = self.dino_fn(video).float()
             clip = self.clip_fn(video).float()
             flow = self.flow_fn(video).float()
-            # Scored from ``clip`` rather than from ``video``: the callable used to
-            # take the clip and call the image encoder again, so every extract ran
-            # CLIP over all frames twice (§P2-7). Computed here, before the CPU
-            # offload below, so the text tower still sees on-device features.
             clip_text_score = float(self.clip_text_fn(clip, prompt))
-            # One extra identity pass per requested tube — the price of a label that
-            # is actually about that tube (§7.1.1); callers pass only what they score.
             tube_dino = {
                 tid: self.dino_fn(crop_to_tube(video, m)).float()
                 for tid, m in (tube_masks or {}).items()
             }
-            # Offload only when asked *and* when there is no graph to keep on-device.
-            # This used to key off ``differentiable`` alone, which silently broke every
-            # consumer that wants the no-grad path but compares the result on the GPU —
-            # Stage C's §6.3.2 reference observation being the one that matters (see the
-            # ``offload`` contract on :meth:`MetricExtractor.extract`).
             if offload and not differentiable:
                 dino, clip, flow = dino.cpu(), clip.cpu(), flow.cpu()
                 tube_dino = {tid: v.cpu() for tid, v in tube_dino.items()}
@@ -269,10 +172,6 @@ class ModelMetricExtractor(MetricExtractor):
                 ocr_accuracy=float(self.ocr_fn(video, prompt)) if self.ocr_fn else 1.0,
                 tube_dino=tube_dino,
             )
-
-    # ------------------------------------------------------------------ #
-    # optional: build the standard stack lazily (requires the deps installed)
-    # ------------------------------------------------------------------ #
 
     @classmethod
     def from_pretrained(
@@ -290,31 +189,9 @@ class ModelMetricExtractor(MetricExtractor):
         raft_weights: Optional[str] = None,
         require_flow: bool = False,
     ) -> "ModelMetricExtractor":  # pragma: no cover - needs model downloads
-        """Wire DINOv2 + CLIP + torchvision-RAFT (+ optional OCR) into callables.
+        """Build the standard DINOv2 + CLIP + RAFT (+ optional OCR) stack.
 
-        ``share_from`` takes an already-built :class:`~cocf.tubes.model_perception.
-        ModelPerception` and reuses its DINOv2/CLIP weights instead of loading a
-        second copy — ~1 GB of duplicate residency when Stage A builds both under
-        ``--real-models`` (§P2-7). The two use the models identically (frozen, eval,
-        default projections), so sharing changes no output.
-
-        Imported lazily so this module stays import-clean without the heavy deps.
-        Wrap-up only — the projections/normalisation that matter for *comparison*
-        are the model defaults, applied identically to both videos being compared.
-
-        ``frame_chunk`` bounds how many frame *pairs* go through RAFT in one forward,
-        and ``vit_chunk`` how many frames go through DINOv2/CLIP. They are separate
-        because only RAFT materialises an all-pairs correlation volume of
-        ``B × (H/8 · W/8)²`` floats — the largest tensor Stage A allocates — while the
-        224²-resized ViT towers are merely launch-bound at RAFT's batch size.
-        ``flow_max_edge`` caps the resolution RAFT runs at, which is what makes that
-        volume affordable in the first place. All the models run in ``eval`` (so
-        BatchNorm uses running stats) and every reduction here is per-frame, so
-        chunking is numerically transparent.
-
-        ``raft_weights`` / ``require_flow`` are handed to
-        :func:`cocf.common.raft.load_raft` — see there for why an unavailable RAFT
-        must not degrade silently.
+        ``share_from`` reuses an existing ModelPerception's DINOv2/CLIP weights.
         """
         import torch as _t
         import torch.nn.functional as _F
@@ -323,12 +200,6 @@ class ModelMetricExtractor(MetricExtractor):
         )
 
         shared = getattr(share_from, "models", None) or {}
-        # Frozen, not merely ``.eval()`` — see the note in
-        # :func:`cocf.tubes.model_perception.ModelPerception.from_pretrained`. This
-        # extractor's *differentiable* branch (Stage C's accelerated render) is exactly
-        # where an unfrozen tower costs both retained activations and a permanent fp32
-        # gradient buffer. ``freeze`` is applied to shared modules too: it is idempotent
-        # and the sharing path must not be the one that leaves them trainable.
         dino = freeze(shared.get("dino") or AutoModel.from_pretrained(dino_name).to(device))
         dino_proc = shared.get("dino_proc") or AutoImageProcessor.from_pretrained(dino_name)
         clip = freeze(shared.get("clip") or CLIPModel.from_pretrained(clip_name).to(device))
@@ -337,34 +208,16 @@ class ModelMetricExtractor(MetricExtractor):
             _log.info("ModelMetricExtractor: reusing the perception backend's "
                       "DINOv2/CLIP weights (no second copy loaded)")
         elif dtype is not None:
-            # Only narrow weights we own: a shared backend already applied its own
-            # dtype, and re-casting it in place would silently change the perception
-            # provider's precision from under it.
-            dino = dino.to(dtype)
+            dino = dino.to(dtype)  # only narrow weights we own
             clip = clip.to(dtype)
-        # The dtype ``_prep`` must produce, resolved **per tower**. DINOv2 and CLIP
-        # are narrowed together above, but ``share_from`` hands them over as two
-        # independently-built modules, so nothing guarantees they agree — and feeding
-        # one tower the other's precision is the same rejection RAFT hits below
-        # ("Input type (c10::BFloat16) and bias type (float) should be the same").
-        # Read off the module rather than from ``dtype`` so the shared-backend path
-        # is covered too, and for CLIP off the *vision* tower specifically: that is
-        # the submodule these pixels reach (via ``clip_image_embed``), whereas
-        # ``next(clip.parameters())`` reports whichever submodule CLIPModel happens
-        # to register first. Falling back to ``clip`` matches ``clip_image_embed``,
-        # which trusts ``get_image_features`` when there is no ``vision_model``.
         dino_dtype = next(dino.parameters()).dtype
         clip_dtype = next(getattr(clip, "vision_model", clip).parameters()).dtype
 
         def _prep(video: Tensor, proc, enc_dtype: torch.dtype) -> Tensor:
-            """``[F,3,H,W]`` in [0,1] → the encoder's pixel values, on device.
+            """``[F,3,H,W]`` in [0,1] -> the encoder's pixel values, on device.
 
-            Resize + normalise **in torch**, using the processor's own constants,
-            instead of handing tensors to the HF processor: that path converts to
-            numpy/PIL internally, which severs the autograd graph. The §6.3.2 Stage-C
-            semantic loss asks this extractor for a differentiable branch, and it was
-            silently getting a detached one — the loss looked healthy and trained
-            nothing through the render.
+            Resize/normalise in torch (not the HF processor) to keep the autograd
+            graph intact.
             """
             v = video.clamp(0, 1).to(device)
             size = getattr(proc, "size", None) or getattr(
@@ -375,22 +228,10 @@ class ModelMetricExtractor(MetricExtractor):
             ip = getattr(proc, "image_processor", proc)
             mean = _t.tensor(getattr(ip, "image_mean", [0.5, 0.5, 0.5]), device=device)
             std = _t.tensor(getattr(ip, "image_std", [0.5, 0.5, 0.5]), device=device)
-            # Cast last, and with ``.to`` rather than a dtype-typed literal, so the
-            # normalisation itself still happens in the wider of the two dtypes and the
-            # §6.3.2 autograd path through this branch stays intact.
             return ((v - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)).to(enc_dtype)
 
         def _per_frame(video: Tensor, fn) -> Tensor:
-            """Apply a per-frame encoder over ``video`` in chunks.
-
-            A wide chunk is a throughput win only on the label-only path, where each
-            chunk's activations die as soon as it returns. On Stage C's §6.3.2
-            differentiable branch every chunk stays alive until backward, so widening
-            buys no memory headroom and only raises the per-forward transient on an
-            already tight budget — fall back to the narrow RAFT-sized chunk there, which
-            is what that branch used before. Chunking is numerically transparent either
-            way (every reduction here is per-frame), so this changes throughput only.
-            """
+            """Apply a per-frame encoder over ``video`` in chunks."""
             f = video.shape[0]
             if f == 0:
                 return _t.zeros(0, device=device)
@@ -399,38 +240,21 @@ class ModelMetricExtractor(MetricExtractor):
 
         def dino_fn(video: Tensor) -> Tensor:
             def _run(chunk: Tensor) -> Tensor:
-                out = dino(_prep(chunk, dino_proc, dino_dtype)).last_hidden_state  # [f,T,d]
-                return out.mean(1)  # CLS-pooled identity per frame
+                out = dino(_prep(chunk, dino_proc, dino_dtype)).last_hidden_state
+                return out.mean(1)  # token-mean identity per frame
             return _per_frame(video, _run)
 
         def clip_fn(video: Tensor) -> Tensor:
-            # clip_image_embed, not clip.get_image_features: the latter returns the
-            # vision tower's token sequence [f,50,768] on newer transformers instead of
-            # the pooled, projected [f,d_clip] embedding CLIP similarity is defined on
-            # (see cocf.common.hf_clip). Stays differentiable for the §6.3.2 loss.
             return _per_frame(video, lambda c: clip_image_embed(clip, _prep(c, clip_proc, clip_dtype)))
 
         text_cache: Dict[str, Tensor] = {}
 
         def _text_embed(prompt: str) -> Tensor:
-            """Unit-norm fp32 prompt embedding, memoised across a clip's rollouts.
-
-            Built under ``normal_mode`` + ``no_grad`` so the entry is a plain tensor
-            regardless of the context that first asked for it. A cache is shared across
-            contexts by definition, and Stage A extracts under ``inference_mode``: an
-            entry allocated there is an *inference* tensor, and reusing it on Stage C's
-            differentiable branch — where ``img`` carries a graph and the matmul has to
-            save its operands — raises "Inference tensors cannot be saved for backward".
-            The towers are frozen, so dropping the graph costs nothing.
-            """
+            """Unit-norm fp32 prompt embedding, memoised across a clip's rollouts."""
             hit = text_cache.get(prompt)
             if hit is not None:
                 return hit
-            with normal_mode(), _t.no_grad():
-                # clip_text_inputs, not a bare clip_proc(...): the text tower has a
-                # 77-token position table and rejects anything longer, so an
-                # untruncated OpenVid-1M caption crashed Stage A on its first clip
-                # (see hf_clip).
+            with normal_mode(), _t.no_grad():  # plain tensors, safe to cache across contexts
                 txt_in = clip_text_inputs(clip, clip_proc, [prompt], device=device)
                 txt = F.normalize(clip_text_embed(clip, **txt_in).float(), dim=-1)
             if len(text_cache) >= _TEXT_CACHE_MAX:
@@ -439,36 +263,16 @@ class ModelMetricExtractor(MetricExtractor):
             return txt
 
         def clip_text_fn(clip_feats: Tensor, prompt: str) -> float:
-            # Both operands to fp32 before the cosine. ``extract`` hands us image
-            # features it has already ``.float()``-ed (§P2-7 stopped re-encoding the
-            # video here), while the text tower still answers in the *weights'*
-            # dtype — under ``--perception-dtype bfloat16`` that pair is a matmul
-            # torch rejects outright:
-            #     RuntimeError: expected mat1 and mat2 to have the same dtype,
-            #                   but got: float != c10::BFloat16
-            # Casting the two vectors, not the tower, keeps the weights in bf16
-            # where the speed is; a [1,d_clip] dot in fp32 costs nothing measurable
-            # (same seam as the RAFT cast below).
             img = F.normalize(clip_feats.to(device).float().mean(0, keepdim=True), dim=-1)
             return float((img @ _text_embed(prompt).T).clamp(-1, 1).item() * 0.5 + 0.5)
 
         raft = load_raft(device, variant="small", weights_path=raft_weights,
                          required=require_flow)
         if raft is not None:
-            # Videos decoded by a bf16/fp16 backbone must be cast to RAFT's own
-            # weight dtype, or conv2d rejects the pair outright ("Input type
-            # (c10::BFloat16) and bias type (float) should be the same"). Cast the
-            # frames, not the module, so the caller's precision never leaks in.
-            raft_dtype = next(raft.parameters()).dtype
+            raft_dtype = next(raft.parameters()).dtype  # cast frames, not the module
 
             def _raft_input(video: Tensor) -> Tensor:
-                """``[F,3,H,W]`` in [0,1] → RAFT's [-1,1] input, edge-capped, on device.
-
-                RAFT requires both spatial dims to be multiples of 8 and no smaller
-                than ``RAFT_MIN_EDGE``, so the capped size is rounded down to that
-                lattice but floored there — a cap tight enough to cross the floor
-                would otherwise make RAFT's correlation pyramid raise.
-                """
+                """``[F,3,H,W]`` in [0,1] -> RAFT's [-1,1] input, edge-capped, on device."""
                 v = (video.clamp(0, 1) * 2 - 1).to(device)
                 h, w = v.shape[-2:]
                 edge = max(h, w)
@@ -484,11 +288,9 @@ class ModelMetricExtractor(MetricExtractor):
                 a, b = v[:-1], v[1:]
                 if a.shape[0] == 0:
                     return _t.zeros(0, device=device)
-                # Chunked over frame *pairs*: the correlation volume is the single
-                # largest allocation in the whole Stage-A pass (see the docstring).
                 mags = []
                 for lo, hi in _chunks(a.shape[0], frame_chunk):
-                    flow = raft(a[lo:hi], b[lo:hi])[-1]  # [n,2,H,W]
+                    flow = raft(a[lo:hi], b[lo:hi])[-1]
                     mags.append(flow.norm(dim=1).flatten(1).mean(1))
                     del flow
                 return _t.cat(mags, 0)

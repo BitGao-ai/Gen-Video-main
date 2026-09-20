@@ -1,23 +1,4 @@
-"""Per-step semantic-tube state ``s_{k,t}`` (§4.3.1).
-
-The 7-dim state vector (field order pinned in
-:data:`cocf.common.types.TUBE_STATE_FIELDS`) is the compact summary the L-COCF
-predictor and the allocator consume per tube. This module computes the *geometric
-/ appearance* components from the tube's own masks/features and its neighbours:
-
-    identity_confidence  mean cosine identity similarity vs the previous frame
-    occlusion            1 − IoU(M_t, warp(M_{t−1}))
-    interaction          Σ IoU with the other tubes on shared frames
-    boundary_uncertainty fraction of boundary tokens (perimeter / area proxy)
-    motion_phase         normalised mean flow magnitude over the tube
-    causal_value         *injected* from the L-COCF strength field (kept external
-                         so STA carries no dependency on L-COCF — low coupling)
-    anchor_age           *injected* bookkeeping owned by the engine
-
-Update rule (§4.3.1): recomputed every denoising step; a tube whose identity
-confidence drops below ``identity_unstable_threshold`` is flagged unstable and the
-allocator forces it to FULL.
-"""
+"""Per-step semantic-tube state s_{k,t}."""
 
 from __future__ import annotations
 
@@ -34,9 +15,10 @@ _log = get_logger(__name__)
 
 
 class TubeStateEncoder:
-    """Computes and updates :class:`TubeState` for a set of tubes each step."""
+    """Computes per-step tube states."""
 
     def __init__(self, config: TubeConfig) -> None:
+        """Store tube config."""
         self.cfg = config
 
     def encode_all(
@@ -45,7 +27,7 @@ class TubeStateEncoder:
         latent_flow_by_frame: Optional[Dict[int, Tensor]] = None,
         causal_values: Optional[Dict[int, float]] = None,
     ) -> Dict[int, TubeState]:
-        """Return ``{tube_id: TubeState}`` for the current step."""
+        """Encode states for all tubes."""
         states: Dict[int, TubeState] = {}
         interaction = self._interaction_scores(tubes)
         for tube in tubes:
@@ -62,6 +44,7 @@ class TubeStateEncoder:
         interaction: float,
         causal_value: float,
     ) -> TubeState:
+        """Encode state for one tube."""
         ident = self._identity_confidence(tube)
         occ = self._occlusion(tube, latent_flow_by_frame)
         boundary = self._boundary_uncertainty(tube)
@@ -74,45 +57,20 @@ class TubeStateEncoder:
             boundary_uncertainty=boundary,
             motion_phase=motion,
             causal_value=causal_value,
-            anchor_age=prev.anchor_age,  # engine increments/resets this
+            anchor_age=prev.anchor_age,
         )
         tube.state = state
         return state
 
-    # -- components ------------------------------------------------------ #
-
     def _identity_confidence(self, tube: SemanticTube) -> float:
-        """Mean cosine similarity of consecutive per-frame identity features (§4.3.1).
-
-        A tube whose appearance is stable across the frames it spans scores near 1;
-        one whose region drifts onto a different object (a tracking failure, an
-        occlusion hand-off) scores low, and below
-        ``identity_unstable_threshold`` the allocator pins it to FULL.
-
-        The similarity is mapped from ``[-1, 1]`` to ``[0, 1]`` as ``cos·0.5 + 0.5``,
-        so the 0.5 threshold sits exactly at "orthogonal appearance".
-
-        This used to compute ``normalize(identity_feat) @ normalize(identity_feat)``
-        — a unit vector dotted with *itself* — and therefore returned exactly 1.0 for
-        every tube, always. That silently disabled the §4.3.1 stability override,
-        pinned the first component of the 7-dim state vector to a constant, and halved
-        the temporal strength ``s_T`` (which is ``0.5·occlusion + 0.5·(1−I_k)``),
-        suppressing the §3.3.4 counterfactual checks that depend on it (§P1-2). The
-        fix needs the per-frame features the matcher now keeps.
-        """
+        """Mean cosine identity similarity across consecutive frames."""
         feats = tube.identity_feat_by_frame
         frames = [f for f in tube.frames if f in feats]
         if len(frames) < 2:
-            # Nothing to compare against (single-frame tube, or a perception provider
-            # that supplies no identity features): assume stable rather than invent
-            # instability, but say so via the value, not by fabricating a comparison.
             return 1.0
         vectors = [feats[f].detach().float().reshape(-1) for f in frames]
         width = vectors[0].numel()
         if any(v.numel() != width for v in vectors):
-            # A provider returning ragged feature widths would otherwise crash the
-            # whole denoising step inside ``torch.stack``. Degrade to "no information"
-            # instead — this is a diagnostic signal, not a correctness-critical one.
             _log.warning(
                 "tube %d: identity features have inconsistent widths %s; "
                 "identity_confidence falls back to 1.0",
@@ -120,12 +78,13 @@ class TubeStateEncoder:
             )
             return 1.0
         normed = torch.nn.functional.normalize(torch.stack(vectors), dim=-1)
-        cos = (normed[:-1] * normed[1:]).sum(-1)  # consecutive-frame similarity
+        cos = (normed[:-1] * normed[1:]).sum(-1)
         return float(torch.clamp(cos.mean() * 0.5 + 0.5, 0.0, 1.0))
 
     def _occlusion(
         self, tube: SemanticTube, latent_flow_by_frame: Optional[Dict[int, Tensor]]
     ) -> float:
+        """Warped mask overlap deficit across frames."""
         frames = tube.frames
         if len(frames) < 2:
             return 0.0
@@ -143,14 +102,7 @@ class TubeStateEncoder:
         return float(1.0 - sum(ious) / len(ious))
 
     def _interaction_scores(self, tubes: List[SemanticTube]) -> Dict[int, float]:
-        """Mean IoU of each tube's mask with the *other* tubes, in ``[0, 1]``.
-
-        Normalised on both axes — over the frames a pair shares and over the tubes a
-        tube is compared against — because this lands in the 7-dim state vector, whose
-        other six components are all bounded. A raw sum grows with ``K`` and with clip
-        length, so it both dominated the predictor's input scale and disagreed with the
-        clamped ``interaction_density`` column written beside it in the same sample.
-        """
+        """Mean mask IoU of each tube with other tubes."""
         scores = {t.tube_id: 0.0 for t in tubes}
         if len(tubes) < 2:
             return scores
@@ -172,11 +124,10 @@ class TubeStateEncoder:
         return {tid: min(v / peers, 1.0) for tid, v in scores.items()}
 
     def _boundary_uncertainty(self, tube: SemanticTube) -> float:
-        """Perimeter/area proxy: thin/fragmented tubes have uncertain boundaries."""
+        """Boundary ratio proxy for edge uncertainty."""
         ratios = []
         for mask in tube.masks_by_frame.values():
             area = mask.sum().float().clamp_min(1.0)
-            # 4-neighbour boundary count
             pad = torch.nn.functional.pad(mask.float()[None, None], (1, 1, 1, 1))
             shifts = (
                 pad[..., :-2, 1:-1] + pad[..., 2:, 1:-1]
@@ -189,6 +140,7 @@ class TubeStateEncoder:
     def _motion_phase(
         self, tube: SemanticTube, latent_flow_by_frame: Optional[Dict[int, Tensor]]
     ) -> float:
+        """Normalized mean flow magnitude over the tube."""
         if not latent_flow_by_frame:
             return 0.0
         mags = []
@@ -196,17 +148,18 @@ class TubeStateEncoder:
             flow = latent_flow_by_frame.get(f)
             if flow is None:
                 continue
-            mag = flow.pow(2).sum(0).sqrt()  # [H,W]
+            mag = flow.pow(2).sum(0).sqrt()
             sel = mag[mask]
             if sel.numel():
                 mags.append(float(sel.mean()))
         if not mags:
             return 0.0
         m = sum(mags) / len(mags)
-        return float(torch.tanh(torch.tensor(m)))  # squashed to [0,1)
+        return float(torch.tanh(torch.tensor(m)))
 
     @staticmethod
     def _warp(mask: Tensor, flow: Optional[Tensor]) -> Tensor:
+        """Forward-warp mask by flow."""
         if flow is None:
             return mask
         h, w = mask.shape

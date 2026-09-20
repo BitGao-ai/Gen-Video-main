@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small-data predictor-only fitting experiment. Not a production Stage B checkpoint."""
+"""Run small-data predictor-only fitting probe."""
 import argparse
 import importlib.util
 import json
@@ -24,6 +24,7 @@ spec.loader.exec_module(evaluation)
 
 
 def regression_loss(target, mu, sigma, actions, objective, scale=100.0):
+    """Compute regression loss for selected actions."""
     selected = actions != 0
     if not selected.any():
         return None
@@ -36,6 +37,7 @@ def regression_loss(target, mu, sigma, actions, objective, scale=100.0):
 
 
 def main():
+    """Run predictor-only fit experiment."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--processed-root', type=Path, required=True)
     p.add_argument('--output-dir', type=Path, required=True)
@@ -70,6 +72,7 @@ def main():
     selected_videos = {videos[i] for i in order[:args.train_videos]}
     ids = [s for s in train if index[s]['video_id'] in selected_videos]
     def loader(keys, shuffle=False):
+        """Build dataloader for given keys."""
         ds = CounterfactualLMDBDataset(layout.lmdb_dir, keys, text_embed_dir=layout.text_embed_dir)
         if list(ds.keys) != list(keys):
             raise ValueError('Missing/reordered dataset samples')
@@ -106,7 +109,7 @@ def main():
     log.info('Probe settings: %s', settings)
     with (args.output_dir / 'history.jsonl').open('x') as history:
         for epoch in range(args.epochs + 1):
-            acc.eval()  # Disable dropout for the controlled small-data fit.
+            acc.eval()
             grad = {}
             losses = []
             if epoch:
@@ -142,7 +145,6 @@ def main():
             for split, keys in [('train', ids), ('val', val)]:
                 rows = evaluation.predict(acc, loader(keys), torch.device(args.device))
                 metrics = evaluation.summarize(rows, baseline)
-                # Frozen variance/certificate modules are not calibrated by this experiment.
                 for group in metrics.values():
                     for key in ('certificate_violation', 'certificate_slack_mean', 'within_2sigma'):
                         group.pop(key, None)
@@ -150,8 +152,7 @@ def main():
             history.write(json.dumps(record, allow_nan=False) + '\n')
             history.flush()
             log.info('epoch=%d train_nonfull_mae=%.7g val_nonfull_mae=%.7g', epoch,
-                     record['train']['nonfull']['mae'], record['val']['nonfull']['mae'])
-    # Deliberately not the accelerator checkpoint format: never deploy this probe.
+                      record['train']['nonfull']['mae'], record['val']['nonfull']['mae'])
     torch.save({'predictor_only': predictor.state_dict(), 'diagnostic_only': True, 'settings': settings},
                args.output_dir / 'predictor_probe.pt')
     log.info('Done: %s/history.jsonl (diagnostic only)', args.output_dir)

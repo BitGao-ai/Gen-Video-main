@@ -1,14 +1,4 @@
-"""Backbone subsystem: the multi-model compatibility layer (user requirement #2).
-
-Importing this package registers every adapter, after which a backbone is built
-purely from a config string::
-
-    from cocf.backbones import build_backbone
-    adapter = build_backbone(config.backbone)   # name="wan22" | "wan21" | "hunyuanvideo" | "mock"
-
-The heavy ``diffusers``/``transformers`` dependencies are imported lazily inside
-each adapter's ``_load``; importing the package itself only needs ``torch``.
-"""
+"""Backbone adapters and construction helper."""
 
 from __future__ import annotations
 
@@ -30,7 +20,7 @@ from cocf.backbones import wan22 as _wan22  # noqa: F401  (registers "wan22" —
 
 
 def build_backbone(config: BackboneConfig) -> BackboneAdapter:
-    """Construct the adapter named by ``config.name`` from the registry."""
+    """Build backbone adapter from config."""
     return BACKBONES.build(config.name, config)
 
 

@@ -1,17 +1,4 @@
-"""HunyuanVideo backbone adapter (§9.1 — main experiment backbone).
-
-Wraps Tencent's HunyuanVideo (the design doc targets "HunyuanVideo-1.5 8B"). The
-model is an **MMDiT**: text (an LLM, e.g. LLaVA, optionally + CLIP pooled) and the
-video latent attend *jointly* in "double-stream" blocks, then the text is dropped
-for "single-stream" blocks. We integrate via 🤗 ``diffusers``:
-
-    AutoencoderKLHunyuanVideo        3D causal VAE (8× spatial, 4× temporal, C=16)
-    HunyuanVideoTransformer3DModel   the MMDiT denoiser (patch (1,2,2))
-    LLM + CLIP text encoders         conditioning ``c``
-
-Only the parts of the upstream API the framework needs are touched; everything
-else (layout, VAE, scheduler) is inherited from :class:`DiffusersVideoBackbone`.
-"""
+"""HunyuanVideo backbone adapter (MMDiT via diffusers)."""
 
 from __future__ import annotations
 
@@ -30,12 +17,13 @@ Tensor = torch.Tensor
 @register_backbone("hunyuanvideo")
 @register_backbone("hunyuan")
 class HunyuanVideoBackbone(DiffusersVideoBackbone):
+    """Tencent HunyuanVideo adapter: MMDiT with LLM + CLIP text conditioning."""
+
     patch = (1, 2, 2)
     vae_compress = (4, 8, 8)
     _latent_channels = 16
 
     def _load(self) -> None:
-        # Lazy import keeps the dependency optional (mock tests don't need it).
         from diffusers import AutoencoderKLHunyuanVideo, HunyuanVideoTransformer3DModel
         from transformers import (
             AutoTokenizer,
@@ -46,34 +34,22 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
 
         path = self.config.model_path
         extra = self.config.extra or {}
-        # Same load discipline as the Wan adapters: without ``torch_dtype`` +
-        # ``low_cpu_mem_usage`` every component materialises in fp32 on the CPU
-        # first (~60 GB transient for 8B + Llama) before ``.to()`` narrows it.
-        hf = {"torch_dtype": self.dtype, "low_cpu_mem_usage": True}
+        hf = {"torch_dtype": self.dtype, "low_cpu_mem_usage": True}  # avoid the fp32 host-RAM transient
         self.vae = AutoencoderKLHunyuanVideo.from_pretrained(path, subfolder="vae", **hf)
         self.transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             path, subfolder="transformer", **hf
         )
-        # primary LLM text encoder (token-level sequence used for joint attention)
         self.text_encoder = LlamaModel.from_pretrained(path, subfolder="text_encoder", **hf)
         self.tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
-        # secondary CLIP encoder for the pooled global condition
-        self._clip = CLIPTextModel.from_pretrained(path, subfolder="text_encoder_2", **hf)
+        self._clip = CLIPTextModel.from_pretrained(path, subfolder="text_encoder_2", **hf)  # pooled global condition
         self._clip_tok = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2")
         self._clip.requires_grad_(False)
         self._clip.to(self.device, self.dtype).eval()
         self._max_len = int(extra.get("max_text_len", 256))
 
-    # -- text ----------------------------------------------------------- #
-
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
         self._ensure_loaded()
-        # The Llama encoder is the bulky one and runs once per prompt; under
-        # ``offload_text_encoder`` it is resident only for this forward. The small
-        # CLIP encoder stays put (it is ~0.1 GB — not worth a transfer).
-        # ``no_grad`` — not ``inference_mode``: the conditioning is consumed by the
-        # (possibly grad-enabled) DiT forward in Stage C, and an inference tensor can
-        # never be saved for backward (§4.2).
+        # no_grad, not inference_mode: the conditioning feeds grad-enabled forwards in Stage C.
         with torch.no_grad(), self._module_active(self.text_encoder):
             tok = self.tokenizer(
                 list(prompts), return_tensors="pt", padding="max_length",
@@ -89,19 +65,13 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
             embeds=seq, mask=tok["attention_mask"], pooled=pooled, prompts=tuple(prompts)
         )
 
-    # -- the MMDiT call -------------------------------------------------- #
-
     def _run_transformer(
         self, latent_grid: Tensor, t: Tensor, cond: TextConditioning, want_attention: bool
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
-        # HunyuanVideoTransformer3DModel returns velocity prediction over the grid.
-        # ``encoder_hidden_states`` = LLM sequence, ``pooled_projections`` = CLIP pooled.
         timestep = (t.to(self.device) * 1000.0).flatten()
         out = self.transformer(  # type: ignore[union-attr]
             hidden_states=latent_grid,
             timestep=timestep,
-            # Trimmed to the prompt's real length (§P1-15); this model already took
-            # the mask, so only the fixed-length padding cost needed removing.
             **self._text_kwargs(cond, self.transformer),
             pooled_projections=cond.pooled.to(self.device, self.dtype)
             if cond.pooled is not None else None,
@@ -109,6 +79,4 @@ class HunyuanVideoBackbone(DiffusersVideoBackbone):
         )
         eps = out.sample if hasattr(out, "sample") else out[0]
         attn: Dict[str, Tensor] = {}
-        # The text→video attention map (for CMSC/affinity) requires a forward hook on
-        # the joint-attention blocks; left as an opt-in to avoid perturbing the graph.
         return eps, attn

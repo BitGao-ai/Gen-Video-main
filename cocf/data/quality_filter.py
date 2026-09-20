@@ -1,25 +1,12 @@
-"""Four-level video quality filter (§2).
+"""Four-level video quality filter.
 
-Filters the parsed OpenVid records (`:class:`~cocf.data.openvid_manifest.OpenVidRecord``)
-from raw ingestion down to the §2.4 final training set, in four escalating levels
-that lean on the dataset's own metadata so the pass is cheap and decode-free:
-
-    L1  basic hard filter (§2.1, Table 0)  — resolution / duration / (opt) blur·watermark
-    L2  semantic filter   (§2.2)           — caption length, aesthetic %ile, dedup
-    L3  task-fitness       (§2.3)           — drop pure-static, force-keep hard samples
-    L4  final sampling     (§2.4)           — target count, HD ≥60%, video-disjoint split
-
-The leakage-safe train/val/test partition (§2.4 / §4.2 "按视频 ID 切分…不跨集") is
-decided here at the **video level** and recorded as a ``split`` column in
-``filtered_final.csv``; Stage A then materialises the §3 level-6 sample-id lists
-(``splits/*.txt``) by inheriting each generated sample's split from its video. This
-keeps the partition decision in one place and guarantees no source video appears in
-two splits.
-
-Optional ``perception`` / ``metric_extractor`` hooks enable the decode-dependent
-gates (Laplacian blur, CLIP image-text alignment) when real backends are supplied;
-without them those gates are skipped (the metadata gates still apply), so the filter
-runs on this CPU box and in tests.
+Filters parsed OpenVid records from raw ingestion down to the final training set in
+four escalating levels (basic hard filter, semantic filter, task-fitness, final
+sampling), leaning on dataset metadata so the pass is cheap and decode-free. The
+leakage-safe train/val/test partition is decided here at the video level and recorded
+as a ``split`` column in ``filtered_final.csv``. Optional ``perception`` /
+``metric_extractor`` hooks enable the decode-dependent gates (blur, CLIP alignment);
+without them those gates are skipped.
 """
 
 from __future__ import annotations
@@ -44,13 +31,10 @@ from cocf.data.processed_layout import ProcessedLayout
 
 _log = get_logger(__name__)
 
-# Scenes that §2.3 force-keeps as "hard" (multi-subject / occlusion / text / face)
-# plus fast motion; these are never dropped and seed the hard-sample test list.
+# Scenes force-kept as "hard" (multi-subject / occlusion / text / face); never dropped.
 _HARD_SCENES = ("multi", "occlusion", "text", "face")
-# strip a trailing OpenVid segment suffix so clips cut from the same source video
-# share a base id and never split across train/val/test. Real OpenVid segment names
-# use ``_<idx>_<start>to<end>`` (e.g. ``AG-rnTlIvgM_11_29to193``); the plainer
-# ``_<start>_<end>`` form is kept for compatibility.
+# Strip a trailing OpenVid segment suffix so clips from the same source video share a
+# base id and never split across train/val/test.
 _SEGMENT_SUFFIX = re.compile(r"_\d+_\d+to\d+$|_\d+_\d+$")
 
 
@@ -61,7 +45,7 @@ def base_video_id(video_id: str) -> str:
 
 @dataclass
 class FilterReport:
-    """Per-level drop counts and final-set statistics (§2.4 report)."""
+    """Per-level drop counts and final-set statistics."""
 
     total_in: int = 0
     kept_l1: int = 0
@@ -108,19 +92,7 @@ def _record_from_row(row: Mapping[str, str]) -> OpenVidRecord:
 
 
 def read_filtered_final(layout: ProcessedLayout) -> Optional[FilterResult]:
-    """Recover the §2.4 kept set and split map from ``metadata/filtered_final.csv``.
-
-    :meth:`QualityFilter.write` emits every :class:`OpenVidRecord` field alongside the
-    ``split`` column, so the filter's decision is fully recoverable from its own output.
-    That is what lets the workers of a sharded Stage-A run inherit it instead of each
-    re-deriving it: re-running the filter per worker re-parses the whole 1.45M-row
-    manifest and, under ``--only-existing-videos``, pays one ``stat`` per row per
-    worker — ~11.6M redundant filesystem calls across 8 GPUs before the first teacher
-    forward, and far worse than that on a network mount.
-
-    The report is filled only with the statistics the CSV actually determines; the
-    per-level drop counts belong to the run that did the filtering and are left at
-    zero, so no caller can mistake a reused result for a fresh one.
+    """Recover the kept set and split map from ``metadata/filtered_final.csv``.
 
     Returns ``None`` when the CSV is absent or carries no usable rows, so callers fall
     back to running the filter themselves.
@@ -164,7 +136,7 @@ def _complexity(r: OpenVidRecord, fast_motion: float) -> str:
 
 
 class QualityFilter:
-    """The §2 four-level filter over OpenVid records."""
+    """The four-level filter over OpenVid records."""
 
     def __init__(
         self,
@@ -176,8 +148,7 @@ class QualityFilter:
         self.cfg = cfg
         self.perception = perception
         self.metric_extractor = metric_extractor
-        # "fast motion" threshold for the hard/complex predicate — well above the
-        # static cut-off so only genuinely dynamic clips qualify.
+        # "fast motion" threshold for the hard/complex predicate.
         self.fast_motion = max(0.2, cfg.static_motion_max * 10.0)
 
     # ------------------------------------------------------------------ #
@@ -215,7 +186,7 @@ class QualityFilter:
         return layout.write_csv(layout.filtered_final, rows, fields)
 
     # ------------------------------------------------------------------ #
-    # L1 — basic hard filter (§2.1, Table 0)
+    # L1 — basic hard filter
     # ------------------------------------------------------------------ #
 
     def _level1_hard(self, pool: List[OpenVidRecord], rep: FilterReport) -> List[OpenVidRecord]:
@@ -226,7 +197,7 @@ class QualityFilter:
                 rep.dropped["l1_no_caption"] = rep.dropped.get("l1_no_caption", 0) + 1
                 continue
             # duration window (only when a duration is known); HD is always 1080p so
-            # never dropped on resolution, the OpenVid-1M base set is ≥512² by spec.
+            # never dropped on resolution.
             if r.seconds > 0 and (r.seconds < c.min_duration_s or r.seconds > c.max_duration_s):
                 rep.dropped["l1_duration"] = rep.dropped.get("l1_duration", 0) + 1
                 continue
@@ -250,7 +221,7 @@ class QualityFilter:
             return True
 
     # ------------------------------------------------------------------ #
-    # L2 — semantic filter (§2.2)
+    # L2 — semantic filter
     # ------------------------------------------------------------------ #
 
     def _level2_semantic(self, pool: List[OpenVidRecord], rep: FilterReport) -> List[OpenVidRecord]:
@@ -294,7 +265,7 @@ class QualityFilter:
         return [r for r in pool if id(r) in keep_ids]
 
     # ------------------------------------------------------------------ #
-    # L3 — task-fitness filter (§2.3)
+    # L3 — task-fitness filter
     # ------------------------------------------------------------------ #
 
     def _level3_task_fitness(self, pool: List[OpenVidRecord], rep: FilterReport) -> List[OpenVidRecord]:
@@ -303,8 +274,7 @@ class QualityFilter:
             return pool
         kept = []
         for r in pool:
-            # drop pure-static / no-motion clips (no causal scheduling signal) — but
-            # never drop a force-keep hard sample even if its motion reads low.
+            # drop pure-static / no-motion clips, but never a force-keep hard sample.
             if (r.scene_type == "static" and r.motion <= c.static_motion_max
                     and not _is_hard(r, self.fast_motion)):
                 rep.dropped["l3_static"] = rep.dropped.get("l3_static", 0) + 1
@@ -313,7 +283,7 @@ class QualityFilter:
         return kept
 
     # ------------------------------------------------------------------ #
-    # L4 — final sampling (§2.4): target count, HD floor, complexity floor
+    # L4 — final sampling: target count, HD floor, complexity floor
     # ------------------------------------------------------------------ #
 
     def _level4_final_sampling(self, pool: List[OpenVidRecord], rep: FilterReport) -> List[OpenVidRecord]:
@@ -336,15 +306,11 @@ class QualityFilter:
             n_hd += int(r.is_hd)
             return True
 
-        # 1) force-keep hard samples (§2.3), highest-aesthetic first
+        # 1) force-keep hard samples, highest-aesthetic first
         for r in by_aes:
             if _is_hard(r, self.fast_motion):
                 take(r)
-        # 2) meet the HD floor (§2.4 OpenVidHD ≥60%). The HD tally is carried in
-        #    ``take`` rather than recounted per candidate: rescanning ``selected``
-        #    every iteration is O(|pool| · target), which on the full manifest is
-        #    hours of pure CPU with no progress output — and under --num-shards it is
-        #    hours the other workers spend idle waiting for filtered_final.csv.
+        # 2) meet the HD floor; the tally is carried in ``take`` rather than recounted.
         hd_target = int(c.hd_min_frac * target)
         if n_hd < hd_target:
             for r in by_aes:
@@ -357,7 +323,7 @@ class QualityFilter:
         return selected
 
     # ------------------------------------------------------------------ #
-    # leakage-safe split by source video (§2.4 / §4.2)
+    # leakage-safe split by source video
     # ------------------------------------------------------------------ #
 
     def _split_by_video(self, pool: List[OpenVidRecord], *, seed: int) -> Dict[str, str]:

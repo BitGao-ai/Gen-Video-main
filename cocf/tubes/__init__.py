@@ -1,22 +1,4 @@
-"""STA — Semantic-Tube Anchoring subsystem (§4).
-
-Upgrades the unit of compute allocation from isolated tokens to cross-frame
-*semantic tubes*, which (provably, §4.4) lowers decision variance and removes the
-flicker/tearing/identity-drift failure modes of token-level skipping.
-
-Public surface:
-
-    TubeBuilder        orchestrates region→affinity→matching→state (entry point)
-    SemanticTube       the tube object (re-exported from common.types)
-    PerceptionProvider the injected SAM/CLIP/DINOv2/RAFT backend contract
-    MockPerception     deterministic stand-in (tests / CPU demos)
-    ModelPerception    the real SAM+DINOv2+CLIP+RAFT provider (production Stage A)
-    TubeSmoothingLoss  the §4.3.2 action-consistency regulariser
-
-``ModelPerception`` keeps its heavy deps behind a lazy ``from_pretrained``, so
-importing this package still only needs ``torch`` (the mock stack stays usable on a
-box without ``transformers``/``torchvision``).
-"""
+"""STA semantic-tube anchoring subsystem."""
 
 from __future__ import annotations
 

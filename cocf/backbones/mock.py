@@ -1,14 +1,4 @@
-"""A tiny, fully-functional mock backbone for testing the whole pipeline on CPU.
-
-It implements every :class:`BackboneAdapter` method with a small network and —
-crucially — *real* token gather/scatter in :meth:`denoise`, so that passing an
-``active_mask`` genuinely computes fewer tokens. That lets the unit tests assert
-the accelerator's FLOPs/active-ratio behaviour (user requirement #1) without any
-multi-billion-parameter weights.
-
-It is registered as ``"mock"`` so a config can select it exactly like a real
-backbone, demonstrating that the algorithm code is backbone-agnostic.
-"""
+"""Tiny mock backbone for CPU testing."""
 
 from __future__ import annotations
 
@@ -33,18 +23,12 @@ Tensor = torch.Tensor
 
 @register_backbone("mock")
 class MockBackbone(BackboneAdapter):
-    """Small deterministic stand-in for HunyuanVideo/Wan2.1.
+    """Small deterministic mock backbone."""
 
-    Patchify factors and dims are configurable through ``BackboneConfig.extra`` so
-    tests can exercise different token-grid shapes.
-    """
-
-    #: The mock gathers the active tokens and computes only those, so a sparse mask
-    #: really is cheaper here (which is what makes it a usable stand-in for a future
-    #: sparse-attention kernel — and why the real adapters must say ``False``).
     supports_token_sparsity = True
 
     def __init__(self, config: BackboneConfig) -> None:
+        """Create mock backbone from config."""
         super().__init__(config)
         extra = config.extra or {}
         self._c = int(extra.get("latent_channels", 4))
@@ -54,17 +38,13 @@ class MockBackbone(BackboneAdapter):
         self._vae_s = int(extra.get("vae_spatial", 8))
         self._d_text = int(extra.get("text_dim", 16))
         self._text_len = int(extra.get("text_len", 8))
-        # Deterministic init without resetting the caller's global RNG (a bare
-        # torch.manual_seed here silently re-seeded every later consumer of the
-        # global stream, e.g. encode_video's latent sampling).
+        # Deterministic init without resetting the caller's global RNG.
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(int(extra.get("seed", 0)))
 
             d = self._d
-            # patch embed: latent channels -> token dim, and back for to_grid
             self.patch_embed = nn.Linear(self._c, d)
             self.unpatch = nn.Linear(d, self._c)
-            # a single attention+MLP block standing in for the DiT stack
             self.norm = nn.LayerNorm(d)
             self.attn = nn.MultiheadAttention(d, num_heads=4, batch_first=True)
             self.cross = nn.MultiheadAttention(d, num_heads=4, batch_first=True, kdim=d, vdim=d)
@@ -76,56 +56,50 @@ class MockBackbone(BackboneAdapter):
                  self.text_proj, self.mlp, self.t_embed]
             )
         for p in self._net.parameters():
-            p.requires_grad_(False)  # frozen, like a real pretrained backbone
-        # Reside on the configured device, exactly like a real backbone loaded onto
-        # the GPU. initial_latent()/denoise() build their tensors on ``self.device``
-        # (e.g. cuda:0), so these frozen weights must live there too — otherwise a
-        # CUDA run mixes cuda inputs with cpu params in patch_embed/denoise and
-        # torch raises "Expected all tensors to be on the same device".
+            p.requires_grad_(False)
         self._net.to(self.device)
-
-    # -- static description --------------------------------------------- #
 
     @property
     def latent_channels(self) -> int:
+        """Return latent channel count."""
         return self._c
 
     @property
     def hidden_dim(self) -> int:
+        """Return token hidden width."""
         return self._d
 
     def token_grid(self, num_frames: int, height: int, width: int) -> TokenGrid:
+        """Map pixels to token grid."""
         t = max(1, num_frames // self._patch_t)
-        # simplest sane mapping for tests: latent grid = pixels / vae / patch
         h = max(1, height // self._vae_s // self._patch_s)
         w = max(1, width // self._vae_s // self._patch_s)
         return TokenGrid(t=t, h=h, w=w)
 
     def timesteps(self, num_inference_steps: int) -> Tensor:
+        """Return denoising schedule."""
         return torch.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
 
-    # -- layout --------------------------------------------------------- #
-
     def to_tokens(self, latent_grid: Tensor) -> Tensor:
+        """Convert latent grid to tokens."""
         b, c, t, h, w = latent_grid.shape
         x = latent_grid.permute(0, 2, 3, 4, 1).reshape(b, t * h * w, c)
         return self.patch_embed(x)
 
     def to_grid(self, tokens: Tensor, grid: TokenGrid) -> Tensor:
+        """Convert tokens to latent grid."""
         b, n, d = tokens.shape
         x = self.unpatch(tokens)
         c = x.shape[-1]
         return x.reshape(b, grid.t, grid.h, grid.w, c).permute(0, 4, 1, 2, 3).contiguous()
 
-    # -- VAE (identity-ish, channel-replicating mock) ------------------- #
-
     def encode_video(self, video: Tensor) -> Tensor:
+        """Encode video to latent grid."""
         b, cpix, f, hp, wp = video.shape
         t = max(1, f // self._patch_t)
         h = max(1, hp // self._vae_s)
         w = max(1, wp // self._vae_s)
         x = torch.nn.functional.adaptive_avg_pool3d(video, (t, h, w))
-        # map pixel channels -> latent channels by tiling/trunc
         if cpix >= self._c:
             x = x[:, : self._c]
         else:
@@ -133,6 +107,7 @@ class MockBackbone(BackboneAdapter):
         return x
 
     def decode_latent(self, latent_grid: Tensor) -> Tensor:
+        """Decode latent grid to video."""
         b, c, t, h, w = latent_grid.shape
         up = torch.nn.functional.interpolate(
             latent_grid, scale_factor=(self._patch_t, self._vae_s, self._vae_s),
@@ -143,23 +118,12 @@ class MockBackbone(BackboneAdapter):
         return up.repeat(1, 3, 1, 1, 1)[:, :3]
 
     def pixel_span(self, lo: int, hi: int):
-        """Uniform mapping: nearest-neighbour upsampling expands *every* slot equally.
-
-        This is deliberately not the causal-VAE formula the real adapters use — the
-        mock's decoder genuinely has a uniform layout, and pretending otherwise would
-        make the contract test pass against the wrong arithmetic.
-        """
+        """Return pixel span for latent slots."""
         return (lo * self._patch_t, hi * self._patch_t)
 
-    # -- text ----------------------------------------------------------- #
-
     def encode_text(self, prompts: Sequence[str]) -> TextConditioning:
+        """Encode prompts into conditioning."""
         b = len(prompts)
-        # deterministic pseudo-embedding from a *stable* digest of each prompt.
-        # Python's built-in ``hash`` is salted per process (PYTHONHASHSEED), so seeding
-        # from it made the mock's conditioning — and therefore the whole generated
-        # video — differ between runs even under a fixed --seed. The repo already uses
-        # md5 for the same reason in Stage-A shard routing.
         embeds = torch.zeros(b, self._text_len, self._d_text)
         for i, p in enumerate(prompts):
             digest = hashlib.md5(p.encode("utf-8")).hexdigest()
@@ -167,13 +131,9 @@ class MockBackbone(BackboneAdapter):
             embeds[i] = torch.randn(self._text_len, self._d_text, generator=g)
         mask = torch.ones(b, self._text_len)
         return TextConditioning(
-            # On the adapter's device like a real encoder's output — ``denoise``
-            # only casts dtype, so a CUDA mock would otherwise mix devices.
             embeds=embeds.to(self.device), mask=mask.to(self.device),
             prompts=tuple(prompts),
         )
-
-    # -- denoiser (real gather/scatter sparsity) ------------------------ #
 
     def denoise(
         self,
@@ -198,14 +158,13 @@ class MockBackbone(BackboneAdapter):
         idx = active.nonzero(as_tuple=False).squeeze(-1)
         attn_out = {}
         if idx.numel() == 0:
-            # nothing to compute: reuse the whole cached output
             eps = self._cached_or_zero(cache, tokens)
             return DenoiseOutput(
                 model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out,
                 compute_fraction=0.0,
             )
 
-        x = tokens.index_select(1, idx)  # [B, n_act, d] — the ONLY tokens we compute
+        x = tokens.index_select(1, idx)  # [B, n_act, d] active tokens only
         h = self.norm(x + t_emb)
         sa, _ = self.attn(h, h, h)
         x = x + sa
@@ -214,7 +173,6 @@ class MockBackbone(BackboneAdapter):
         x = x + self.mlp(self.norm(x))
         eps_active = self.unpatch_noise(x)
 
-        # scatter computed tokens back; inactive tokens come from cache (or zero).
         eps = self._cached_or_zero(cache, tokens).clone()
         eps.index_copy_(1, idx, eps_active.to(eps.dtype))
         if want_attention and w is not None:
@@ -222,15 +180,10 @@ class MockBackbone(BackboneAdapter):
             attn_out["text"] = full_attn  # placeholder layout [B, n_act, L]
         return DenoiseOutput(
             model_output=eps, cache=self._mk_cache(eps, cache), attention=attn_out,
-            # The mock really does gather → compute → scatter, so its spend genuinely
-            # tracks mask occupancy. Real DiT adapters report 1.0 for the same mask
-            # (see :meth:`DiffusersVideoBackbone.denoise`) — the difference is the
-            # point of reporting this per-adapter instead of deriving it from the mask.
-            compute_fraction=(float(idx.numel()) / max(1, n)),
+            compute_fraction=(float(idx.numel()) / max(1, n)),  # the mock is genuinely token-sparse
         )
 
     def unpatch_noise(self, x: Tensor) -> Tensor:
-        # predict ε in *token* space (same dim as tokens) for a clean scheduler step
         return self.mlp(self.norm(x))
 
     def _cached_or_zero(self, cache: Optional[BackboneCache], tokens: Tensor) -> Tensor:
@@ -240,11 +193,7 @@ class MockBackbone(BackboneAdapter):
 
     def _mk_cache(self, eps: Tensor, prev: Optional[BackboneCache]) -> BackboneCache:
         step = (prev.step + 1) if prev is not None else 0
-        # The adapter contract (transition.py) is that the cached copy is detached:
-        # keeping the graph on it would chain every step's activations together.
         return BackboneCache(model_output=eps.detach(), step=step)
-
-    # -- scheduler (simple Euler / flow-matching style update) ---------- #
 
     def scheduler_step(
         self, model_output: Tensor, t: Tensor, t_next: Tensor, tokens: Tensor
@@ -257,12 +206,5 @@ class MockBackbone(BackboneAdapter):
         return self._net
 
     def dit_blocks(self):
-        """Expose the FFN / time-embed sub-blocks for Stage-C LoRA (§4.2).
-
-        A real backbone returns its transformer blocks here; the mock has no block
-        list, so it returns the ``nn.Linear``-bearing sub-modules that lie on the
-        denoiser's gradient path (``mlp`` is used in both the block and the ε head,
-        ``t_embed`` in every step). Wrapping these lets the LoRA path be exercised
-        end-to-end on CPU (the base linears stay frozen; only the LoRA A/B train).
-        """
+        """Sub-blocks on the denoiser's gradient path, exposed for Stage-C LoRA."""
         return [self.mlp, self.t_embed]

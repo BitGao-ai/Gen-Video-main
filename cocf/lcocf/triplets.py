@@ -1,21 +1,4 @@
-"""Local causal sub-graph construction via VLM parsing (§3.3.1).
-
-L-COCF's first simplification: instead of *learning* a global spatio-temporal
-causal graph (NP-hard, §3.1), we *read* a local causal sub-graph straight from the
-prompt with a frozen VLM, then close it under spatio-temporal locality
-(axiom §3.2.1). Concretely:
-
-    prompt ──VLM──▶ causal triplets {(E_i, A_ij, E_j)}  ──locality──▶  G_s
-
-The parser is frozen (zero training cost, §3.3.5) and injected behind the
-:class:`CausalParser` contract, so a rule-based parser (tests/cold-start) and a
-real VLM (LLaVA / Qwen-VL / GPT-4o) are interchangeable with no algorithm change.
-
-Output is a :class:`~cocf.common.types.CausalSubgraph`: the entities, their VLM
-importance scores (→ ``s_E``), the triplet adjacency, and the set of
-quality-critical entities tagged text/face/hands (§9.3), which the strength field
-and the budget scheduler treat preferentially.
-"""
+"""Local causal sub-graph construction via parsing."""
 
 from __future__ import annotations
 
@@ -26,8 +9,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from cocf.common.config import LCOCFConfig
 from cocf.common.types import CausalSubgraph, CausalTriplet
 
-# Lightweight lexicons for the rule-based fallback parser. A real VLM supersedes
-# these; they exist so the framework runs (and tests) with no model download.
 _CRITICAL_HINTS = {
     "text": ("text", "word", "letter", "sign", "logo", "caption", "number", "字", "文字"),
     "face": ("face", "person", "man", "woman", "child", "eye", "portrait", "脸", "人"),
@@ -37,25 +18,23 @@ _STOP = {"a", "an", "the", "of", "in", "on", "with", "and", "is", "are", "to", "
 
 
 class CausalParser(abc.ABC):
-    """Frozen prompt → causal sub-graph parser (§3.3.1)."""
+    """Frozen prompt to causal sub-graph parser."""
 
     @abc.abstractmethod
     def parse(self, prompt: str) -> CausalSubgraph:
+        """Parse prompt into causal sub-graph."""
         ...
 
 
 class RuleBasedCausalParser(CausalParser):
-    """Dependency-free heuristic parser (cold-start fallback & unit tests).
-
-    Extracts crude ``(subject, verb, object)`` triplets via token heuristics and
-    assigns importance by salience (subject > object > modifiers). It is *not*
-    meant to rival a VLM — it makes the pipeline runnable and deterministic.
-    """
+    """Heuristic parser fallback for tests."""
 
     def __init__(self, config: Optional[LCOCFConfig] = None) -> None:
+        """Store config."""
         self.cfg = config or LCOCFConfig()
 
     def parse(self, prompt: str) -> CausalSubgraph:
+        """Parse prompt with token heuristics."""
         tokens = [t for t in re.findall(r"[\w']+", prompt.lower()) if t not in _STOP]
         verbs = {"running", "walking", "jumping", "holding", "moving", "spinning",
                  "writing", "talking", "dancing", "flying", "falling", "rotating"}
@@ -81,6 +60,7 @@ class RuleBasedCausalParser(CausalParser):
 
     @staticmethod
     def _tags(text: str) -> Tuple[str, ...]:
+        """Critical entity tags in text."""
         tags = []
         for tag, hints in _CRITICAL_HINTS.items():
             if any(h in text for h in hints):
@@ -88,24 +68,21 @@ class RuleBasedCausalParser(CausalParser):
         return tuple(tags)
 
     def _to_subgraph(self, triplets: List[CausalTriplet], prompt: str) -> CausalSubgraph:
+        """Wrap triplets into sub-graph."""
         return build_subgraph(triplets)
 
 
 class VLMCausalParser(CausalParser):
-    """Frozen VLM parser (LLaVA / Qwen-VL / …) — lazy, optional dependency.
-
-    Prompts the VLM for a JSON list of causal triplets with importance scores and
-    critical-entity tags, then closes them into a sub-graph. Falls back to the
-    rule-based parser if the model or its output is unavailable, so callers never
-    have to special-case the cold-start path.
-    """
+    """Frozen VLM parser with rule fallback."""
 
     def __init__(self, config: LCOCFConfig) -> None:
+        """Store config and fallback parser."""
         self.cfg = config
         self._fallback = RuleBasedCausalParser(config)
-        self._model = None  # lazily built in _ensure
+        self._model = None
 
     def _ensure(self) -> bool:
+        """Load VLM if available."""
         if self._model is not None:
             return True
         try:  # pragma: no cover - requires a downloaded VLM
@@ -117,6 +94,7 @@ class VLMCausalParser(CausalParser):
             return False
 
     def parse(self, prompt: str) -> CausalSubgraph:
+        """Parse prompt via VLM or fallback."""
         if not self._ensure():
             return self._fallback.parse(prompt)
         try:  # pragma: no cover
@@ -126,16 +104,12 @@ class VLMCausalParser(CausalParser):
             return self._fallback.parse(prompt)
 
     def _query_vlm(self, prompt: str) -> List[CausalTriplet]:  # pragma: no cover
+        """Query VLM for triplets."""
         raise NotImplementedError("wire the concrete VLM prompt/JSON schema here")
 
 
 def build_subgraph(triplets: List[CausalTriplet]) -> CausalSubgraph:
-    """Close a triplet list into a local causal sub-graph (§3.3.1).
-
-    Aggregates per-entity importance (max over its appearances) and collects
-    critical entities. No structure learning, no global edges — locality is
-    enforced by construction (axiom §3.2.1).
-    """
+    """Close triplet list into sub-graph."""
     importance: Dict[str, float] = {}
     critical: List[str] = []
     for tr in triplets:
@@ -151,7 +125,7 @@ def build_subgraph(triplets: List[CausalTriplet]) -> CausalSubgraph:
 
 
 def build_parser(config: LCOCFConfig) -> CausalParser:
-    """Factory: a real VLM parser when configured, else the rule-based fallback."""
+    """Build VLM or rule-based parser."""
     if config.vlm_name and config.vlm_name not in ("frozen-vlm", "rule", "mock"):
         return VLMCausalParser(config)
     return RuleBasedCausalParser(config)

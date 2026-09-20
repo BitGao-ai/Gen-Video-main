@@ -1,39 +1,14 @@
-"""Stage-B joint loss assembly — ``L_total`` over a counterfactual batch (§4.1).
+"""Stage-B joint loss assembly: ``L_total`` over a counterfactual batch.
 
-Stage B trains the four learnable plugins together on the offline counterfactual
-samples, minimising the design's combined objective::
+The pure realisation of the combined objective from one collated batch (no IO, no
+optimiser, no loop), reused verbatim by Stage C's regulariser term::
 
     L_total = L_cocf + λ_sta·L_tube + λ_cert·L_cert + λ_cmsc·L_cmsc + λ_cost·L_budget
 
-This module is the *pure* realisation of that objective from one
-:func:`cocf.data.cocf_batch.collate_cocf_samples` batch — no IO, no optimiser, no
-loop — so it is unit-testable in isolation and reused verbatim by Stage C's
-regulariser term. Each term maps to one §4.1 module row:
-
-    L_cocf   L-COCF predictor: Gaussian NLL of the executed action's ``(μ, σ)``
-             against the realised scalar degradation label (§4.1 "高斯似然损失").
-             The differentiable causal strength ``s = α·s_E+β·s_A+γ·s_T`` flows into
-             the predictor input via :class:`CausalStrengthField`, so the three
-             strength weights train end-to-end too.
-    L_tube   STA smoothing: action-probability *temporal* consistency for the same
-             tube across adjacent denoising steps present in the batch, via the
-             shared :class:`~cocf.tubes.smoothing.TubeSmoothingLoss` (no math
-             duplicated). The boundary term needs spatial tube adjacency, which the
-             per-sample store does not carry, so Stage B exercises the temporal term
-             only (the offline-data-supported half of §4.1's STA row).
-    L_cert   RAEC certificate calibration: ``E_cert = μ + κσ + λ_bnd·b + λ_age·age``
-             (boundary ``b`` and ``age`` read from the tube-state vector) calibrated
-             to be a hinge upper bound on the true damage via
-             :meth:`ErrorCertificateModule.loss`.
-    L_cmsc   CMSC conservation: change in text–tube alignment between the full and
-             counterfactual renders, via :meth:`CMSCLoss.alignment_conservation`.
-    L_budget budget penalty: expected per-action compute cost vs the dynamic budget
-             ``B_t`` (§7.3), penalising ``relu(cost − B_t)`` so the predictor prefers
-             cheaper actions when the step budget is tight (§4.1 预算约束模块).
-
-The certificate's skip-residual and per-tube local-CMSC inputs are not present in
-the offline per-sample schema, so they are passed as zero here (the certificate
-still calibrates on μ/σ/boundary/age, and its coefficients still receive gradient).
+L_cocf is the L-COCF predictor's Gaussian NLL; L_tube the STA temporal smoothing;
+L_cert the RAEC certificate calibration; L_cmsc the text-tube alignment conservation;
+L_budget the over-budget compute penalty. The certificate's skip-residual and
+local-CMSC inputs are not in the offline per-sample schema and are passed as zero.
 """
 
 from __future__ import annotations
@@ -52,10 +27,8 @@ from cocf.lcocf.predictor import build_predictor_input_batch
 
 Tensor = torch.Tensor
 
-# Temperature of the soft action policy ``p(a) = softmax(−μ_a / τ)``: lower damage ⇒
-# higher probability the tube takes that (cheaper) action. τ<1 sharpens the
-# preference so the smoothing/budget terms see a decisive distribution rather than a
-# near-uniform one when the predicted damages are all small.
+# Temperature of the soft action policy ``p(a) = softmax(−μ_a / τ)``: lower damage
+# means a higher probability of the cheaper action.
 ACTION_TEMP = 0.5
 _EPS = 1e-6
 
@@ -101,16 +74,11 @@ def predictor_regression_loss(
     objective: str = "mse",
     scale: float = 100.0,
 ) -> Tensor:
-    """Phase-1 mean pretraining loss: scaled MSE/Huber on ``mu`` — no variance term.
+    """Phase-1 mean pretraining loss: scaled MSE/Huber on ``mu``, no variance term.
 
-    NLL couples ``mu`` and ``sigma`` through ``1/σ²``: while ``sigma`` is far from the
-    residual scale the mean's gradient is either suppressed (large σ) or exploded
-    (small σ), and the fit stalls at a per-action constant. Regressing ``mu`` alone
-    first gives the hidden layers a stable, well-scaled signal; ``sigma`` is
-    calibrated afterwards in the variance phase. FULL rows (action 0, label pinned
-    at zero by construction) are excluded when ``actions`` is given, matching the
-    fit-probe protocol this phased scheme is derived from. ``scale`` inflates the
-    tiny (~1e-2) targets so the loss lives in a numerically comfortable range.
+    Regressing ``mu`` alone first gives the hidden layers a stable signal; ``sigma`` is
+    calibrated afterwards. FULL rows (action 0, label pinned at zero) are excluded when
+    ``actions`` is given. ``scale`` inflates the tiny targets into a comfortable range.
     """
     if actions is not None:
         keep = actions != 0
@@ -127,9 +95,9 @@ def predictor_regression_loss(
 def _nonfull_nll(target: Tensor, mu: Tensor, sigma: Tensor, actions: Tensor) -> Tensor:
     """Gaussian NLL over non-FULL rows only (differentiable zero when none).
 
-    FULL's label and its (structurally pinned) prediction are both zero, so its
-    NLL term 0.5·log(2πσ²) decreases monotonically with σ — including it lets the
-    variance head "improve" by shrinking σ where there is nothing to calibrate.
+    FULL's label and prediction are both zero, so its NLL term decreases monotonically
+    with σ; including it would let the variance head shrink σ where there is nothing to
+    calibrate.
     """
     keep = actions != 0
     if not bool(keep.any()):
@@ -138,23 +106,23 @@ def _nonfull_nll(target: Tensor, mu: Tensor, sigma: Tensor, actions: Tensor) -> 
 
 
 def budget_penalty(probs: Tensor, action_cost: Tensor, budget: Tensor) -> Tensor:
-    """Mean over-budget penalty ``relu(E[cost] − B_t)`` (§4.1 预算约束)."""
+    """Mean over-budget penalty ``relu(E[cost] − B_t)``."""
     expected_cost = (probs * action_cost).sum(-1)        # [B]
     return torch.relu(expected_cost - budget).mean()
 
 
 # --------------------------------------------------------------------------- #
-# per-sample dynamic budget B_t (§7.3) — a conditioning input, non-differentiable
+# per-sample dynamic budget B_t — a conditioning input, non-differentiable
 # --------------------------------------------------------------------------- #
 
 
 def per_sample_budget(accelerator, batch: Dict[str, object], device=None) -> Tensor:
-    """Vector ``[B]`` of the dynamic step budget ``B_t`` for each sample (§7.3).
+    """Vector ``[B]`` of the dynamic step budget ``B_t`` for each sample.
 
     Uses the shared :class:`~cocf.scheduler.budget.BudgetScheduler` so the budget the
-    loss compares against is exactly the one the inference loop spends. Scene
-    complexity is unavailable per offline sample (no parsed sub-graph), so only the
-    time profile + multi-seed uncertainty + interaction-density demand signals apply.
+    loss compares against is the one the inference loop spends. Scene complexity is
+    unavailable per offline sample, so only the time profile, uncertainty and
+    interaction-density signals apply.
     """
     sched = accelerator.budget_scheduler
     step_frac = batch["step_frac"]
@@ -187,9 +155,8 @@ def tube_temporal_smoothness(
 
     Groups the batch by ``(video_id, tube_id)``, orders each group by timestep and
     feeds consecutive-step probability pairs to the shared
-    :class:`~cocf.tubes.smoothing.TubeSmoothingLoss` (single-tube dicts, so only its
-    temporal term fires). Zero when no two same-tube adjacent-step samples co-occur.
-    Reused by Stage C's regulariser and the Stage-B validation smoothness metric.
+    :class:`~cocf.tubes.smoothing.TubeSmoothingLoss`. Zero when no two same-tube
+    adjacent-step samples co-occur.
     """
     video_id = batch.get("video_id") or []
     tube_id = batch["tube_id"]
@@ -220,8 +187,7 @@ def tube_temporal_smoothness(
 def batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
     """Per-sample float column as ``[B]`` on ``like``'s device (zeros when absent).
 
-    Shared with Stage C so both stages feed the certificate the same way — the two had
-    drifted, and the stage that passed zeros silently trained λ_res/λ_cmsc to nothing.
+    Shared with Stage C so both stages feed the certificate the same way.
     """
     v = batch.get(key)
     if not isinstance(v, Tensor) or v.numel() == 0:
@@ -232,11 +198,8 @@ def batch_float(batch: Dict[str, object], key: str, like: Tensor) -> Tensor:
 def _local_cmsc_violation(accelerator, batch: Dict[str, object], like: Tensor) -> Tensor:
     """Per-sample local CMSC violation ``1 − align(tube, prompt)`` as ``[B]``.
 
-    The certificate's ``λ_cmsc`` term exists to raise the risk of skipping a tube that
-    is poorly aligned to the prompt. Stage B fed it a constant zero, so the
-    coefficient never moved — and :meth:`CMSCLoss.local_conservation`, written for
-    exactly this, had no caller anywhere (§P1-13). The counterfactual render's tube
-    embed is the right side to score: it is what the skip actually produced.
+    Raises the certificate risk of skipping a tube poorly aligned to the prompt, scored
+    on the counterfactual render's tube embed (what the skip actually produced).
     """
     text = batch.get("text_embed")
     tube_cf = batch.get("tube_visual_embed_cf")
@@ -250,8 +213,8 @@ def _local_cmsc_violation(accelerator, batch: Dict[str, object], like: Tensor) -
     mask = batch.get("text_mask")
     out = like.new_zeros(like.shape)
     with torch.no_grad():
-        # ``tube_scores`` takes one prompt's [L, d_c] tokens against [K, d_v] tube
-        # embeds, and every sample carries its own prompt — so this is per-sample.
+        # ``tube_scores`` scores one prompt's [L, d_c] tokens against [K, d_v] tube
+        # embeds, per sample.
         for i in range(min(like.shape[0], txt.shape[0], cf.shape[0])):
             tokens = txt[i]
             if isinstance(mask, Tensor) and mask.numel():
@@ -295,42 +258,14 @@ def compute_joint_loss(
     target_scale: float = 100.0,
     isolate_aux: bool = False,
 ) -> Tuple[Tensor, Dict[str, float]]:
-    """Assemble ``L_total`` and its (unweighted) components for one batch (§4.1).
+    """Assemble ``L_total`` and its (unweighted) components for one batch.
 
-    Parameters
-    ----------
-    accelerator
-        The wired :class:`~cocf.core.accelerator.Accelerator` (frozen backbone +
-        plugins). All learnable parameters that receive gradient here live on it.
-    batch
-        A :func:`cocf.data.cocf_batch.collate_cocf_samples` batch dict (tensors on
-        any device; moved to the plugin device internally).
-    training_cfg
-        Loss weights (λ_sta/λ_cert/λ_cmsc/λ_cost); defaults to
-        ``accelerator.config.training``.
-    phase
-        ``"joint"`` (default) is the classic combined objective. ``"mean"``
-        (phased mode, phase 1) replaces L_cocf with a scaled regression on ``mu``
-        and feeds the certificate **detached** ``mu``/``sigma`` — during the
-        controlled phases the certificate loss must not push the mean or the
-        variance. ``"var"`` (phase 2) returns the plain Gaussian NLL over
-        **non-FULL rows only** — FULL's target and (pinned) prediction are both
-        zero, so its NLL would keep rewarding a shrinking σ and masquerade as
-        calibration. The caller freezes everything except ``predictor.var_head``,
-        so the other terms would contribute no gradient anyway.
-    isolate_aux
-        Phased-mode auxiliary-gradient isolation. When True, the certificate
-        receives detached ``mu``/``sigma`` in **every** phase (not just the mean
-        phase — the isolation must not silently lapse at the joint phase), and
-        the mean phase drops the STA/budget terms from the total, making it a
-        pure regression control. Classic single-phase training passes False and
-        is unchanged.
-
-    Returns
-    -------
-    (total, components)
-        ``total`` is a scalar with ``grad_fn``; ``components`` are the *unweighted*
-        per-term floats (plus the weighted total) for logging.
+    ``phase`` selects the objective: ``"joint"`` (default) is the classic combined
+    loss; ``"mean"`` (phased mode) replaces L_cocf with a scaled regression on ``mu``;
+    ``"var"`` returns the plain Gaussian NLL over non-FULL rows only. ``isolate_aux``
+    feeds the certificate detached ``mu``/``sigma`` in every phase and drops the
+    STA/budget terms from the mean-phase total. Returns ``(total, components)`` where
+    ``total`` carries ``grad_fn`` and ``components`` are the unweighted per-term floats.
     """
     cfg = training_cfg or accelerator.config.training
     device = next(accelerator.parameters()).device
@@ -360,9 +295,8 @@ def compute_joint_loss(
 
     # --- L_cocf: phase-dependent predictor loss ------------------------------- #
     if phase == "var":
-        # Variance-calibration phase: non-FULL NLL only. The caller has frozen
-        # every parameter except predictor.var_head, so the remaining joint
-        # terms have no trainable path and are skipped outright.
+        # Variance-calibration phase: non-FULL NLL only; other terms have no
+        # trainable path (the caller froze everything but predictor.var_head).
         l_cocf = _nonfull_nll(damage_true, mu_a, sigma_a, actions)
         return l_cocf, {"cocf": float(l_cocf.detach()), "total": float(l_cocf.detach())}
     if phase == "mean":
@@ -370,10 +304,8 @@ def compute_joint_loss(
             damage_true, mu_a, actions, objective=mean_objective, scale=target_scale
         )
     elif isolate_aux:
-        # The experiment's joint fine-tune keeps FULL out of the NLL too —
-        # re-admitting it would re-create the "σ[FULL] keeps shrinking for free"
-        # gradient the variance phase was insulated from. Classic training
-        # (isolate_aux=False) keeps the original all-sample NLL.
+        # Keep FULL out of the NLL in the joint fine-tune too, as in the variance
+        # phase. Classic training (isolate_aux=False) keeps the all-sample NLL.
         l_cocf = _nonfull_nll(damage_true, mu_a, sigma_a, actions)
     else:
         l_cocf = gaussian_nll(damage_true, mu_a, sigma_a)
@@ -383,20 +315,15 @@ def compute_joint_loss(
     l_tube = tube_temporal_smoothness(accelerator, probs, batch)
 
     # --- L_cert: certificate calibrated as an upper bound on true damage ----- #
-    # ``residual`` and ``local_cmsc`` used to be hard zeros here, so ``λ_res`` and
-    # ``λ_cmsc`` received no gradient at any point in training and stayed at their
-    # config inits for the whole run — two of the certificate's five learnable
-    # coefficients were decorative (§P1-13). Both now carry the real per-sample
-    # signal Stage A measured: δ on the intervened tube, and the tube's local
-    # text-alignment violation from the stored CMSC embeds.
+    # ``residual`` and ``local_cmsc`` carry the real per-sample signal Stage A
+    # measured: δ on the intervened tube, and the tube's local text-alignment
+    # violation from the stored CMSC embeds.
     residual = batch_float(batch, "skip_residual", mu_a)
     local_cmsc = _local_cmsc_violation(accelerator, batch, mu_a)
     if phase == "mean" or isolate_aux:
-        # The certificate's own coefficients still calibrate, but against a
-        # read-only (mu, sigma): during the controlled phases nothing outside the
-        # regression term may push the mean or the variance. ``isolate_aux``
-        # extends that wall into the joint phase so the isolation cannot lapse
-        # silently at the phase switch.
+        # The certificate's coefficients still calibrate, but against a read-only
+        # (mu, sigma): during the controlled phases nothing outside the regression
+        # term may push the mean or the variance.
         mu_cert, sigma_cert = mu_a.detach(), sigma_a.detach()
     else:
         mu_cert, sigma_cert = mu_a, sigma_a
@@ -421,8 +348,7 @@ def compute_joint_loss(
     l_budget = budget_penalty(probs, action_cost, budget)
 
     # Mean phase under auxiliary isolation: a pure regression control — the STA
-    # and budget terms stay out of the total so nothing but the regression shapes
-    # mu. (Their raw values remain in the components for logging.)
+    # and budget terms stay out of the total so only the regression shapes mu.
     skip_aux = phase == "mean" and isolate_aux
     total = (
         l_cocf

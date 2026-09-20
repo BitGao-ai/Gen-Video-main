@@ -1,18 +1,9 @@
-"""Data subsystem — training-data pipeline & quality-metric extraction.
+"""Data subsystem: training-data pipeline and quality-metric extraction.
 
-Two responsibilities, both deliberately decoupled from the algorithm code so the
-four innovations never depend on a particular dataset format or perception model:
-
-    metrics         the :class:`~cocf.lcocf.damage.MetricExtractor` backends
-                    (DINOv2/CLIP/RAFT/OCR) that score video quality — feeding the
-                    L-COCF damage labels (§7.1.1) and the CMSC loss (§6). A
-                    deterministic mock makes the whole pipeline CPU-testable.
-    video_dataset   video+caption reading with HunyuanVideo/Wan2.1-style frame
-                    sampling, resolution bucketing and normalisation (§7.1).
-
-The counterfactual *teacher* generation that turns these into L-COCF training
-labels lives in :mod:`cocf.lcocf.data` (it is L-COCF-specific), and consumes a
-:class:`MetricExtractor` from here.
+Provides the :class:`~cocf.lcocf.damage.MetricExtractor` perception backends
+(DINOv2/CLIP/RAFT/OCR, plus a deterministic mock) and video+caption reading with
+HunyuanVideo/Wan2.1-style frame sampling, bucketing and normalisation. The
+counterfactual teacher generation lives in :mod:`cocf.lcocf.data`.
 """
 
 from __future__ import annotations
@@ -77,7 +68,7 @@ __all__ = [
     "SyntheticVideoReader",
     "TorchvisionVideoReader",
     "collate_video_samples",
-    # OpenVid manifest ingestion & scene stratification (§1.1/§1.2)
+    # OpenVid manifest ingestion & scene stratification
     "OpenVidRecord",
     "read_openvid_csv",
     "read_openvid_manifest",
@@ -86,26 +77,26 @@ __all__ = [
     "scene_histogram",
     "SCENE_TYPES",
     "DEFAULT_OPENVID_COLUMNS",
-    # four-level quality filter (§2)
+    # four-level quality filter
     "QualityFilter",
     "FilterResult",
     "FilterReport",
     "base_video_id",
-    # Stage-C raw-clip source + hard-sample sampling (§4.2)
+    # Stage-C raw-clip source + hard-sample sampling
     "RawFilteredDataset",
     "RawFilteredItem",
     "HardSamplePrioritySampler",
     "collate_raw_filtered",
     "HARD_SCENE_TYPES",
-    # six-level processed store (§3)
+    # six-level processed store
     "ProcessedLayout",
     "video_id_str",
-    # counterfactual LMDB store (§3 level-5)
+    # counterfactual LMDB store
     "CounterfactualSampleWriter",
     "CounterfactualLMDBDataset",
     "store_is_lmdb",
     "iter_lmdb_records",
-    # Stage-B stratified batch assembly (§4.1)
+    # Stage-B stratified batch assembly
     "StratifiedBatchSampler",
     "collate_cocf_samples",
     "timestep_stratum",

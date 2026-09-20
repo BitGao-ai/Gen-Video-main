@@ -1,13 +1,8 @@
-"""Unified training pipeline that orchestrates all three stages (§7.1).
+"""Unified training pipeline that orchestrates all three stages.
 
-The :class:`TrainingPipeline` provides a high-level API to run the full training
-process from data generation through fine-tuning. Each stage is optional (can be
-skipped if data/checkpoint exists), and intermediate results are cached.
-
-Typical usage:
-    pipeline = TrainingPipeline.from_config(config_path)
-    pipeline.run(stages=["A", "B", "C"])
-    accelerator = pipeline.accelerator  # Trained model ready for inference
+:class:`TrainingPipeline` runs the full process from data generation through
+fine-tuning. Each stage is optional (skipped if its data/checkpoint exists) and
+intermediate results are cached.
 """
 
 from __future__ import annotations
@@ -36,10 +31,8 @@ _log = get_logger(__name__)
 class PipelineConfig:
     """Top-level configuration for the three-stage training pipeline.
 
-    Stage A reads the OpenVid CSV(s) and writes the six-level processed store; Stages
-    B and C read that same store. One ``processed_root`` is therefore threaded through
-    all three stages (defaulting to ``experiment_dir / 'LCOCF_OpenVid1M_Processed'``)
-    so the data written by A is exactly what B/C consume.
+    One ``processed_root`` is threaded through all three stages so the store written by
+    Stage A is exactly what Stages B/C consume.
     """
 
     # Shared
@@ -47,10 +40,10 @@ class PipelineConfig:
     checkpoint_load_path: Optional[Path] = None  # Resume from checkpoint
     seed: int = 42
 
-    # Stage-A data inputs (§1.1): OpenVid metadata CSV(s) and where the clips live.
+    # Stage-A data inputs: OpenVid metadata CSV(s) and where the clips live.
     openvid_csvs: List[Path] = field(default_factory=list)
     data_root: str = ""
-    # Shared processed-store root (§3); defaults under experiment_dir when unset.
+    # Shared processed-store root; defaults under experiment_dir when unset.
     processed_root: Optional[Path] = None
 
     # Individual stage configs (optional pre-built overrides; built lazily otherwise)
@@ -71,9 +64,7 @@ class PipelineConfig:
     @classmethod
     def from_yaml(cls, path: Path) -> PipelineConfig:
         """Load config from YAML file."""
-        # Imported here, not at module scope: ``Config.load`` deliberately falls
-        # back to JSON when PyYAML is absent, and a top-level import made merely
-        # importing ``cocf.training`` fail on such a box.
+        # Imported lazily so ``Config.load``'s JSON fallback works without PyYAML.
         import yaml
 
         with open(path) as f:
@@ -89,14 +80,7 @@ class PipelineConfig:
 
 
 class TrainingPipeline:
-    """Orchestrates the three-stage training workflow (§7.1).
-
-    Responsibilities:
-        1. Manage experiment directory & checkpoints
-        2. Load/save accelerator state
-        3. Run stages in sequence or independently
-        4. Log progress & efficiency metrics
-    """
+    """Orchestrates the three-stage training workflow."""
 
     def __init__(
         self,
@@ -105,7 +89,7 @@ class TrainingPipeline:
     ) -> None:
         self.config = config
         self.pipeline_cfg = pipeline_cfg
-        # Device lives on the backbone sub-config (Config has no top-level `device`).
+        # Device lives on the backbone sub-config.
         selected = resolve_device(config.backbone.device)
         if selected.startswith("cuda") and not torch.cuda.is_available():
             _log.warning("CUDA unavailable; pipeline using CPU")
@@ -119,9 +103,7 @@ class TrainingPipeline:
         # Build accelerator
         self.accelerator = Accelerator.from_config(config)
 
-        # Load checkpoint if specified. Accepts either layout — a bare Stage-B
-        # state_dict or the two-part Stage-C {"accelerator", "lora"} mapping — and
-        # re-attaches any LoRA adapters the checkpoint carries.
+        # Load checkpoint if specified; re-attaches any LoRA adapters it carries.
         if pipeline_cfg.checkpoint_load_path:
             _log.info(f"Loading checkpoint from {pipeline_cfg.checkpoint_load_path}")
             ckpt = torch.load(
@@ -130,8 +112,7 @@ class TrainingPipeline:
             )
             load_checkpoint(self.accelerator, ckpt, training_config=config.training)
 
-        # Build engine. The trigger config is a top-level node on Config
-        # (`config.trigger`), not `config.raec.trigger`.
+        # Build engine. The trigger config is a top-level node on Config.
         self.engine = InferenceEngine(
             self.accelerator,
             config.engine,
@@ -144,13 +125,9 @@ class TrainingPipeline:
         self._stage_c: Optional[FinettuneStage] = None
 
     def run(self, stages: List[str] = ["A", "B", "C"]) -> Accelerator:
-        """Run the training pipeline for specified stages.
+        """Run the training pipeline for the given stages, in order.
 
-        Args:
-            stages: List of stage names ("A", "B", "C") to run in order.
-
-        Returns:
-            The trained accelerator, ready for inference.
+        Returns the trained accelerator, ready for inference.
         """
         _log.info("=== COCF-SS-DCA Training Pipeline ===")
         _log.info(f"Running stages: {', '.join(stages)}")
@@ -172,14 +149,14 @@ class TrainingPipeline:
         return self.accelerator
 
     def _processed_root(self) -> Path:
-        """The shared six-level store root (§3): A writes it, B/C read it."""
+        """The shared six-level store root: A writes it, B/C read it."""
         return (
             self.pipeline_cfg.processed_root
             or self.pipeline_cfg.experiment_dir / "LCOCF_OpenVid1M_Processed"
         )
 
     def _run_stage_a(self) -> None:
-        """Run Stage A: counterfactual teacher data generation (§1)."""
+        """Run Stage A: counterfactual teacher data generation."""
         _log.info("\n--- Stage A: Data Generation ---")
 
         if self.pipeline_cfg.stage_a is None:
@@ -197,18 +174,17 @@ class TrainingPipeline:
                 seed=self.pipeline_cfg.seed,
             )
 
-        # The metric extractor is owned by the accelerator (mock by default); Config
-        # carries no such runtime object.
+        # The metric extractor is owned by the accelerator (mock by default).
         self._stage_a = DataGenerationStage(
             config=self.pipeline_cfg.stage_a,
             backbone=self.accelerator.backbone,
-            metric_extractor=self.accelerator.metric_extractor,  # injected
+            metric_extractor=self.accelerator.metric_extractor,
             accelerator=self.accelerator,
         )
         self._stage_a.run()
 
     def _run_stage_b(self) -> None:
-        """Run Stage B: joint module training (§4.1)."""
+        """Run Stage B: joint module training."""
         _log.info("\n--- Stage B: Joint Training ---")
 
         if self.pipeline_cfg.stage_b is None:
@@ -226,7 +202,7 @@ class TrainingPipeline:
         self.accelerator = self._stage_b.run()
 
     def _run_stage_c(self) -> None:
-        """Run Stage C: end-to-end lightweight fine-tuning (§4.2)."""
+        """Run Stage C: end-to-end lightweight fine-tuning."""
         _log.info("\n--- Stage C: Fine-tuning ---")
 
         if self.pipeline_cfg.stage_c is None:
@@ -246,11 +222,8 @@ class TrainingPipeline:
     def _save_checkpoint(self, stage: str) -> None:
         """Save the checkpoint for a completed stage.
 
-        After Stage C this must go through :meth:`FinettuneStage.checkpoint`, not
-        ``accelerator.state_dict()``: the LoRA adapters live inside the *frozen*
-        backbone, which is deliberately not an ``nn.Module`` child of the accelerator,
-        so a bare ``state_dict()`` silently discards the entire ``use_lora`` fine-tune
-        (§4.2). The stage object owns that knowledge, so ask it.
+        After Stage C this goes through :meth:`FinettuneStage.checkpoint` so the LoRA
+        adapters inside the frozen backbone are not discarded.
         """
         ckpt_path = self.pipeline_cfg.experiment_dir / f"checkpoint_after_stage_{stage}.pt"
         if stage.upper() == "C" and self._stage_c is not None:

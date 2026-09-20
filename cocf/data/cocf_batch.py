@@ -1,19 +1,9 @@
-"""Stage-B batch assembly — stratified sampling + collation (§4.1).
+"""Stage-B batch assembly: stratified sampling and collation.
 
-§4.1 prescribes how Stage B reads the counterfactual LMDB:
-
-    * **action-balanced** — each batch holds FULL/LOWFREQ/INTERP/ANCHOR in a 1:1:1:1
-      ratio so the damage predictor is not biased toward the over-represented cheap
-      actions (this is the one *quantitative* balance the doc states);
-    * **scene-stratified** — the six scene classes are mixed within a batch;
-    * **timestep-stratified** — early / mid / late denoising steps co-occur.
-
-:class:`StratifiedBatchSampler` enforces the action ratio *exactly* (cycling the
-rarer action buckets when needed) and mixes scene/timestep by shuffling the per-
-action pools each epoch — driven only by the lightweight ``sample_index.csv`` rows,
-so it never has to read a sample payload to plan a batch. :func:`collate_cocf_samples`
-turns a list of stored payload dicts into stacked tensors (padding the variable-
-length text token sequence with a mask) for the Stage-B forward pass.
+:class:`StratifiedBatchSampler` yields batches balanced 1:1:1:1 across the four
+actions and stratified by scene and timestep, planning only from ``sample_index.csv``
+rows (never a payload). :func:`collate_cocf_samples` stacks stored payload dicts into
+batched tensors, padding the variable-length text token sequence with a mask.
 """
 
 from __future__ import annotations
@@ -31,7 +21,7 @@ from cocf.common.types import Action
 Tensor = torch.Tensor
 _log = get_logger(__name__)
 
-# Per-sample tensor fields that collate stacks into ``[B, ...]`` (name -> rank≥1).
+# Per-sample tensor fields that collate stacks into ``[B, ...]``.
 _VECTOR_FIELDS = (
     "tube_features", "strength_features", "damage_label", "cost_label",
     "uncertainty", "tube_visual_embed_full", "tube_visual_embed_cf",
@@ -43,7 +33,7 @@ _STRING_FIELDS = ("prompt", "scene_type", "video_id")
 
 
 def timestep_stratum(timestep: int, num_total_steps: int) -> str:
-    """Map a denoising timestep to its early / mid / late phase (§7.1.1 strata)."""
+    """Map a denoising timestep to its early / mid / late phase."""
     sf = float(timestep) / max(1, num_total_steps)
     if sf >= 0.8:
         return "early"
@@ -53,22 +43,11 @@ def timestep_stratum(timestep: int, num_total_steps: int) -> str:
 
 
 class StratifiedBatchSampler(Sampler[List[int]]):
-    """Yields batches of dataset indices, action-balanced 1:1:1:1 (§4.1).
+    """Yields batches of dataset indices, action-balanced 1:1:1:1.
 
-    Parameters
-    ----------
-    actions, scenes, strata
-        Per-dataset-index lists (aligned to the dataset's ``keys`` order) giving each
-        sample's action id, scene type and timestep stratum. Built from
-        ``sample_index.csv`` so planning a batch never reads a payload.
-    batch_size
-        Total batch size; split evenly across the present action buckets.
-    rank, world_size
-        Data-parallel shard of this process. Each *action bucket* is strided by rank,
-        so the 1:1:1:1 balance holds within every rank rather than only globally. The
-        batch count is derived from the global sample count, so every rank runs the
-        same number of steps — a rank that finished early would leave the others
-        blocked in the gradient all-reduce.
+    ``actions``/``scenes``/``strata`` are per-index lists aligned to the dataset keys.
+    ``rank``/``world_size`` stride each action bucket so the balance holds per rank and
+    every rank runs the same number of steps.
     """
 
     def __init__(
@@ -113,13 +92,8 @@ class StratifiedBatchSampler(Sampler[List[int]]):
 
     def __iter__(self) -> Iterator[List[int]]:
         rng = random.Random(self.seed + self.epoch)
-        # Each action pool is ordered by *interleaving* its (stratum, scene) groups
-        # rather than by a plain shuffle. A plain shuffle only makes scene/timestep
-        # diversity emerge in expectation, which is not the same as the §4.1
-        # "场景分层 + 时间步分层" the constructor advertises — and both fields were
-        # accepted and then never read at all (§P1-5). Round-robining the groups makes
-        # every *contiguous* draw span as many strata and scenes as the data allows,
-        # which is what a batch actually consumes.
+        # Each action pool is ordered by interleaving its (stratum, scene) groups so
+        # every contiguous draw spans as many strata and scenes as the data allows.
         pools = {a: self._interleaved(idxs, rng) for a, idxs in self.action_buckets.items()}
         present = list(pools)
         if not present:
@@ -128,8 +102,7 @@ class StratifiedBatchSampler(Sampler[List[int]]):
         cursors = {a: 0 for a in present}
 
         def draw(a: int) -> int:
-            # Small pools repeat (cursor wraps): forcing a 1:1:1:1 action mix on an
-            # imbalanced store necessarily oversamples the rare actions.
+            # Small pools repeat (cursor wraps): a 1:1:1:1 mix oversamples rare actions.
             pool = pools[a]
             i = pool[cursors[a] % len(pool)]
             cursors[a] += 1
@@ -137,9 +110,7 @@ class StratifiedBatchSampler(Sampler[List[int]]):
 
         for _ in range(len(self)):
             batch: List[int] = [draw(a) for a in present for _k in range(per_action)]
-            # Top up round-robin when batch_size is not a multiple of the number of
-            # present actions: __len__ promises batches of batch_size, and a short
-            # batch would also make the epoch consume fewer samples than it reports.
+            # Top up round-robin so a batch always has batch_size entries.
             while len(batch) < self.batch_size:
                 batch.append(draw(present[len(batch) % len(present)]))
             rng.shuffle(batch)
@@ -148,10 +119,8 @@ class StratifiedBatchSampler(Sampler[List[int]]):
     def _interleaved(self, idxs: Sequence[int], rng: random.Random) -> List[int]:
         """Order ``idxs`` so consecutive entries vary in timestep stratum and scene.
 
-        Groups by ``(stratum, scene)``, shuffles within each group and across the group
-        order, then draws round-robin. With one group (no strata/scenes supplied) this
-        degrades to a plain shuffle, so the sampler behaves exactly as before when the
-        caller has no metadata to stratify on.
+        Groups by ``(stratum, scene)``, shuffles within and across groups, then draws
+        round-robin; degrades to a plain shuffle when there is only one group.
         """
         groups: Dict[tuple, List[int]] = {}
         for i in idxs:
@@ -171,9 +140,8 @@ class StratifiedBatchSampler(Sampler[List[int]]):
 def collate_cocf_samples(batch: Sequence[Mapping[str, object]]) -> Dict[str, object]:
     """Collate stored counterfactual payload dicts into a batch of stacked tensors.
 
-    Tolerant of missing keys (older/partial payloads default to zeros) so the schema
-    can evolve without breaking already-written stores. The variable-length text
-    token sequence is right-padded to the batch max with a companion ``text_mask``.
+    Missing keys default to zeros; the variable-length text token sequence is
+    right-padded to the batch max with a companion ``text_mask``.
     """
     out: Dict[str, object] = {}
     n = len(batch)
@@ -193,12 +161,8 @@ def collate_cocf_samples(batch: Sequence[Mapping[str, object]]) -> Dict[str, obj
     for key in _STRING_FIELDS:
         out[key] = [str(b.get(key, "")) for b in batch]
 
-    # text token sequence: pad [L_i, d_c] → [B, L_max, d_c] with a [B, L_max] mask.
-    # A sample whose per-clip embedding is missing gets an all-zero row and an all-zero
-    # mask rather than disqualifying the batch: dropping the field entirely made
-    # ``_cmsc_conservation`` return None and the certificate's local-CMSC term fall
-    # back to a hard zero, so one unwritten text_embeds/<vid>.pt silently switched off
-    # L_cmsc for every batch it appeared in.
+    # text token sequence: pad [L_i, d_c] -> [B, L_max, d_c] with a [B, L_max] mask.
+    # A sample missing its per-clip embedding gets an all-zero row and mask.
     text = [_as_tensor(b.get("text_embed")) for b in batch]
     text = [t if (t is not None and t.dim() == 2) else None for t in text]
     out["text_missing"] = sum(1 for t in text if t is None)

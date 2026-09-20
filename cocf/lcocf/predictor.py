@@ -1,20 +1,13 @@
-"""Counterfactual damage predictor ``H_φ`` (§3.3, the learnable core of L-COCF).
+"""Counterfactual damage predictor: the learnable core of L-COCF.
 
-Predicts, for each candidate action ``a`` on a tube ``g_k`` at step ``t``, the
-*final-video* counterfactual damage ``y_{k,t,a}`` as a Gaussian ``(μ, σ)``:
+For each candidate action ``a`` on a tube at step ``t`` it predicts the final-video
+counterfactual damage as a Gaussian ``(mu, sigma)``: ``mu`` is the expected marginal
+damage of the cheap action versus FULL, ``sigma`` its epistemic uncertainty. ``mu``
+feeds the budget-constrained allocator and the error certificate; ``sigma`` drives the
+uncertainty term of the budget schedule and the certificate's risk margin.
 
-    μ   expected marginal damage of taking the cheap action (vs FULL)
-    σ   epistemic uncertainty of that estimate
-
-This is the single trainable network of L-COCF (a few-MLP head, ~1–10 M params,
-§3.3.5). It consumes the 7-dim tube state plus a compact causal/temporal context;
-``μ`` feeds the budget-constrained allocator (§2.2) and the error certificate
-(§5.3.1), while ``σ`` drives the uncertainty term of the budget schedule (§7.3)
-and the certificate's risk margin.
-
-The *exact* input assembly lives here (``build_predictor_input``) and is imported
-verbatim by the data pipeline, so the features the predictor is trained on are
-byte-for-byte the features it sees at inference — no train/serve skew.
+The exact input assembly lives here (``build_predictor_input``) and is imported by the
+data pipeline, so training and inference see identical features.
 """
 
 from __future__ import annotations
@@ -33,7 +26,7 @@ Tensor = torch.Tensor
 
 
 def sinusoidal_embedding(values: Tensor, dim: int) -> Tensor:
-    """Standard sinusoidal embedding of a ``[...]`` scalar tensor → ``[..., dim]``."""
+    """Standard sinusoidal embedding of a ``[...]`` scalar tensor to ``[..., dim]``."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(10000.0) * torch.arange(half, device=values.device, dtype=torch.float32) / max(half, 1)
@@ -62,9 +55,8 @@ def build_predictor_input(
 ) -> Tensor:
     """Assemble the predictor input vector for one tube at one step.
 
-    ``step_frac`` ∈ [0,1] is ``t / T`` (1=pure noise, 0=clean), embedded
-    sinusoidally so the predictor can be conditioned on the denoising phase
-    (early structure vs late detail, §7.3).
+    ``step_frac`` in [0, 1] is ``t / T`` (1 = pure noise, 0 = clean), embedded
+    sinusoidally so the predictor is conditioned on the denoising phase.
     """
     scalars = torch.tensor(
         [
@@ -87,20 +79,18 @@ def predictor_input_dim(cfg: PredictorConfig) -> int:
 
 
 def build_predictor_input_batch(
-    states: Tensor,          # [B, 7]   tube-state vectors
-    strength_feats: Tensor,  # [B, 3]   (s_E, s_A, s_T)
-    strength: Tensor,        # [B]      combined causal strength s
-    budget: Tensor,          # [B]      per-step budget B_t
-    step_frac: Tensor,       # [B]      t / T ∈ [0,1]
+    states: Tensor,          # [B, 7] tube-state vectors
+    strength_feats: Tensor,  # [B, 3] (s_E, s_A, s_T)
+    strength: Tensor,        # [B] combined causal strength
+    budget: Tensor,          # [B] per-step budget
+    step_frac: Tensor,       # [B] t / T in [0, 1]
     step_embed_dim: int,
 ) -> Tensor:
     """Batched, differentiable predictor input ``[B, in_dim]``.
 
-    Concatenates in the **exact same order** as the per-sample
-    :func:`build_predictor_input` — ``[state(7), s_E, s_A, s_T, strength, budget]``
-    then the sinusoidal step embedding — so the features the predictor is trained on
-    in Stage B are byte-for-byte the features it sees at inference (no train/serve
-    skew). Stays in the autograd graph (``strength`` flows from the strength field).
+    Concatenates in the same order as :func:`build_predictor_input`
+    (``[state(7), s_E, s_A, s_T, strength, budget]`` then the step embedding) so Stage-B
+    training and inference see identical features. Stays in the autograd graph.
     """
     scalars = torch.cat(
         [
@@ -116,7 +106,7 @@ def build_predictor_input_batch(
 
 
 class DamagePredictor(nn.Module):
-    """MLP head mapping a tube's features → per-action ``(μ, σ)`` (§3.3)."""
+    """MLP head mapping a tube's features to per-action ``(mu, sigma)``."""
 
     def __init__(self, config: PredictorConfig) -> None:
         super().__init__()
@@ -130,36 +120,24 @@ class DamagePredictor(nn.Module):
                 layers.append(nn.Dropout(config.dropout))
         self.trunk = nn.Sequential(*layers)
         self.mu_head = nn.Linear(config.hidden_dim, config.num_actions)
-        # log-variance head for a calibrated, heteroscedastic σ
+        # log-variance head for a calibrated, heteroscedastic sigma
         self.var_head = nn.Linear(config.hidden_dim, config.num_actions)
-        # Bias-init both heads so an *untrained* predictor yields a small μ and a
-        # small σ rather than μ≈0.70/σ≈1.0 (the softplus/exp values at bias 0). The
-        # error certificate is μ + κ·σ with κ=1.96, so zero biases put E_cert at ~2.7
-        # against a τ_high of 0.80 and every tube is rolled back on step 2 — the
-        # accelerator would disable itself before the predictor ever learns anything
-        # (§5.3.1 cold start). See PredictorConfig.mu_init / log_var_init.
+        # Bias-init both heads so an untrained predictor yields small mu and sigma;
+        # the cold-start error certificate (mu + k*sigma) must sit below the rollback
+        # threshold. See PredictorConfig.mu_init / log_var_init.
         nn.init.constant_(self.mu_head.bias, _inv_softplus(config.mu_init))
         nn.init.constant_(self.var_head.bias, float(config.log_var_init))
-        # Small-weight init on the heads so the biases (not the random projections)
-        # dominate at step 0 and the cold-start certificate is actually calibrated.
+        # Small-weight init so the biases dominate at step 0.
         nn.init.normal_(self.mu_head.weight, std=1e-3)
         nn.init.normal_(self.var_head.weight, std=1e-3)
 
     def forward(self, features: Tensor) -> DamagePrediction:
-        """``features`` is ``[B, in_dim]`` (B = number of tubes); returns batched μ, σ."""
-        # No gradient checkpointing: the trunk is 3 layers of width 128, so its
-        # activations are a few hundred KB while recomputing them costs a second
-        # forward on every backward — the trade is inverted at this size (§P2-10).
+        """``features`` is ``[B, in_dim]`` (B = number of tubes); returns batched mu, sigma."""
         h = self.trunk(features)
-        mu = torch.nn.functional.softplus(self.mu_head(h))  # damage ≥ 0
+        mu = torch.nn.functional.softplus(self.mu_head(h))  # damage >= 0
         if self.cfg.pin_full_zero:
-            # FULL is the *reference* the whole framework measures damage against:
-            # Stage A labels it as exactly zero (§1.5) and the allocator's benefit /
-            # cost arithmetic assumes it. Left free, softplus can emit μ[FULL] > μ[skip],
-            # and then upgrading toward FULL has negative benefit while downgrading is
-            # clamped to zero cost by ``max(0, ·)`` — a downgrade looks *free* and the
-            # allocation degenerates (§P1-12). Anchoring the column removes the
-            # degree of freedom instead of hoping training removes it.
+            # FULL is the reference damage is measured against, so its column is pinned
+            # to zero to keep the allocator's benefit/cost arithmetic consistent.
             keep = torch.ones_like(mu)
             keep[..., int(Action.FULL)] = 0.0
             mu = mu * keep
@@ -182,7 +160,7 @@ class DamagePredictor(nn.Module):
 
 
 def _inv_softplus(y: float) -> float:
-    """``x`` such that ``softplus(x) == y`` — so ``mu_head.bias`` init lands on ``μ₀``."""
+    """``x`` such that ``softplus(x) == y``, so ``mu_head.bias`` init lands on ``mu_0``."""
     y = max(float(y), 1e-6)
-    # log(exp(y) − 1), via expm1 for stability at small y (the regime we init in).
+    # log(exp(y) - 1), via expm1 for stability at small y.
     return float(math.log(math.expm1(y))) if y < 20.0 else y

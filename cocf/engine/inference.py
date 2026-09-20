@@ -1,20 +1,18 @@
-"""Accelerated inference engine — the main denoising loop (§7.2).
+"""Accelerated inference engine: the main denoising loop.
 
-The engine orchestrates a reverse denoising process from noisy latent z_T to clean
-z_0, with dynamic per-tube compute allocation using the full COCF-SS-DCA pipeline:
+Runs reverse denoising from noisy latent z_T to clean z_0 with dynamic per-tube
+compute allocation across the COCF pipeline. Each step (t = T..1):
 
-    Iteration (t=T to t=1):
-        1. Build/update semantic tubes G_t (STA)
-        2. Extract 7-dim tube states s_{k,t} (STA)
-        3. Compute causal strengths & damage predictions (L-COCF)
-        4. Compute error certificates (RAEC)
-        5. Solve action allocation under budget & risk constraints (scheduler)
-        6. Execute actions: FULL/LOWFREQ/INTERP/ANCHOR (transition executor)
-        7. Check error triggers & apply repairs: rollback/boundary-blend/KV-refresh
-        8. Update anchor library & tube memory
+    1. Build/update semantic tubes (STA)
+    2. Extract per-tube states (STA)
+    3. Predict causal strengths and damage (L-COCF)
+    4. Compute error certificates (RAEC)
+    5. Allocate actions under budget and risk constraints (scheduler)
+    6. Execute actions: FULL/LOWFREQ/INTERP/ANCHOR
+    7. Check triggers and repair: rollback/boundary-blend/KV-refresh
+    8. Update anchor library and tube memory
 
-The loop is fully stateless across calls (no accumulated gradients, device-agnostic
-error handling). All mutable state lives in :class:`EngineState`.
+The loop is stateless across calls; all mutable state lives in :class:`EngineState`.
 """
 
 from __future__ import annotations
@@ -61,27 +59,13 @@ _log = get_logger(__name__)
 
 
 class InferenceEngine(nn.Module):
-    """Stateless accelerated denoising loop (§7.2).
+    """Stateless accelerated denoising loop.
 
-    The engine is the **only** orchestrator of the full pipeline. It does not
-    train; all trainable parameters live in the :class:`Accelerator`. The engine:
-
-    1. Owns the :class:`BudgetScheduler` and :class:`ActionAllocator` (stateless)
-    2. Calls into the accelerator's submodules (L-COCF, STA, RAEC, CMSC, etc.)
-    3. Maintains transient per-generation state in :class:`EngineState`
-    4. Returns :class:`GenerationResult` with efficiency traces
-
-    The engine is device-agnostic: it works on CPU for testing and on GPU for
-    production (all tensors follow the accelerator's device).
-
-    Parameters
-    ----------
-    accelerator
-        The wired accelerator containing all learnable components & backbone.
-    engine_config
-        Knobs: num_steps, tube_build_step, tube_refresh_every.
-    trigger_config
-        Risk thresholds & rollback params (§5.3.2).
+    The engine orchestrates the pipeline but does not train; all trainable
+    parameters live in the :class:`Accelerator`. It owns the (stateless) budget
+    scheduler and action allocator, calls into the accelerator submodules, keeps
+    transient state in :class:`EngineState`, and returns a
+    :class:`GenerationResult` with efficiency traces. Device-agnostic.
     """
 
     def __init__(
@@ -95,19 +79,11 @@ class InferenceEngine(nn.Module):
         self.engine_cfg = engine_config
         self.trigger_cfg = trigger_config
 
-        # Both are stateless and already built (with the executor's stride) by the
-        # accelerator; constructing a second pair here meant a config edit could land
-        # on one copy and not the other.
         self.budget_scheduler = accelerator.budget_scheduler
         self.action_allocator = accelerator.allocator
 
-        # Tube builder (only called at specific steps)
         self.tube_builder = accelerator.tube_builder
 
-        # One-shot flags: an adapter with no temporal-layout description disables the
-        # windowed differentiable decode, and one that only describes prefix windows
-        # pins the loss to the head of the clip. Both are worth saying once, not once
-        # per batch.
         self._warned_no_pixel_span = False
         self._warned_prefix_window = False
 
@@ -128,32 +104,21 @@ class InferenceEngine(nn.Module):
             prompts: Text prompts (batch).
             z_init: Initial noisy latent [B, N, d].
             grid: TokenGrid metadata.
-            cond: Text conditioning (embeddings, etc.).
+            cond: Text conditioning.
             backbone: Frozen backbone model.
-            record_sink: Optional per-step callback ``(step_idx, t, budget, step_frac,
-                tube_states, strength_feats, actions, tube_residual, local_cmsc)`` used
-                by Stage-C end-to-end fine-tuning to collect the exact per-tube features
-                the engine allocated on and certified against (§4.2). Called after the
-                transition, so ``actions`` names what really executed. ``None`` at
-                inference (zero overhead).
-            decode_grad: If True, run the whole trajectory **on** the autograd graph —
-                the backbone is put in :meth:`~cocf.backbones.base.BackboneAdapter.grad_mode`
-                so its forwards stop using ``inference_mode``, and the final decode is
-                differentiable. This is the §4.2 path from the pixel/semantic loss back
-                to the residual-repair net and any LoRA adapters. Inference leaves it
-                False and keeps the cheaper ``inference_mode``/``no_grad`` passes.
+            record_sink: Optional per-step callback used by Stage-C fine-tuning to
+                collect the per-tube features the engine allocated on. ``None`` at
+                inference.
+            decode_grad: If True, run the trajectory on the autograd graph with a
+                differentiable final decode; inference leaves it False.
 
         Returns:
             GenerationResult with final video, traces, efficiency stats.
         """
-        # ``inference_mode`` is viral — a tensor produced under it can never join an
-        # autograd graph, which is why Stage C used to train nothing despite asking for
-        # a differentiable decode. Opening the backbone's grad mode for the whole span
-        # is what makes ``decode_grad`` mean anything (§4.2).
-        #
-        # The peak-memory probe wraps the whole trajectory because §9.4 asks for 峰值显存
-        # alongside the latency/FLOPs figures, and a saving that is really a
-        # memory-for-time trade should be visible as one. It is a no-op off CUDA.
+        # inference_mode is viral: a tensor produced under it can never join an autograd
+        # graph, so the backbone's grad mode is opened for the whole span when a
+        # differentiable decode is requested. The peak-memory probe wraps the
+        # trajectory (a no-op off CUDA).
         if z_init.shape[0] != 1 or len(prompts) != 1 or cond.embeds.shape[0] != 1:
             raise ValueError("InferenceEngine requires a single video and prompt per call")
         if cond.prompts and list(cond.prompts) != list(prompts):
@@ -181,49 +146,33 @@ class InferenceEngine(nn.Module):
         """The denoising trajectory itself (see :meth:`generate` for the contract)."""
         batch_size = z_init.shape[0]
 
-        # RAEC's trigger carries per-run bookkeeping (the force-FULL pins). Clearing it
-        # here is what keeps the engine stateless across calls now that the pins live
-        # in the module rather than in EngineState; ``reset()`` had no caller at all
-        # before (§P1-7).
+        # Clear RAEC's per-run trigger bookkeeping to keep the engine stateless.
         self.accelerator.raec.reset()
 
-        # Initialize state for this generation
         state = EngineState(
             z=z_init,
             grid=grid,
             cond=cond,
-            subgraph=None,  # Built on-demand
-            # AnchorStore's only ctor arg is offload_to_cpu; RAEC owns the factory.
-            # The memory policy has to be *handed* to it — the engine used to call the
-            # factory bare, so ``MemoryConfig.offload_backbone_to_cpu`` could never
-            # reach the store and its CPU-offload path was unreachable config.
+            subgraph=None,
             anchor_store=self.accelerator.raec.new_anchor_store(
                 self.accelerator.config.memory
             ),
             cache=None,
         )
 
-        # Main denoising loop: t = T → 1
         num_steps = self.engine_cfg.num_inference_steps
-        # Truncated BPTT (§4.2), counted in *computed* steps rather than wall-clock
-        # ones. Activations are retained only by steps whose denoiser actually ran, so
-        # that is what bounds memory — and it is also what carries gradient to the LoRA
-        # adapters. A wall-clock window ("keep the last 4 steps") cuts the graph on an
-        # accelerated trajectory that skipped its final steps, which is the *normal*
-        # case here: a run computing 2 of 30 steps would train nothing at all while
-        # every log line still said use_lora. 0 keeps the whole trajectory.
+        # Truncated BPTT counted in computed steps rather than wall-clock ones; 0 keeps
+        # the whole trajectory.
         window = int(getattr(self.engine_cfg, "grad_window_steps", 0))
         state.grad_window = window if decode_grad else 0
         _log.info("generation start: steps=%d batch=%d tokens=%d decode_grad=%s grad_window=%d",
                   num_steps, batch_size, grid.num_tokens, decode_grad, state.grad_window)
 
         for step_idx in range(num_steps):
-            # Reverse time: step 0 is t=T, step num_steps-1 is t=1
             t = num_steps - step_idx
 
             _log.debug(f"Denoising step {step_idx+1}/{num_steps} (t={t})")
 
-            # Execute one denoising step with full COCF pipeline
             trace = self._step(
                 state=state,
                 step_idx=step_idx,
@@ -243,21 +192,14 @@ class InferenceEngine(nn.Module):
                 trace.budget, trace.num_tubes, trace.rollbacks, trace.repairs,
                 trace.cf_repairs, state.z.requires_grad, state.retained_computed, state.graph_cuts,
             )
-            # The executed plan decides everything about quality; keep its histogram
-            # at the same cadence as the step line instead of burying it in DEBUG.
             if trace.actions:
                 hist = Counter(trace.actions.values())
                 log_step("step %d actions: %s", step_idx + 1,
                          ", ".join(f"{name}={n}" for name, n in sorted(hist.items())))
 
-        # Decode final latent to video. The adapter owns the token<->grid layout
-        # (`to_grid`) and the VAE decode (`decode_latent`).
+        # Decode the final latent to video.
         z0_grid = self.accelerator.backbone.to_grid(state.z, state.grid)  # [B, C, T, H, W]
 
-        # The backbone's decoder is frozen, so we call it directly. Stage-C end-to-end
-        # fine-tuning needs the decode on the autograd graph (the §4.2 pixel-loss path to
-        # the LoRA / repair params), so it passes ``decode_grad=True``; inference keeps the
-        # cheaper no_grad decode.
         frame_span: Optional[Tuple[int, int]] = None
         if decode_grad:
             lo, hi, frame_span = self._grad_decode_window(state.grid, backbone)
@@ -283,21 +225,11 @@ class InferenceEngine(nn.Module):
     ) -> Tuple[int, int, Optional[Tuple[int, int]]]:
         """Latent slots ``[lo, hi)`` to decode on the graph, and the pixel range they cover.
 
-        Returns the whole clip (and ``frame_span=None``) when windowing is off, when the
-        window would cover everything anyway, or when the backbone can describe no window
-        at all — see :meth:`BackboneAdapter.pixel_span` for why guessing that layout is
-        not an option.
-
-        The offset is drawn uniformly so the subsampled loss stays an unbiased estimator
-        of the full-clip one across steps (it follows the global RNG, so a seeded run is
-        reproducible) — but the draw is *offered* to the backbone rather than imposed on
-        it. A causal-temporal VAE can only reproduce a sub-range of its own full decode
-        when the slice starts at slot 0: given any later offset it has no feature cache
-        of the preceding slots and re-anchors, returning a differently-sized window of
-        different pixels. Such an adapter declines the random offset (``None``), and this
-        falls back to the prefix ``[0, k)``, which it can honour exactly. Adapters with a
-        uniform temporal layout (the mock) accept the random offset and keep the
-        unbiasedness.
+        Returns the whole clip (``frame_span=None``) when windowing is off or when the
+        backbone can describe no window. The offset is drawn uniformly to keep the
+        subsampled loss unbiased, but it is offered to the backbone: a causal-temporal
+        VAE can only reproduce a sub-range starting at slot 0, so such an adapter
+        declines the random offset and this falls back to the prefix ``[0, k)``.
         """
         k = int(getattr(self.engine_cfg, "decode_grad_frames", 0))
         if k <= 0 or k >= grid.t:
@@ -305,7 +237,6 @@ class InferenceEngine(nn.Module):
         span_fn = getattr(backbone, "pixel_span", None)
         if callable(span_fn):
             lo = int(torch.randint(0, grid.t - k + 1, (1,)).item())
-            # The random draw first, then the prefix — never the prefix twice.
             for cand in ((lo, 0) if lo > 0 else (0,)):
                 span = span_fn(cand, cand + k)
                 if span is not None:
@@ -329,10 +260,9 @@ class InferenceEngine(nn.Module):
     ) -> None:
         """Say once that the windowed decode is pinned to the head of every clip.
 
-        Not an error — a prefix window is the only one a causal decoder can align — but
-        it does change the training signal: the §4.2 pixel / §6.3.2 semantic gradients
-        then only ever reach frames ``[start, stop)``, so the tail of the clip trains on
-        the schedule regularisers alone.
+        Not an error: a prefix window is the only one a causal decoder can align, but
+        the pixel/semantic gradients then reach only frames ``[start, stop)``, so the
+        clip tail trains on the schedule regularisers alone.
         """
         if self._warned_prefix_window:
             return
@@ -347,18 +277,10 @@ class InferenceEngine(nn.Module):
 
     @staticmethod
     def _warn_if_no_graph(video: Tensor, state: EngineState, window: int) -> None:
-        """Say so loudly when a ``decode_grad`` render carries no gradient.
+        """Warn when a ``decode_grad`` render carries no gradient.
 
-        Silently training nothing is the failure this whole path exists to prevent, and
-        it has two innocent-looking causes worth telling apart:
-
-        * no step inside the retained window ran the denoiser (a fully-cached
-          trajectory touches no backbone weight, so there is nothing to differentiate);
-        * detached anchors replaced the differentiable state, or no trainable
-          LoRA/repair operation contributed to the final render.
-
-        Both leave Stage C training only its schedule regulariser while the logs look
-        perfectly healthy.
+        Two causes: no step inside the retained window ran the denoiser, or detached
+        anchors / absent LoRA-repair participation left nothing trainable in the render.
         """
         if video.requires_grad:
             return
@@ -381,11 +303,7 @@ class InferenceEngine(nn.Module):
         backbone: BackboneAdapter,
         record_sink: Optional[Callable[..., None]] = None,
     ) -> StepTrace:
-        """Execute one complete denoising step with full COCF pipeline (§7.2).
-
-        This is the per-timestep orchestration that implements the 8-step workflow
-        described in the design document.
-        """
+        """Execute one complete denoising step with the full COCF pipeline."""
         trace = StepTrace(
             step=step_idx,
             mask_ratio=1.0,
@@ -395,9 +313,8 @@ class InferenceEngine(nn.Module):
             compute_ratio=1.0,
         )
 
-        # --- Step 1: Build/update semantic tubes G_t (STA) -----
-        # The tube builder segments *RGB frames*, so decode a cheap preview of the
-        # current latent first (build() expects [F, 3, Hp, Wp] with F == grid.t).
+        # Step 1: build/update semantic tubes. The builder segments RGB frames, so a
+        # cheap preview of the current latent is decoded first.
         if step_idx == self.engine_cfg.tube_build_step or (
             self.engine_cfg.tube_refresh_every > 0
             and (step_idx - self.engine_cfg.tube_build_step) % self.engine_cfg.tube_refresh_every == 0
@@ -406,46 +323,36 @@ class InferenceEngine(nn.Module):
             frames_rgb = self._decode_preview_frames(state, backbone)
             state.tubes, _, state.latent_flows = self.tube_builder.build_with_states(
                 frames_rgb, state.grid, state.prompt)
-            # Pool each tube's CLIP visual embed off the *same* preview frames while
-            # they are still in hand (§P4-4). These feed the certificate's local-CMSC
-            # term every step; recomputing them per step would cost a perception
-            # forward per tube per step, and they only change when tubes are rebuilt.
+            # Pool each tube's CLIP visual embed off the same preview frames; they feed
+            # the certificate's local-CMSC term every step and only change on rebuild.
             state.tube_embeds = {
                 tube.tube_id: tube_clip_embed(
                     frames_rgb, tube, state.grid, self.accelerator.perception
                 )
                 for tube in state.tubes
             }
-            # Re-segmentation mints fresh tube ids (they are monotonic, so nothing
-            # inherits a previous tube's anchor — §P1-10). Retire the anchors of tubes
-            # that no longer exist so the store does not grow for the whole run.
+            # Retire anchors and trigger bookkeeping of tubes that no longer exist.
             live_ids = {t.tube_id for t in state.tubes}
             dropped = state.anchor_store.retain(live_ids)
-            # Same cleanup for the trigger: a retired id at the unmeasured cap would
-            # otherwise veto every later whole-step-skip promotion.
             self.accelerator.raec.trigger.retain(live_ids)
             _log.debug(f"  Built {len(state.tubes)} semantic tubes "
                        f"({dropped} stale anchor(s) retired)")
 
         trace.num_tubes = len(state.tubes)
 
-        # No tubes yet (cold-start warm-up): advance the latent with a dense FULL
-        # step and return — there is nothing to allocate or certify.
+        # No tubes yet (cold-start warm-up): advance with a dense FULL step.
         if not state.tubes:
             state.z, state.cache, warm_cost = self._warmup_step(state, t, backbone)
             trace.compute_ratio = warm_cost  # a warm-up step is a full dense forward
             return trace
 
-        # --- Step 2: Extract per-tube states s_{k,t}, keyed by tube_id -----
-        # tube_builder.update returns {tube_id: TubeState}; using tube_id (not the
-        # list index) is required because L-COCF indexes states[tube.tube_id] and
-        # tube_ids are persistent/global (and drift from list position after splits).
+        # Step 2: extract per-tube states keyed by tube_id (persistent/global ids).
         for tube in state.tubes:
             tube.state.anchor_age = float(state.anchor_store.age(tube.tube_id, step_idx))
         tube_states: Dict[int, TubeState] = self.tube_builder.update(
             state.tubes, latent_flow_by_frame=state.latent_flows)
 
-        # --- Step 3: Compute causal strengths & L-COCF damage predictions -----
+        # Step 3: causal strengths and L-COCF damage predictions.
         if state.subgraph is None:
             state.subgraph = self.accelerator.lcocf.parse(state.prompt)
 
@@ -455,12 +362,8 @@ class InferenceEngine(nn.Module):
         strengths = self.accelerator.lcocf.strengths(strength_feats)
         priors = self.accelerator.lcocf.prior_actions(strengths, tube_states)
 
-        # --- Step 5a: budget for this step (drives prediction & allocation) -----
-        # Dynamic per-step budget B_t (§7.3): the U-shaped time profile modulated by
-        # caption complexity and tube-interaction density. This is also exactly the
-        # §4.2 "按字幕复杂度动态分配单步算力预算" Stage C relies on, so inference and the
-        # end-to-end fine-tune size the budget identically (no train/serve skew). Gated
-        # by ``use_dynamic_budget``: off ⇒ spend the full-compute ceiling every step.
+        # Step 5a: per-step budget. U-shaped time profile modulated by caption
+        # complexity and tube-interaction density; gated by ``use_dynamic_budget``.
         step_frac = t / self.engine_cfg.num_inference_steps
         if self.engine_cfg.use_dynamic_budget:
             complexity = self.budget_scheduler.score_complexity(state.prompt, state.subgraph)
@@ -484,42 +387,31 @@ class InferenceEngine(nn.Module):
         trace.predicted_damage = float(
             sum(float(p.mu.detach().mean()) for p in damage_preds.values())
         )
-        # Carry this step's mean damage uncertainty (mean σ over tubes) into the next
-        # step's budget demand (§7.3): the more unsure the predictor, the more compute
-        # the following step is allowed to spend.
+        # Carry this step's mean damage uncertainty into the next step's budget demand.
         if damage_preds:
             state.prev_mean_uncertainty = float(
                 sum(float(p.sigma.detach().mean()) for p in damage_preds.values())
                 / len(damage_preds)
             )
 
-        # --- Step 5b: Solve optimal action allocation -----
-        # Tubes still inside a post-rollback/repair forced-FULL window (§5.3.2) are
-        # pinned to FULL so a rolled-back tube is actually recomputed forward rather
-        # than allowed to skip again and stay frozen at a stale latent. The pins are
-        # owned by :class:`~cocf.raec.trigger.RiskTrigger` — the engine used to keep a
-        # second, inlined copy of the same policy in ``EngineState`` while that class
-        # sat unused, so the two could (and did) drift apart (§P1-7).
+        # Step 5b: solve action allocation. Tubes inside a post-rollback/repair
+        # forced-FULL window are pinned to FULL so they are recomputed forward; the pins
+        # are owned by :class:`~cocf.raec.trigger.RiskTrigger`.
         trigger = self.accelerator.raec.trigger
         forced_full = (
             {t.tube_id for t in state.tubes}
             if self.engine_cfg.force_all_full
             else trigger.forced_full_tubes()
         )
-        # §6.3.1's local conservation proxy ``1 − align(tube, prompt)``: a tube the
-        # prompt barely describes is one whose skip risks a semantic violation, so it
-        # raises that tube's certificate through λ_cmsc (§5.3.1). One projection over
-        # the cached tube embeds — no perception forward — so it is affordable every
-        # step. This term used to be a hard zero at inference: the engine never passed
-        # it and ``CMSCLoss.local_conservation``, written for exactly this, had no
-        # caller anywhere (§P4-4).
+        # Local conservation proxy ``1 - align(tube, prompt)``: a tube the prompt barely
+        # describes risks a semantic violation on skip, raising its certificate through
+        # λ_cmsc. Computed by one projection over the cached tube embeds.
         local_cmsc = self.accelerator.cmsc_loss.local_conservation(
             state.cond.embeds[0], state.tube_embeds,
             text_mask=state.cond.mask[0] if state.cond.mask is not None else None,
         ) if state.tube_embeds else {}
-        # §2.2's hard risk constraint ``E_cert_k(a_k) ≤ τ_r``, evaluated *before* the
-        # action is chosen. The allocator has always accepted this argument; nobody
-        # ever passed it, so the constraint existed only in the docstring.
+        # Hard risk constraint ``E_cert_k(a_k) <= τ_r``, evaluated before the action is
+        # chosen.
         action_risk = {
             tube.tube_id: self.accelerator.raec.action_risk(
                 damage_preds[tube.tube_id],
@@ -546,10 +438,8 @@ class InferenceEngine(nn.Module):
             for tid in changed:
                 decision.actions[tid] = Action.FULL
             _log.info("diagnostic: LOWFREQ -> FULL tubes=%s; allocator cost is pre-override", changed)
-        # Periodic LOWFREQ refresh: ride-through holes never see their own fresh
-        # velocity, so high-frequency residue accumulates between refreshes. Every
-        # ``lowfreq_refresh_every`` steps promote LOWFREQ tubes to FULL for one step,
-        # which both serves fresh values and re-grounds the cache they ride on.
+        # Periodic LOWFREQ refresh: promote LOWFREQ tubes to FULL every
+        # ``lowfreq_refresh_every`` steps to serve fresh values and re-ground the cache.
         refresh_every = self.engine_cfg.lowfreq_refresh_every
         if refresh_every > 0 and (step_idx + 1) % refresh_every == 0:
             refreshed = [tid for tid, action in decision.actions.items()
@@ -570,11 +460,10 @@ class InferenceEngine(nn.Module):
         trace.predicted_cost = decision.predicted_cost
         trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
 
-        # Consume one step of every active forced-FULL window now that this step's
-        # allocation has honoured it; the trigger drops windows that have elapsed.
+        # Consume one step of every active forced-FULL window.
         trigger.step()
 
-        # --- Step 6: Execute tube actions (the latent transition) -----
+        # Step 6: execute tube actions (the latent transition).
         result = self._execute_transition(
             state=state,
             t=t,
@@ -586,34 +475,26 @@ class InferenceEngine(nn.Module):
         trace.mask_ratio = result.mask_ratio
         trace.compute_ratio = result.compute_ratio
 
-        # A promoted whole-step skip executes something cheaper than the allocation
-        # asked for. Adopt the executed actions from here on so the trace, the
-        # certificate and the counterfactual check all describe what really happened
-        # (§P0-1); an empty ``downgraded`` — the ordinary case — changes nothing.
+        # Adopt the executed actions after a promoted whole-step skip so the trace,
+        # certificate and counterfactual check describe what really happened.
         if result.downgraded:
             optimal_actions = {**optimal_actions, **result.downgraded}
             trace.actions = {k: Action(a).name for k, a in optimal_actions.items()}
             _log.debug("  step promoted to a whole-step skip; %d tube(s) downgraded",
                        len(result.downgraded))
 
-        # --- Step 6b: §3.3.4 single-hop counterfactual check on skipped tubes -----
-        # Fire only at temporal mutation points (s_T > θ_sT) for tubes that actually
-        # skipped, capped per step (verifier.triggered_tubes). Compare the executed
-        # (skip) latent against the transition's compute-everywhere reference z_full;
-        # a residual above η means the skip omitted a causal effect (causal omission),
-        # repaired locally by the L-COCF residual-repair net. Gated by cf_check_enabled.
+        # Step 6b: single-hop counterfactual check on skipped tubes. Fires at temporal
+        # mutation points for tubes that skipped; a residual above η means the skip
+        # omitted a causal effect, repaired locally by the residual-repair net.
         if self.engine_cfg.cf_check_enabled and result.z_full is not None:
             trace.cf_checks, trace.cf_repairs = self._counterfactual_check(
                 state, result.z_full, optimal_actions, strength_feats
             )
 
-        # --- Step 4 (post-transition): error certificates (RAEC), keyed by tube_id
-        # Certify the action that was *actually executed* and feed it every §5.3.1 term
-        # the loop can supply: the real skip residual δ_k = ‖z_full − z_action‖ measured
-        # by the transition, the tube's boundary uncertainty (from the tube state), its
-        # anchor age, and the local cross-modal violation computed above. This must run
-        # after the transition: a pre-transition guess (prior action, zero residual)
-        # decouples the risk trigger from the error it exists to catch.
+        # Step 4 (post-transition): error certificates keyed by tube_id. Certify the
+        # action actually executed, feeding it the measured skip residual, boundary
+        # uncertainty, anchor age and local cross-modal violation. Runs after the
+        # transition so the risk trigger sees the real error.
         certificates: Dict[int, float] = {}
         for tube in state.tubes:
             tid = tube.tube_id
@@ -631,15 +512,10 @@ class InferenceEngine(nn.Module):
             certificates[tid] = cert.value
 
         # Stage-C training hook: emit this step's per-tube (state, strength, executed
-        # action) so the end-to-end fine-tune can recompute the scheduling regularisers
-        # on the exact features the engine allocated on (§4.2, no train/serve skew).
-        # Fired *here*, after the transition and the certificates, for two reasons the
-        # pre-transition position could not satisfy: ``optimal_actions`` now names what
-        # actually ran (a promoted whole-step skip has been folded in), and the skip
-        # residual δ and the local CMSC violation exist — the two certificate inputs
-        # Stage C otherwise had to pass as hard zeros, leaving λ_res and λ_cmsc without
-        # gradient while calibrating E_cert against the full damage.
-        # No-op at inference (record_sink is None) and for warm-up steps (no tubes).
+        # action) so the fine-tune recomputes the scheduling regularisers on the exact
+        # features the engine allocated on. Fired after the transition and certificates
+        # so ``optimal_actions`` names what ran and the residual/CMSC inputs exist.
+        # No-op at inference and for warm-up steps.
         if record_sink is not None:
             record_sink(
                 step_idx=step_idx,
@@ -653,31 +529,26 @@ class InferenceEngine(nn.Module):
                 local_cmsc=local_cmsc,
             )
 
-        # --- Step 7: Risk triggers & local repairs (RAEC) -----
+        # Step 7: risk triggers and local repairs.
         repairs_this_step = 0
         rollbacks_this_step = 0
 
         if self.engine_cfg.risk_control_enabled:
             for tube in state.tubes:
                 cert_k = certificates.get(tube.tube_id, 0.0)
-                # One owner for the threshold policy: the engine used to inline the
-                # same two comparisons that RiskTrigger implements, so editing either
-                # left the other stale (§P1-7).
                 level = trigger.classify_value(cert_k)
 
                 if level == TriggerLevel.ROLLBACK:
                     # High risk: revoke the tube to its safe anchor, fuse the boundary
-                    # against the compute-everywhere latent so the rolled-back interior
-                    # joins its surroundings seam-free (§5.3.2 边界修复), and pin it to
-                    # FULL for the next q steps so it is recomputed forward.
+                    # against the compute-everywhere latent, and pin it to FULL for the
+                    # next q steps so it is recomputed forward.
                     _log.debug(f"  Tube {tube.tube_id}: HIGH RISK ({cert_k:.3f}), rolling back")
                     if result.z_full is not None:
                         rr = self.accelerator.raec.repair.rollback(
                             state.z, result.z_full, tube, state.grid, state.anchor_store
                         )
                         state.z = rr.z
-                        # Refresh the now-stale ε/KV cache for the repaired tokens
-                        # (§5.3.2 缓存刷新; a no-op for backbones without a KV cache).
+                        # Refresh the stale KV cache for the repaired tokens.
                         state.cache = backbone.recompute_kv(
                             state.z, state.cond, rr.refreshed, state.cache
                         )
@@ -688,9 +559,7 @@ class InferenceEngine(nn.Module):
 
                 elif level == TriggerLevel.REPAIR:
                     # Medium risk: boundary-fuse the tube's drifting rim toward the
-                    # freshly computed latent (§5.3.2 边界修复/缓存刷新) and pin it to
-                    # FULL for one refresh step so the region is recomputed rather than
-                    # left to skip again.
+                    # freshly computed latent and pin it to FULL for one refresh step.
                     _log.debug(f"  Tube {tube.tube_id}: MEDIUM RISK ({cert_k:.3f}), repairing")
                     if result.z_full is not None:
                         rr = self.accelerator.raec.repair.repair(
@@ -700,8 +569,6 @@ class InferenceEngine(nn.Module):
                         state.cache = backbone.recompute_kv(
                             state.z, state.cond, rr.refreshed, state.cache
                         )
-                    # One refresh step so the region is recomputed rather than left to
-                    # skip again (a rollback's longer window takes precedence).
                     if not trigger.is_forced_full(tube.tube_id):
                         trigger.register_repair(tube.tube_id)
                     repairs_this_step += 1
@@ -709,19 +576,12 @@ class InferenceEngine(nn.Module):
         trace.rollbacks = rollbacks_this_step
         trace.repairs = repairs_this_step
 
-        # ``z_full`` was the last consumer of a second full-size latent: it is needed by
-        # the residual measurement, the §3.3.4 check and RAEC's boundary fusion, all of
-        # which are done by here. Dropping the reference now means the anchor update and
-        # the next step's forward do not run with it still resident (§P4-B4).
+        # Drop the second full-size latent now that its consumers are done.
         result.z_full = None
 
-        # --- Step 8: Update anchor library (snapshot low-risk tubes) -----
-        # The gate is ``tau_anchor``, *not* ``tau_low``: sharing the trigger's lower
-        # bound made the anchor library a hostage of certificate calibration — with a
-        # cold-start certificate above τ_low nothing was ever anchored, so every
-        # rollback silently did nothing while still pinning the tube to FULL (§5.3.2).
-        # A tube computed at acceptable risk with no anchor at all is also seeded, so
-        # the library is never empty when the first high-risk step arrives.
+        # Step 8: update anchor library (snapshot low-risk tubes). The gate is
+        # ``tau_anchor``; a tube computed at acceptable risk with no anchor is also
+        # seeded so the library is never empty when the first high-risk step arrives.
         for tube in state.tubes:
             tid = tube.tube_id
             cert_k = certificates.get(tid, 1.0)
@@ -744,20 +604,12 @@ class InferenceEngine(nn.Module):
         self, state: EngineState, backbone: BackboneAdapter
     ) -> Tensor:
         """Decode the current latent to RGB frames ``[grid.t, 3, Hp, Wp]`` in ``[0, 1]``
-        for tube segmentation. The tube builder works on pixels and requires exactly one
-        RGB frame per latent-temporal slot (``F == grid.t``).
+        for tube segmentation.
 
-        Only the **first batch element** is decoded. The result is indexed as
-        ``video[0]`` and the rest discarded, so decoding the whole batch bought
-        nothing — and this is the single largest transient in the pass: an untiled
-        49×480×832 decode needs one ~7.7 GiB block (see
-        :meth:`DiffusersVideoBackbone._configure_vae_memory`), which is a strange
-        thing to allocate inside a loop whose purpose is saving memory (§P2-1).
-
-        A real backbone's causal-temporal VAE expands the latent's ``T`` slots into
-        ``(T-1)·c_t + 1`` pixel frames, so the decoded video generally has *more*
-        frames than ``grid.t``. We subsample evenly back to ``grid.t`` representative
-        frames (the mock keeps F == grid.t, so this is a no-op there).
+        Only the first batch element is decoded (the rest is discarded) since this is the
+        single largest transient in the pass. A causal-temporal VAE expands ``T`` latent
+        slots into more pixel frames, so the result is subsampled evenly back to
+        ``grid.t`` representative frames.
         """
         with torch.no_grad():
             latent_grid = self.accelerator.backbone.to_grid(state.z[:1], state.grid)
@@ -793,13 +645,11 @@ class InferenceEngine(nn.Module):
     ) -> Tuple[Tensor, Optional[BackboneCache], float]:
         """Dense FULL denoising step used before tubes exist (cold-start).
 
-        Computes ε on every token and takes a single scheduler step, returning the
-        advanced latent, the refreshed ε cache and the adapter-reported compute cost
-        of the forward (always a full dense pass, hence ~1.0 — reported rather than
-        assumed so the trace stays sourced from the adapter).
+        Computes the noise estimate on every token and takes one scheduler step,
+        returning the advanced latent, the refreshed cache and the adapter-reported
+        compute cost.
         """
-        # The backbone denoises in σ∈(0,1] (see sigma_from_step); the loop counts the
-        # step index down, so convert before handing t to the model.
+        # The backbone denoises in sigma in (0, 1]; convert the descending step index.
         T = self.engine_cfg.num_inference_steps
         t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
         t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
@@ -812,18 +662,12 @@ class InferenceEngine(nn.Module):
         return z_next, out.cache, float(getattr(out, "compute_fraction", 1.0))
 
     def _assemble_anchor_latent(self, state: EngineState) -> Optional[Tensor]:
-        """Build the per-token "last verified-safe" latent ``[B, N, d]`` for ANCHOR
-        reuse and the RAEC residual (§5.3.1).
+        """Build the per-token last-verified-safe latent ``[B, N, d]`` for ANCHOR reuse
+        and the RAEC residual.
 
-        Each tube that has a stored safe anchor contributes its anchored tokens;
-        all other tokens keep the current latent. Returns ``None`` when no tube has
-        been anchored yet, in which case the transition falls back to a cheap
-        ε-reuse step (and reports a zero residual, correctly — there is no safe
-        reference to deviate from).
-
-        One clone, then a scatter per tube: chaining ``rollback`` allocated a fresh
-        full latent for *every* anchored tube and dropped the previous one, K times a
-        step (§P2-2).
+        Each tube with a stored safe anchor contributes its anchored tokens; all other
+        tokens keep the current latent. Returns ``None`` when no tube has been anchored,
+        in which case the transition falls back to a cheap reuse step.
         """
         anchored = [t for t in state.tubes if state.anchor_store.has(t.tube_id)]
         if not anchored:
@@ -843,12 +687,11 @@ class InferenceEngine(nn.Module):
         """Execute one accelerated denoising transition for the allocated actions.
 
         Delegates to the accelerator's :class:`TransitionExecutor`, which handles
-        FULL/LOWFREQ/INTERP/ANCHOR per tube and returns the advanced latent, the
-        refreshed cache, the active-token mask and per-tube residuals. The safe
-        anchor latent is supplied so ANCHOR tubes freeze to it and the measured
-        residual ``‖z_full − z_anchor‖`` is meaningful (the RAEC trigger signal).
+        FULL/LOWFREQ/INTERP/ANCHOR per tube and returns the advanced latent, refreshed
+        cache, active-token mask and per-tube residuals. The safe anchor latent is
+        supplied so ANCHOR tubes freeze to it and the measured residual is meaningful.
         """
-        # Model-space σ∈(0,1] from the descending step index (see sigma_from_step).
+        # Model-space sigma in (0, 1] from the descending step index.
         T = self.engine_cfg.num_inference_steps
         t_now = torch.full((state.z.shape[0],), sigma_from_step(t, T), device=state.z.device)
         t_next = torch.full((state.z.shape[0],), sigma_from_step(t - 1, T), device=state.z.device)
@@ -888,23 +731,15 @@ class InferenceEngine(nn.Module):
         actions: Dict[int, Action],
         strength_feats,
     ) -> Tuple[int, int]:
-        """Run the §3.3.4 single-hop counterfactual verification + local repair.
+        """Run the single-hop counterfactual verification and local repair.
 
-        For each tube the L-COCF verifier flags — temporal-mutation point ``s_T > θ_sT``
-        *and* the tube skipped this step, capped at ``max_checks_per_step`` — the
-        executed (skip) tube latent is compared against the compute-everywhere
-        reference ``z_full``. When the residual exceeds ``η`` the residual-repair net
-        corrects that tube's tokens (do(¬skip) causal-omission repair, §3.3.4).
+        For each tube the verifier flags (temporal-mutation point and skipped this
+        step, capped per step), the executed skip latent is compared against the
+        compute-everywhere reference ``z_full``; when the residual exceeds the
+        threshold the residual-repair net corrects that tube's tokens.
 
-        The corrections are written into a **single** working copy of the latent, cloned
-        lazily on the first actual repair: cloning per repaired tube allocated and threw
-        away a full latent up to ``max_checks_per_step`` times a step, the same churn
-        :meth:`_assemble_anchor_latent` was fixed for (§P2-2). Each tube still *reads*
-        the running copy, so a later tube overlapping an earlier one sees the earlier
-        correction exactly as before. The writes are in-place on the clone, which keeps
-        the autograd graph intact (Stage-C repair-net training) because nothing in the
-        chain — ``clone`` / ``index_select`` / ``index_put_`` — saves the mutated values
-        for backward.
+        Corrections are written into a single working copy cloned lazily on the first
+        repair, in place to keep the autograd graph intact for Stage-C training.
 
         Returns ``(num_checks, num_repairs)``.
         """
@@ -918,7 +753,7 @@ class InferenceEngine(nn.Module):
             return 0, 0
         tubes_by_id = {t.tube_id: t for t in state.tubes}
         checks = repairs = 0
-        z_work: Optional[Tensor] = None  # cloned on the first repair, not before
+        z_work: Optional[Tensor] = None
         for tid in triggered:
             tube = tubes_by_id.get(tid)
             if tube is None:

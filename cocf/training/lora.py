@@ -1,25 +1,15 @@
-"""Dependency-free lightweight LoRA for the Stage-C optional backbone fine-tune (§4.2).
+"""Dependency-free lightweight LoRA for the Stage-C optional backbone fine-tune.
 
-§4.2's gradient scope allows an *optional* LoRA adapter on "最后若干层 DiT 的 LoRA 适配器"
-(the last few DiT blocks) while the backbone bulk stays frozen. This module provides
-that without pulling in ``peft``:
+Adds an optional low-rank adapter to the last few DiT blocks while the backbone bulk
+stays frozen, without pulling in ``peft``:
 
-    * :class:`LoRALinear` wraps a frozen ``nn.Linear`` with a low-rank update
-      ``y = W·x + (α/r)·(x·Aᵀ)·Bᵀ``. ``B`` is zero-initialised so the adapter is an
-      exact identity at the start of fine-tuning (no quality regression on step 0).
-    * :func:`inject_lora` swaps the ``nn.Linear`` children of the backbone's last-N
-      :meth:`~cocf.backbones.base.BackboneAdapter.dit_blocks` for ``LoRALinear`` in
-      place, returning the new trainable parameters (and the wrapper modules for
-      checkpointing). It is a **logged no-op** when the backbone exposes no blocks
-      (e.g. a real adapter whose weights are absent in a dry run, ``dit_blocks() == []``).
+    * :class:`LoRALinear` wraps a frozen ``nn.Linear`` with a low-rank update; ``B`` is
+      zero-initialised so the adapter is an exact identity at the start.
+    * :func:`inject_lora` swaps the ``nn.Linear`` children of the target blocks for
+      ``LoRALinear`` in place and returns the trainable params and wrapper modules.
     * :func:`lora_state_dict` / :func:`load_lora_state_dict` / :func:`attach_lora`
-      persist and restore those adapters. They need their own checkpoint because the
-      backbone is intentionally *not* an ``nn.Module`` child of the accelerator, so
-      ``Accelerator.state_dict()`` cannot see them (§4.2).
-
-Replacement is done by rebinding the child in its *immediate parent* module's
-``_modules`` dict, so a block whose ``forward`` calls ``self.mlp(x)`` transparently
-runs through the wrapped layer (no forward-code changes needed).
+      persist and restore the adapters, which need their own checkpoint because the
+      frozen backbone is not an ``nn.Module`` child of the accelerator.
 """
 
 from __future__ import annotations
@@ -45,9 +35,9 @@ class LoRALinear(nn.Module):
             raise ValueError(f"LoRA rank must be > 0, got {rank}")
         self.base = base
         for p in self.base.parameters():
-            p.requires_grad_(False)  # the pretrained weight stays frozen
+            p.requires_grad_(False)
         in_f, out_f = base.in_features, base.out_features
-        # A ~ small normal, B = 0  ⇒  Δ = 0 at init (exact identity, no warm-up shock)
+        # A ~ small normal, B = 0, so the update is zero at init (exact identity).
         self.lora_A = nn.Parameter(torch.randn(rank, in_f) / rank)
         self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
         self.scaling = float(alpha) / float(rank)
@@ -62,14 +52,9 @@ class LoRALinear(nn.Module):
 def _wrap_linears_in(module: nn.Module, rank: int, alpha: float) -> List[LoRALinear]:
     """Recursively replace every ``nn.Linear`` under ``module`` with ``LoRALinear``.
 
-    Rebinds each child in its parent's ``_modules`` so the parent's ``forward`` (which
-    references the child by name/index) runs through the wrapper.
-
-    An already-wrapped layer is **returned as-is rather than skipped**. Re-injection
-    happens on any resumed run — the checkpoint's adapters are attached first, then the
-    stage injects — and silently dropping those layers from the result would hand the
-    optimiser an empty parameter list, freezing the fine-tune while every log line
-    still said ``use_lora``.
+    Rebinds each child in its parent's ``_modules`` so the parent's ``forward`` runs
+    through the wrapper. Already-wrapped layers are returned as-is so a resumed run
+    still hands the optimiser their parameters.
     """
     wrapped: List[LoRALinear] = []
     for name, child in list(module.named_children()):
@@ -93,18 +78,11 @@ def inject_lora(
     alpha: float = 16.0,
     last_n_blocks: int = 4,
 ) -> Tuple[List[nn.Parameter], List[LoRALinear]]:
-    """Inject LoRA into the backbone's last ``last_n_blocks`` DiT blocks (§4.2).
+    """Inject LoRA into the backbone's last ``last_n_blocks`` DiT blocks.
 
-    Returns ``(trainable_params, lora_modules)``. ``lora_modules`` is returned so the
-    stage can checkpoint the adapters separately (the frozen backbone is not part of
-    ``Accelerator.state_dict``). A backbone with no ``dit_blocks()`` yields ``([], [])``
-    with a warning — the rest of Stage C (plugin fine-tune) proceeds unchanged.
-
-    The backbone's weights are **materialised first**: real adapters build their
-    components lazily on the first forward, so injecting before that saw
-    ``transformer is None``, ``dit_blocks() == []`` and turned the whole ``--use_lora``
-    flag into a silent no-op (the caller was constructing the stage — hence injecting —
-    long before any forward ran).
+    Returns ``(trainable_params, lora_modules)``; a backbone with no ``dit_blocks()``
+    yields ``([], [])`` with a warning. The backbone's weights are materialised first
+    because real adapters build their components lazily on the first forward.
     """
     backbone.ensure_loaded()
     blocks = list(backbone.dit_blocks())
@@ -115,18 +93,14 @@ def inject_lora(
         )
         return [], []
 
-    # Ask the backbone which blocks to wrap: the default is the last ``last_n`` of
-    # dit_blocks(), but a Mixture-of-Experts backbone returns each expert's own tail
-    # so LoRA is not starved onto a single expert (§7.1.3).
+    # A MoE backbone returns each expert's own tail so LoRA is not starved onto one.
     targets = list(backbone.lora_target_blocks(last_n_blocks))
     modules: List[LoRALinear] = []
     for block in targets:
         modules.extend(_wrap_linears_in(block, rank, alpha))
 
-    # A resumed run re-injects over adapters restored from a checkpoint. Those keep
-    # the rank they were trained at, so an injection asking for a different one is
-    # silently ignored — say so rather than let the mismatch surface as a confusing
-    # shape error at load time.
+    # A resumed run re-injects over adapters restored from a checkpoint; those keep
+    # the rank they were trained at, so a different requested rank is ignored.
     mismatched = {m.lora_A.shape[0] for m in modules if m.lora_A.shape[0] != rank}
     if mismatched:
         _log.warning(
@@ -137,8 +111,7 @@ def inject_lora(
         )
 
     params: List[nn.Parameter] = [p for m in modules for p in (m.lora_A, m.lora_B)]
-    # inject_lora is the *training* entry point: adapters restored by ``attach_lora``
-    # were frozen for inference, so re-arm them or the optimiser would filter them out.
+    # Adapters restored by ``attach_lora`` were frozen for inference; re-arm them here.
     for p in params:
         p.requires_grad_(True)
     _log.info(
@@ -149,20 +122,15 @@ def inject_lora(
 
 
 # --------------------------------------------------------------------------- #
-# Checkpointing (§4.2 — the adapters live inside the *frozen* backbone)
+# Checkpointing (the adapters live inside the frozen backbone)
 # --------------------------------------------------------------------------- #
 
 
 def lora_state_dict(backbone: BackboneAdapter) -> Dict[str, Tensor]:
     """Collect every injected adapter's weights, keyed by module path.
 
-    The backbone is deliberately a plain attribute of the accelerator so its frozen
-    billions never enter ``Accelerator.state_dict()`` — which also means the LoRA
-    tensors living *inside* it are invisible to ``torch.save(accelerator.state_dict())``
-    and were being discarded the moment Stage C finished. This gives them their own
-    serialisable view, keyed ``"<root>.<module path>.lora_{A,B}"`` so the mapping
-    survives a save → re-inject → load round-trip in a fresh process (and keeps a
-    Mixture-of-Experts backbone's two experts apart, see ``BackboneAdapter.lora_roots``).
+    Keyed ``"<root>.<module path>.lora_{A,B}"`` so the mapping survives a save /
+    re-inject / load round-trip and keeps a MoE backbone's experts apart.
     """
     out: Dict[str, Tensor] = {}
     for root_name, root in backbone.lora_roots():
@@ -230,11 +198,9 @@ def attach_lora(
     last_n_blocks: int = 4,
     strict: bool = False,
 ) -> int:
-    """Inject LoRA and immediately restore trained weights — the *inference* entry.
+    """Inject LoRA and immediately restore trained weights — the inference entry.
 
-    Without this there was no path at all from a Stage-C checkpoint back into a
-    generating model: the adapters were trained, then dropped on the floor. Returns
-    the number of adapters restored (0 when the backbone exposes no blocks).
+    Returns the number of adapters restored (0 when the backbone exposes no blocks).
     """
     params, modules = inject_lora(
         backbone, rank=rank, alpha=alpha, last_n_blocks=last_n_blocks

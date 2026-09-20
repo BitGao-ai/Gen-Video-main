@@ -1,29 +1,5 @@
 #!/usr/bin/env python
-"""Trace the accelerated trajectory step by step (diagnostic).
-
-Runs the same engine path as ``scripts/inference/infer_single_video.py`` but wraps
-``InferenceEngine._step`` to record, after every denoise step:
-
-* per-action-group latent statistics (mean / std / absmax / mean |Δz| vs the
-  previous step) — tells whether skipped tokens keep moving with the schedule,
-  stagnate (freeze), or blow up (out-of-distribution values);
-* a mid-trajectory VAE decode at selected steps — shows *when* corruption
-  becomes visible rather than only at the end;
-* an action-map PNG for the middle latent frame — shows which tokens the
-  allocator assigned to FULL / LOWFREQ(lattice|hole) / INTERP / ANCHOR / none,
-  so tube-builder indexing mistakes become visible.
-
-Usage (same backbone/perception args as infer_single_video.py):
-
-    python3 scripts/diagnose/trace_accelerated.py \
-        --prompt "A person walks slowly across a park, ..." \
-        --checkpoint checkpoints/stage_b.../stage_b_final.pt \
-        --backbone wan22 --wan-variant a14b-t2v --model-path ... \
-        --sam-model ... --dino-model ... --clip-model ... --raft-weights ... \
-        --flow-shift 5 --steps 20 --num-frames 49 --height 384 --width 640 \
-        --vae-tile 128 --quality quality --seed 1234 --device cuda \
-        --output-dir outputs/trace_run
-"""
+"""Trace accelerated trajectory step by step."""
 
 import argparse
 import json
@@ -49,7 +25,6 @@ from cocf.engine import InferenceEngine
 
 GROUPS = ("full", "lowfreq_lattice", "lowfreq_hole", "interp", "anchor", "none")
 
-# BGR colours for the action map (cv2).
 GROUP_COLORS = {
     "none": (128, 128, 128),
     "full": (0, 200, 0),
@@ -61,7 +36,7 @@ GROUP_COLORS = {
 
 
 def _group_labels(state, actions, executor, device):
-    """[N] string labels: which action group each token belongs to this step."""
+    """Label each token by action group."""
     import numpy as np
 
     grid = state.grid
@@ -86,6 +61,7 @@ def _group_labels(state, actions, executor, device):
 
 def _record_step(state, step_idx, trace, executor, prev_z, decode_steps, out_dir,
                  backbone, log):
+    """Record latent stats for one step."""
     z = state.z.detach().float()
     actions = trace.actions or {}
     labels = _group_labels(state, actions, executor, z.device)
@@ -116,18 +92,18 @@ def _record_step(state, step_idx, trace, executor, prev_z, decode_steps, out_dir
 
 
 def _save_mid_frame(video, path):
-    """video [1, 3, F, H, W] in [0,1] → middle frame PNG."""
+    """Save middle frame as PNG."""
     import cv2
     import numpy as np
 
     mid = video.shape[2] // 2
     frame = video[0, :, mid].permute(1, 2, 0).cpu().numpy()
-    frame = (frame.clip(0, 1) * 255).astype(np.uint8)[:, :, ::-1]  # RGB→BGR
+    frame = (frame.clip(0, 1) * 255).astype(np.uint8)[:, :, ::-1]
     cv2.imwrite(str(path), frame)
 
 
 def _save_action_map(state, actions, executor, out_dir, log):
-    """Colour every token of the middle latent frame by its action group."""
+    """Save action map for middle frame."""
     import cv2
     import numpy as np
 
@@ -148,6 +124,7 @@ def _save_action_map(state, actions, executor, out_dir, log):
 
 
 def main():
+    """Run accelerated trajectory trace."""
     p = argparse.ArgumentParser(description="Trace the accelerated trajectory")
     p.add_argument("--prompt", type=str, required=True)
     p.add_argument("--checkpoint", type=Path)
@@ -181,7 +158,6 @@ def main():
     apply_wan_variant(config, args)
     frames, height, width = apply_geometry(config, args)
 
-    # Same b_min presets as scripts/inference/infer_single_video.py.
     quality_b_min = {"fast": 0.30, "balanced": 0.50, "quality": 0.80}
     config.budget.b_min = quality_b_min[args.quality]
     config.budget.b_max = max(config.budget.b_max, config.budget.b_min)
@@ -225,6 +201,7 @@ def main():
     orig_step = engine._step
 
     def wrapped_step(state, step_idx, t, backbone, record_sink=None):
+        """Wrap engine step with tracing."""
         nonlocal prev_z
         trace = orig_step(state=state, step_idx=step_idx, t=t, backbone=backbone,
                           record_sink=record_sink)

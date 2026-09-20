@@ -1,20 +1,4 @@
-"""Local repair operators — rollback, boundary fusion, cache refresh (§5.3.2).
-
-When the risk trigger fires, the fix must be *local* and *seam-free*: rolling a
-tube back to its safe anchor leaves a discontinuity against the neighbouring
-tokens that advanced normally, and a hard seam is itself an artefact. The repair
-operators here resolve that:
-
-    rollback        restore a tube's tokens from the anchor store (the revocation)
-    boundary_fuse   blend the tube's *boundary band* between the rolled-back latent
-                    (interior, frozen-safe) and the freshly computed latent
-                    (exterior-consistent) using a soft mask of bandwidth σ_bnd, so
-                    the seam vanishes (the boundary operator B(·) of §5.3.2)
-    refreshed_tokens the indices whose ε cache is now stale and must be recomputed
-
-Everything is pure latent/token-grid arithmetic against the backbone-agnostic
-:class:`~cocf.common.types.TokenGrid`, so RAEC works for every backbone.
-"""
+"""Local repair operators for rollback and boundary fusion."""
 
 from __future__ import annotations
 
@@ -35,20 +19,17 @@ Tensor = torch.Tensor
 class RepairResult:
     """Outcome of repairing one tube."""
 
-    z: Tensor                 # [B, N, d] latent after repair
-    refreshed: Tensor         # [n] flat token indices whose ε cache is now stale
-    rolled_back: bool         # whether a full rollback to anchor happened
+    z: Tensor
+    refreshed: Tensor
+    rolled_back: bool
 
 
 class BoundaryRepair:
-    """Rollback + boundary fusion + cache-refresh accounting."""
+    """Rollback plus boundary fusion operators."""
 
     def __init__(self, config: TriggerConfig) -> None:
+        """Create repair with trigger config."""
         self.cfg = config
-
-    # ------------------------------------------------------------------ #
-    # ROLLBACK (+ boundary fusion against the advanced latent)
-    # ------------------------------------------------------------------ #
 
     def rollback(
         self,
@@ -58,26 +39,13 @@ class BoundaryRepair:
         grid: TokenGrid,
         anchor_store: AnchorStore,
     ) -> RepairResult:
-        """Restore ``tube`` to its safe anchor and fuse the boundary against ``z_full``.
-
-        ``z_current`` is the post-transition latent whose *non-tube* tokens (background
-        and other tubes' executed actions) are preserved — only this tube's tokens are
-        revoked to its safe anchor. ``z_full`` is the step's compute-everywhere latent,
-        used as the exterior-consistent reference so the seam between the rolled-back
-        interior and its surroundings is blended away over ``σ_bnd`` (the boundary
-        operator B(·) of §5.3.2). If the tube has no anchor yet, returns ``z_current``
-        unchanged but still flags its tokens as refreshed (the engine forces FULL on it).
-        """
+        """Restore tube to anchor and fuse boundary."""
         idx = tube.all_token_indices().to(z_current.device)
         if not anchor_store.has(tube.tube_id):
             return RepairResult(z=z_current, refreshed=idx, rolled_back=False)
-        z = anchor_store.rollback(z_current, tube)         # interior = safe anchor
-        z = self._fuse_boundary(z, z_full, tube, grid)     # smooth the seam toward z_full
+        z = anchor_store.rollback(z_current, tube)
+        z = self._fuse_boundary(z, z_full, tube, grid)
         return RepairResult(z=z, refreshed=idx, rolled_back=True)
-
-    # ------------------------------------------------------------------ #
-    # REPAIR (no rollback): just refresh the cache + light boundary fuse
-    # ------------------------------------------------------------------ #
 
     def repair(
         self,
@@ -86,15 +54,10 @@ class BoundaryRepair:
         tube: SemanticTube,
         grid: TokenGrid,
     ) -> RepairResult:
-        """Moderate-risk fix: pull the tube toward the freshly computed ``z_full``
-        at the boundary and mark it for cache refresh, without a full rollback."""
+        """Fix moderate-risk tube without full rollback."""
         idx = tube.all_token_indices().to(z_current.device)
         z = self._fuse_boundary(z_current, z_full, tube, grid)
         return RepairResult(z=z, refreshed=idx, rolled_back=False)
-
-    # ------------------------------------------------------------------ #
-    # boundary soft-mask fusion
-    # ------------------------------------------------------------------ #
 
     def _fuse_boundary(
         self,
@@ -103,14 +66,7 @@ class BoundaryRepair:
         tube: SemanticTube,
         grid: TokenGrid,
     ) -> Tensor:
-        """Blend ``z_interior`` (e.g. anchor) and ``z_exterior`` (e.g. z_full) over a
-        tube's tokens using a per-token weight derived from depth-into-the-tube.
-
-        ``w = 1 − exp(−depth / σ_bnd)`` → ~0 at the edge (favour the exterior,
-        neighbour-consistent latent) and →1 deep inside (favour the interior,
-        safe latent). REPAIR uses the current latent as the interior; ROLLBACK
-        uses the restored anchor. Both reconcile the rim with z_full.
-        """
+        """Blend interior and exterior latents over tube boundary."""
         sigma = max(self.cfg.sigma_bnd, 1e-3)
         out = z_interior.clone()
         for frame, idx in tube.tokens_by_frame.items():
@@ -122,7 +78,7 @@ class BoundaryRepair:
             hi = torch.div(local, grid.w, rounding_mode="floor")
             wi = local - hi * grid.w
             d_tok = depth[hi.clamp(0, grid.h - 1), wi.clamp(0, grid.w - 1)].float()
-            w = 1.0 - torch.exp(-d_tok / sigma)            # [n_tok] ∈ [0,1)
+            w = 1.0 - torch.exp(-d_tok / sigma)
             w = w.view(1, -1, 1).to(out.device, out.dtype)
             gidx = idx.to(out.device)
             blended = w * z_interior.index_select(1, gidx) + (1 - w) * z_exterior.index_select(1, gidx)
@@ -131,12 +87,7 @@ class BoundaryRepair:
 
     @staticmethod
     def _erosion_depth(mask: Tensor, max_depth: int) -> Tensor:
-        """Per-pixel depth into a boolean mask ``[H, W]`` via iterated 4-neighbour erosion.
-
-        ``depth = 0`` outside; ``1`` on the boundary; increasing toward the interior
-        (capped at ``max_depth``). Vectorised: each iteration keeps only pixels whose
-        4 neighbours are all still set.
-        """
+        """Compute per-pixel depth into boolean mask."""
         if max_depth < 1:
             raise ValueError("max_depth must be positive")
         cur = mask.bool()
@@ -146,7 +97,7 @@ class BoundaryRepair:
             dn = torch.zeros_like(cur); dn[1:] = cur[:-1]
             lf = torch.zeros_like(cur); lf[:, :-1] = cur[:, 1:]
             rt = torch.zeros_like(cur); rt[:, 1:] = cur[:, :-1]
-            cur = cur & up & dn & lf & rt   # survives erosion
+            cur = cur & up & dn & lf & rt
             depth = depth + cur.to(torch.int32)
             if not cur.any():
                 break

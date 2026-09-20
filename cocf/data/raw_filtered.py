@@ -1,22 +1,8 @@
-"""Stage-C raw-clip source — ``raw_filtered/`` reading + hard-sample sampling (§4.2).
+"""Stage-C raw-clip source: reads ``raw_filtered/`` and provides hard-sample sampling.
 
-§4.2 switches the data source away from the offline counterfactual LMDB: Stage C
-"直接读取 raw_filtered/ 下的原始视频 - 文本对，以生成式任务做端到端训练". This module is that
-reader plus the §4.2 采样策略:
-
-    * **hard-sample priority** — multi / occlusion / text / face clips are up-weighted
-      so the end-to-end fine-tune spends more steps on the model's short-board scenes
-      (:class:`HardSamplePrioritySampler`);
-    * **length / budget dynamic** — each item carries its scene type and (when known)
-      duration so the stage can size a dynamic per-step budget ``B_t`` from scene
-      complexity (the budget itself is computed by the shared
-      :class:`~cocf.scheduler.budget.BudgetScheduler` in the stage).
-
-Primary source is the processed store's ``raw_filtered/captions.jsonl``
-(written by Stage A via :meth:`ProcessedLayout.write_captions`). When no processed
-store is given, a plain video/caption manifest (CSV or JSONL) is read as a fallback,
-so Stage C also runs against an ad-hoc prompt list. Like the Stage-B sampler, batch
-planning only ever touches this lightweight metadata — never a video payload.
+Reads the processed store's ``raw_filtered/captions.jsonl`` (or a plain video/caption
+CSV/JSONL manifest as fallback) and up-weights hard scenes (multi / occlusion / text /
+face). Batch planning touches only this lightweight metadata, never a video payload.
 """
 
 from __future__ import annotations
@@ -36,7 +22,7 @@ from cocf.data.processed_layout import ProcessedLayout
 
 _log = get_logger(__name__)
 
-# The §2.3 / §4.2 hard scene classes whose sampling is up-weighted in Stage C.
+# Hard scene classes whose sampling is up-weighted in Stage C.
 HARD_SCENE_TYPES = frozenset({"multi", "occlusion", "text", "face"})
 
 
@@ -57,17 +43,7 @@ class RawFilteredItem:
 
 
 class RawFilteredDataset(Dataset):
-    """Reads Stage-C raw-clip items from the processed store (or a fallback manifest).
-
-    Parameters
-    ----------
-    processed_root
-        Root of the six-level store; reads ``raw_filtered/captions.jsonl`` (§4.2). Takes
-        precedence over ``manifest_path`` when both are given.
-    manifest_path
-        Fallback CSV/JSONL with ``{video|path, caption[, scene]}`` rows, used when no
-        processed store is available.
-    """
+    """Reads Stage-C raw-clip items from the processed store (or a fallback manifest)."""
 
     def __init__(
         self,
@@ -162,18 +138,7 @@ def collate_raw_filtered(batch: Sequence[RawFilteredItem]) -> List[RawFilteredIt
 
 
 class HardSamplePrioritySampler(Sampler[int]):
-    """Weighted index sampler that up-weights hard scenes (§4.2 硬样本优先).
-
-    Hard scene types (:data:`HARD_SCENE_TYPES`) are drawn ``hard_boost`` times more
-    often than easy ones. Sampling is **with replacement** so the boost is exact and
-    the epoch length stays fixed; reshuffled deterministically per epoch via
-    :meth:`set_epoch`.
-
-    ``rank``/``world_size`` shard the epoch: each rank draws its own
-    ``num_samples // world_size`` indices from the same weights with a rank-offset
-    seed. Drawing with replacement is what makes that sound — there is no pool to
-    partition, so every rank keeps the exact boost and the same step count.
-    """
+    """Weighted index sampler that up-weights hard scenes, with replacement."""
 
     def __init__(
         self,

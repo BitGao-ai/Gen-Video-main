@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only checkpoint evaluation on cached Stage A features; no real backbone."""
+"""Evaluate Stage-B checkpoint on cached features."""
 import argparse
 import importlib.util
 import json
@@ -23,7 +23,6 @@ from cocf.training.stage_b_losses import (
     damage_scalar_batch, per_sample_budget, batch_float, _local_cmsc_violation,
 )
 
-# `scripts` is not an installed package; an unrelated package may shadow it.
 _training_path = Path(__file__).resolve().parents[1] / 'train' / 'train_stage_b.py'
 if not _training_path.is_file():
     raise ImportError(f'Missing project training entry point: {_training_path}')
@@ -35,6 +34,7 @@ _infer_dims_from_store = _training_entry._infer_dims_from_store
 
 
 def summarize(rows, train_targets):
+    """Summarize predictions by action subset."""
     result = {}
     for name, selected in [('all', rows), ('nonfull', [r for r in rows if r['action'] != 0])] + [
         (name, [r for r in rows if r['action'] == a])
@@ -66,7 +66,7 @@ def summarize(rows, train_targets):
 
 
 def collect_inputs(acc, loader):
-    """Keep only compact predictor inputs, not video/text tensors."""
+    """Collect compact predictor inputs."""
     chunks = {k: [] for k in ('tube_features', 'strength_features', 'step_frac', 'budget', 'action')}
     for batch in loader:
         for key in chunks:
@@ -76,6 +76,7 @@ def collect_inputs(acc, loader):
 
 
 def audit_fields(dataset):
+    """Audit missing and nonfinite fields."""
     fields = ('tube_features', 'strength_features', 'step_frac', 'damage_label',
               'text_embed', 'tube_visual_embed_full', 'tube_visual_embed_cf')
     missing = dict.fromkeys(fields, 0)
@@ -91,6 +92,7 @@ def audit_fields(dataset):
 
 
 def input_statistics(pool):
+    """Compute input column statistics."""
     stats = {}
     for key, tensor in pool.items():
         if key == 'action':
@@ -111,7 +113,7 @@ def input_statistics(pool):
 
 
 def shuffle_inputs(pool, seed):
-    """Shuffle joint input rows within each action across the entire split."""
+    """Shuffle inputs within each action."""
     generator = torch.Generator().manual_seed(seed)
     order = torch.arange(len(pool['action']))
     for action in torch.unique(pool['action']):
@@ -122,6 +124,7 @@ def shuffle_inputs(pool, seed):
 
 @torch.inference_mode()
 def predict(acc, loader, device, *, inputs=None, zero_state=False):
+    """Predict damage and certificate for samples."""
     rows = []
     offset = 0
     for batch in loader:
@@ -152,7 +155,6 @@ def predict(acc, loader, device, *, inputs=None, zero_state=False):
         idx = actions[:, None]
         mu = pred.mu.gather(-1, idx).squeeze(-1)
         sigma = pred.sigma.gather(-1, idx).squeeze(-1)
-        # Perturbed rows are a predictor sensitivity probe, not certificate calibration.
         if inputs is not None or zero_state:
             cert = torch.full_like(mu, 0)
         else:
@@ -171,10 +173,12 @@ def predict(acc, loader, device, *, inputs=None, zero_state=False):
 
 
 def canonical_split(name):
+    """Map test split alias."""
     return 'test_hard' if name == 'test' else name
 
 
 def main():
+    """Evaluate Stage-B checkpoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--processed-root', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path, required=True)
@@ -213,6 +217,7 @@ def main():
     if not (set(train_ids) | set(eval_ids)) <= indexed:
         parser.error('Split contains samples absent from retained sample_index')
     def loader(ids):
+        """Build dataloader for given ids."""
         dataset = CounterfactualLMDBDataset(layout.lmdb_dir, ids, text_embed_dir=layout.text_embed_dir)
         if set(dataset.keys) != set(ids):
             raise ValueError('Requested samples missing from store')

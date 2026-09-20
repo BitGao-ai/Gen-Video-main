@@ -1,27 +1,8 @@
-"""OpenVid-1M manifest ingestion & scene stratification (§1.1, §1.2).
+"""OpenVid-1M manifest ingestion and scene stratification.
 
-OpenVid-1M ships its metadata as ``data/train/OpenVid-1M.csv`` (≈930k clips) and
-``data/train/OpenVidHD.csv`` (≈433k 1080p clips). The column names **contain
-spaces** (``aesthetic score``, ``motion score``, ``temporal consistency score``,
-``camera motion``), so a reader must map them explicitly — that is exactly what
-:data:`DEFAULT_OPENVID_COLUMNS` does. All 202 ``OpenVid_part*.zip`` parts extract
-into one flat ``video/`` folder, so a clip resolves to
-``{data_root}/{video_subdir}/{video}`` (§1.1).
-
-This module turns those CSVs into typed :class:`OpenVidRecord`s with:
-
-    * a stable ``video_id`` (the mp4 stem, which encodes the clip's unique id),
-    * the resolved on-disk path,
-    * the carried-through quality metadata (aesthetic / motion / temporal scores),
-    * an HD flag (rows from ``OpenVidHD.csv``), and
-    * a coarse **scene type** (§1.2) drawn from the six classes the rest of the
-      framework balances over — ``static / dynamic / multi / text / face /
-      occlusion`` — inferred cheaply from the caption + motion/camera cues.
-
-It then writes the §3 level-1 ``metadata/raw_dataset_index.csv`` via
-:class:`~cocf.data.processed_layout.ProcessedLayout`. The scene lexicons are reused
-from the existing perception/parser code so the inference here matches what the
-strength field and CMSC see downstream (no skew).
+Parses the OpenVid CSVs into typed :class:`OpenVidRecord`s (stable video_id, resolved
+path, carried quality metadata, HD flag, derived scene type) and writes the level-1
+``metadata/raw_dataset_index.csv``.
 """
 
 from __future__ import annotations
@@ -41,8 +22,7 @@ from cocf.lcocf.triplets import _CRITICAL_HINTS
 
 _log = get_logger(__name__)
 
-# Canonical field -> OpenVid CSV column name. The spaces are load-bearing: the HF
-# dataset uses them verbatim, so they must be mapped, never assumed split-free.
+# Canonical field -> OpenVid CSV column name (spaces are part of the real header).
 DEFAULT_OPENVID_COLUMNS: Dict[str, str] = {
     "video": "video",
     "caption": "caption",
@@ -55,8 +35,7 @@ DEFAULT_OPENVID_COLUMNS: Dict[str, str] = {
     "seconds": "seconds",
 }
 
-# The six scene classes the pipeline balances over (matches VideoSample.scene and
-# StratifiedSamplingConfig.scene_weights). Pinned so callers can iterate them.
+# The six scene classes the pipeline balances over.
 SCENE_TYPES: Sequence[str] = ("static", "dynamic", "multi", "text", "face", "occlusion")
 
 _FACE_HINTS = _CRITICAL_HINTS["face"]
@@ -68,14 +47,7 @@ _OCCLUSION_CUES = ("behind", "occlud", "overlap", "hidden", "cover", "in front o
 
 
 def _cue_re(cues: Sequence[str]) -> Optional[re.Pattern]:
-    """Word-start-anchored regex over the ASCII cues (``None`` when there are none).
-
-    Plain substring matching let "and" hit hand/land/stand/island and "man" hit
-    woman/human, flooding the multi/face classes with single-subject clips. The
-    ``\\b`` anchor keeps legitimate stems working ("occlud" → "occluded", "child"
-    → "children", word-level "and" → "a cat and a dog") while killing mid-word
-    false positives. CJK cues have no word boundaries and stay substring.
-    """
+    """Word-start-anchored regex over the ASCII cues (``None`` when there are none)."""
     words = [c for c in cues if c.isascii()]
     if not words:
         return None
@@ -124,7 +96,7 @@ class OpenVidRecord:
         return VideoMeta(path=self.path, caption=self.caption, scene=self.scene_type)
 
     def index_row(self) -> Dict[str, object]:
-        """Flat dict for ``raw_dataset_index.csv`` (§3 level-1)."""
+        """Flat dict for ``raw_dataset_index.csv``."""
         row = asdict(self)
         row["is_hd"] = int(self.is_hd)
         return row
@@ -146,11 +118,10 @@ def _to_int(x: object, default: int = 0) -> int:
 
 def infer_scene_type(caption: str, motion: float, camera_motion: str = "",
                      static_motion_max: float = 0.02) -> str:
-    """Classify a clip into one of :data:`SCENE_TYPES` (§1.2).
+    """Classify a clip into one of :data:`SCENE_TYPES`.
 
-    Priority — occlusion ▸ text ▸ face ▸ multi ▸ (static | dynamic) — so the harder,
-    rarer, quality-critical categories (which §2.3 force-keeps) win when several
-    cues co-occur; the static/dynamic split is decided last from the motion score.
+    Priority — occlusion ▸ text ▸ face ▸ multi ▸ (static | dynamic); the
+    static/dynamic split is decided last from the motion score.
     """
     cap = (caption or "").lower()
     cam = (camera_motion or "").lower()
@@ -162,8 +133,7 @@ def infer_scene_type(caption: str, motion: float, camera_motion: str = "",
         return "face"
     if _has_cue(cap, _MULTI_RE, _MULTI_CJK):
         return "multi"
-    # otherwise distinguish static vs single-subject dynamic by motion magnitude;
-    # a non-"static"/"none" camera motion also implies a dynamic scene.
+    # otherwise distinguish static vs single-subject dynamic by motion magnitude.
     moving_cam = bool(cam) and cam not in ("static", "none", "fixed", "")
     if motion <= static_motion_max and not moving_cam:
         return "static"
@@ -183,16 +153,9 @@ def read_openvid_csv(
 ) -> List[OpenVidRecord]:
     """Parse one OpenVid CSV into :class:`OpenVidRecord`s.
 
-    ``is_hd`` defaults to detecting ``OpenVidHD`` in the filename; pass it explicitly
-    to override. Missing optional columns degrade gracefully to defaults so a
-    trimmed/sample CSV still reads.
-
-    ``require_file`` scopes the manifest to clips whose resolved ``path`` actually
-    exists on disk — the metadata CSV lists ~1.45M clips but a working copy usually
-    holds only the extracted subset. When set, rows whose mp4 is absent are skipped
-    and ``limit`` caps the number of *kept* rows (so a small ``limit`` still finds
-    on-disk clips no matter how deep they sit in the CSV), rather than the number of
-    rows scanned.
+    ``is_hd`` defaults to detecting ``OpenVidHD`` in the filename. ``require_file``
+    keeps only clips whose resolved ``path`` exists, and then ``limit`` caps the number
+    of *kept* rows rather than the number scanned.
     """
     path = Path(csv_path)
     if not path.exists():
@@ -204,8 +167,7 @@ def read_openvid_csv(
     with open(path, "r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         for i, row in enumerate(reader):
-            # Without an existence filter, ``limit`` caps rows scanned; with one it
-            # caps rows *kept* (checked after the skip below) so scanning continues.
+            # ``limit`` caps rows scanned without ``require_file``, else rows kept.
             if limit is not None and not require_file and i >= limit:
                 break
             video = (row.get(col["video"]) or "").strip()
@@ -257,11 +219,7 @@ def read_openvid_manifest(
     limit_per_csv: Optional[int] = None,
     require_file: bool = False,
 ) -> List[OpenVidRecord]:
-    """Read & concatenate several OpenVid CSVs (e.g. the 1M subset + the HD subset).
-
-    ``require_file`` scopes each CSV to clips whose mp4 exists under
-    ``{data_root}/{video_subdir}/`` — see :func:`read_openvid_csv`.
-    """
+    """Read & concatenate several OpenVid CSVs (e.g. the 1M subset + the HD subset)."""
     out: List[OpenVidRecord] = []
     for p in csv_paths:
         out.extend(read_openvid_csv(
@@ -273,14 +231,14 @@ def read_openvid_manifest(
 
 
 def write_raw_dataset_index(records: Sequence[OpenVidRecord], layout: ProcessedLayout) -> Path:
-    """Write the §3 level-1 ``metadata/raw_dataset_index.csv`` (video_id ─ path ─ info)."""
+    """Write the level-1 ``metadata/raw_dataset_index.csv``."""
     rows = [r.index_row() for r in records]
     fields = list(rows[0].keys()) if rows else list(OpenVidRecord.__annotations__.keys())
     return layout.write_csv(layout.raw_dataset_index, rows, fields)
 
 
 def scene_histogram(records: Sequence[OpenVidRecord]) -> Dict[str, int]:
-    """Count records per scene type (for the §2.4 statistics report)."""
+    """Count records per scene type."""
     hist = {s: 0 for s in SCENE_TYPES}
     for r in records:
         hist[r.scene_type] = hist.get(r.scene_type, 0) + 1

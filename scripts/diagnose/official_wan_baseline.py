@@ -5,10 +5,10 @@ Renders one clip with the *stock* ``WanPipeline`` (its own scheduler, MoE routin
 CFG and negative prompt) from the same weights and prompt as
 ``scripts/inference/run_stage_b_probe.sh``. Interpretation:
 
-* this video good + ``MODE=full`` mud  → the bug is in the project's adapter path
+* this video good + ``MODE=full`` mud  -> the bug is in the project's adapter path
   (sigma schedule, expert routing, dtype policy, text conditioning), not in the
   weights or the server environment;
-* this video mud as well               → the checkpoint/environment is broken and
+* this video mud as well               -> the checkpoint/environment is broken and
   nothing downstream of it (Stage A store included) can be trusted.
 
 Useful variations for bisecting *settings* vs *code* once the stock run is known-good:

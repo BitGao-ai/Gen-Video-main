@@ -1,31 +1,5 @@
 #!/usr/bin/env python
-"""Sanity-check Stage A's counterfactual labels before Stage B trains on them.
-
-There is no external ground truth for a damage label, so correctness has to be
-established from *internal consistency* instead. Four properties are strong enough
-to catch the failure modes that actually occur, and all four are checkable offline:
-
-1. **The FULL anchor.** ``action=FULL`` skips nothing — its rollout re-runs the same
-   transition the teacher ran — so its damage must be ≈ 0. It is the only label in
-   the store whose correct value is known a priori, which makes it the calibration
-   point for every other label: if FULL is not ≈ 0, the rollout diverges from the
-   teacher for reasons unrelated to the intervention (different noise, a schedule
-   mismatch), and every other damage value carries that same offset.
-2. **Action monotonicity.** FULL ≤ LOWFREQ ≤ INTERP ≤ ANCHOR by construction — the
-   actions are ordered by how much compute they remove. An inversion means the
-   damage metric is not measuring degradation.
-3. **Non-degenerate axes.** An axis with zero variance across the store is a metric
-   backend that silently fell back (the classic one is RAFT: without it
-   ``raft_motion`` and ``motion_smoothness`` are computed from a descriptor diff and
-   ``s_A`` is identically 0).
-4. **Design coverage.** The (tube × action × step) enumeration must actually cover
-   all four actions and all three representative steps, with no duplicate sample ids.
-
-Usage::
-
-    python scripts/diagnose/check_labels.py ./LCOCF_OpenVid1M_Processed
-    python scripts/diagnose/check_labels.py ./LCOCF_OpenVid1M_Processed --limit 5000
-"""
+"""Check Stage-A counterfactual labels for consistency."""
 
 import argparse
 import sys
@@ -35,13 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ``python scripts/diagnose/check_labels.py`` puts *this file's directory* on
-# sys.path[0] — never the repo root, and never the cwd. ``import cocf`` therefore
-# resolves through site-packages, where a stale editable install can serve a
-# completely different checkout than the one being edited. Pinning the sibling
-# package first makes the tree this script ships with the tree that runs; the
-# assertion below turns a silent substitution into a startup error, because a
-# diagnostic that validates the wrong codebase is worse than one that refuses.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if (_REPO_ROOT / "cocf" / "__init__.py").is_file():
     sys.path.insert(0, str(_REPO_ROOT))
@@ -63,21 +30,15 @@ from cocf.data.processed_layout import ProcessedLayout
 from cocf.data.sample_store import store_is_lmdb, iter_lmdb_records
 from cocf.lcocf.damage import DAMAGE_DIMENSIONS, DEFAULT_DAMAGE_WEIGHTS, DISABLED_DAMAGE_AXES
 
-# A FULL rollout reproduces the teacher transition, so its damage is bounded by
-# sampler noise alone. Above this the store's reference and counterfactual sides are
-# not comparable and no other label in it can be trusted.
 _FULL_ANCHOR_MAX = 0.05
-# Below this an axis carries no signal (constant across the whole store).
 _DEGENERATE_STD = 1e-6
-# Share of a damage axis allowed to sit exactly at 0 or exactly at 1 before the axis
-# is reported as saturated rather than informative.
 _SATURATED_FRAC = 0.95
 
 _W = np.array([DEFAULT_DAMAGE_WEIGHTS[a] for a in DAMAGE_DIMENSIONS], np.float32)
 
 
 class Report:
-    """Collects check outcomes so the exit code can reflect the worst one."""
+    """Collect check outcomes."""
 
     def __init__(self) -> None:
         self.rows: List[tuple] = []
@@ -172,7 +133,7 @@ def scan_samples(layout: ProcessedLayout, limit: Optional[int]) -> Scan:
 # --------------------------------------------------------------------------- #
 
 def check_full_anchor(rep: Report, dmg: np.ndarray, act: np.ndarray) -> None:
-    """§1: the one label whose correct value is known independently."""
+    """Check the FULL anchor: the one label whose correct value is known independently."""
     sel = act == int(Action.FULL)
     if not sel.any():
         rep.add("FAIL", "FULL 锚点",
@@ -220,7 +181,7 @@ def check_monotonicity(rep: Report, dmg: np.ndarray, act: np.ndarray) -> None:
 
 
 def check_axes(rep: Report, dmg: np.ndarray) -> None:
-    """§3: a constant axis is a metric backend that silently degraded."""
+    """Check damage axes: a constant axis is a metric backend that silently degraded."""
     dead, saturated, healthy = [], [], []
     for i, name in enumerate(DAMAGE_DIMENSIONS):
         if name in DISABLED_DAMAGE_AXES:
@@ -267,7 +228,7 @@ def check_uncertainty(rep: Report, scan: Scan) -> None:
 
 
 def check_coverage(rep: Report, act: np.ndarray, scan: Scan) -> None:
-    """§4: the sampling design actually covers what it claims to."""
+    """Check that the sampling design actually covers what it claims to."""
     counts = Counter(int(a) for a in act)
     dist = "  ".join(f"{Action(k).name}={counts.get(int(k),0)}" for k in Action)
     n = len(act)

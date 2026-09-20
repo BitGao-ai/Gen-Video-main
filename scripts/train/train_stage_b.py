@@ -1,24 +1,5 @@
 #!/usr/bin/env python
-"""Entry script for Stage B: joint module training (§4.1).
-
-Trains the four learnable plugins (L-COCF predictor + strength weights, STA
-smoothing, RAEC certificate, CMSC alignment) together on the Stage-A counterfactual
-LMDB store, minimising::
-
-    L_total = L_cocf + λ_sta·L_tube + λ_cert·L_cert + λ_cmsc·L_cmsc + λ_cost·L_budget
-
-The backbone stays frozen, so every gradient lands on the tiny plugin set.
-
-Usage:
-    python scripts/train/train_stage_b.py \
-        --processed-root ./LCOCF_OpenVid1M_Processed \
-        --checkpoint_load ./checkpoints/after_stage_a.pt
-
-Data-parallel (one process per GPU); each rank owns a stride of every action bucket,
-so the 1:1:1:1 balance holds per rank and the gradients are averaged every step::
-
-    torchrun --standalone --nproc_per_node=8 scripts/train/train_stage_b.py ...
-"""
+"""Train Stage-B plugins jointly on counterfactual store."""
 
 import argparse
 import logging
@@ -36,29 +17,15 @@ from cocf.training.distributed import resolve_device as dist_device
 from cocf.training.distributed import shutdown as dist_shutdown
 from cocf.training.stage_b_joint import JointTrainingStage, StageBConfig
 
-# Repo root (…/pro_011). Anchors the default processed-store path so the script runs
-# with no flags — mirroring scripts/data/generate_counterfactual_data.py.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROCESSED_ROOT = REPO_ROOT / "LCOCF_OpenVid1M_Processed"
 
 
 def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
-    """Infer (text_dim, visual_dim) from the processed store's sample payloads.
-
-    Stage B must build the CMSC alignment projection with the same dims that Stage A
-    used when writing the counterfactual samples. Probing the backbone can silently
-    fall back to a wrong default (e.g. 4096 when the mock store holds 16-dim embeds),
-    so reading the ground-truth from the data itself is the robust path.
-    Returns (text_dim | None, visual_dim | None) — None when the field is absent.
-    """
+    """Infer text and visual dims from store samples."""
     text_dim = None
     visual_dim = None
     try:
-        # Must join the out-of-store prompt embeddings exactly as the Stage-B
-        # loader does (stage_b_joint.py) — without ``text_embed_dir`` the payload
-        # has no ``text_embed`` at all, text_dim silently falls back to the
-        # backbone probe (16 on mock), and the alignment projection is built too
-        # narrow for the 4096-d embeds the real loader then feeds it.
         ds = CounterfactualLMDBDataset(layout.lmdb_dir, text_embed_dir=layout.text_embed_dir)
         if len(ds) > 0:
             sample = ds[0]
@@ -77,7 +44,6 @@ def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
     except Exception as e:
         log.warning("Could not infer dims from store (will probe backbone): %s", e)
     if text_dim is None:
-        # Last resort: read the width straight off any stored prompt embedding.
         try:
             import torch
             for p in sorted(layout.text_embed_dir.glob("*.pt"))[:1]:
@@ -93,14 +59,7 @@ def _infer_dims_from_store(layout: ProcessedLayout, log: logging.Logger):
 
 
 def _preflight(layout: ProcessedLayout, log: logging.Logger) -> None:
-    """Fail fast with an actionable message when the store can't feed Stage B.
-
-    Stage A writes the sample index, the ``splits/`` lists and the committed sample
-    store only in its final §1.6 step, so a run interrupted earlier leaves the heavy
-    per-video buckets on disk but none of the three things Stage B actually reads.
-    Detect that here and say exactly what is missing — instead of the late, generic
-    "no training samples" error (or a silent no-op that trains on nothing).
-    """
+    """Check store readiness for Stage B."""
     missing = []
     if not layout.read_split("train"):
         missing.append(f"a non-empty splits/train_list.txt (at {layout.splits_dir})")
@@ -121,19 +80,7 @@ def _preflight(layout: ProcessedLayout, log: logging.Logger) -> None:
 
 
 def _apply_stage_a_geometry(config, layout, log) -> None:
-    """Rebuild Stage A's backbone geometry into ``config`` from the store's env file.
-
-    Stage B never loads a backbone — it trains the plugins on Stage A's cached labels —
-    so it defaults to the mock adapter, whose ``hidden_dim`` is 32. But the L-COCF
-    residual-repair net is sized from that number, and Stage A's Wan2.2-A14B reports 64.
-    The result was a Stage-B checkpoint that could not be loaded into a Stage C running
-    the real backbone, with nothing to hint at why until the shapes collided.
-
-    Reading it back off ``metadata/stage_a_env.json`` keeps Stage B free of any weight
-    loading (the mock still holds no parameters) while making it agree with the store it
-    is training on. A store written before this file existed simply keeps the old
-    behaviour, with a warning naming the risk.
-    """
+    """Rebuild Stage-A geometry into config from store env."""
     env = layout.read_stage_a_env()
     if not env:
         log.warning(
@@ -143,8 +90,6 @@ def _apply_stage_a_geometry(config, layout, log) -> None:
             "Stage C. Re-run Stage A's --finalize-only pass to write it."
         )
         return
-    # The mock adapter reads its widths straight from ``extra``, so Stage A's real
-    # geometry is reproduced without materialising a single weight.
     config.backbone.name = "mock"
     config.backbone.extra = {
         "hidden_dim": int(env["token_dim"]),
@@ -164,6 +109,7 @@ def _apply_stage_a_geometry(config, layout, log) -> None:
 
 
 def main():
+    """Run Stage-B joint training."""
     parser = argparse.ArgumentParser(description="Stage B: joint module training (§4.1)")
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT,
                         help="Root of the six-level processed store (§3), written by Stage A. "
@@ -208,27 +154,16 @@ def main():
     if args.checkpoint_load and not args.checkpoint_load.is_file():
         parser.error(f"Checkpoint not found: {args.checkpoint_load}")
 
-    # Join the process group first: it pins this rank's CUDA device before any weight
-    # is built, and settles which rank narrates. A run not launched under torchrun gets
-    # a disabled context and behaves exactly as a single process always did.
     dctx = init_distributed(args.device)
     args.device = dist_device(args.device, dctx)
 
     setup_logging(level=logging.INFO if dctx.is_main else logging.WARNING)
-    # setup_logging attaches the stdout handler to the "cocf" logger and sets
-    # propagate=False, so a bare getLogger("__main__") would emit nothing at
-    # INFO — this script's own progress lines included.
     log = get_logger("cocf.stage_b")
-    # The *same* seed on every rank: the replicas must start from identical weights,
-    # and the data is split by the sampler rather than by diverging RNG streams.
     torch.manual_seed(args.seed)
 
-    # Fail fast (with a precise message) if Stage A never finished writing the store.
     layout = ProcessedLayout(args.processed_root)
     _preflight(layout, log)
 
-    # The action-balanced sampler drops the last partial batch, so a batch larger than
-    # this rank's shard of the train split yields zero batches and trains nothing.
     n_train = len(layout.read_split("train")) // max(1, dctx.world_size)
     batch_size = args.batch_size
     if batch_size > n_train:
@@ -244,13 +179,8 @@ def main():
         if args.early_stop_patience < 1:
             parser.error("--early_stop_patience must be a positive integer")
         config.training.early_stop_patience = args.early_stop_patience
-    # Size the plugins from the geometry the *store* was generated with, not from
-    # whatever backbone default this process happens to construct.
     _apply_stage_a_geometry(config, layout, log)
 
-    # Infer text/visual embedding dims from the data store so the CMSC alignment
-    # projection matches what Stage A actually wrote — avoids the silent fallback
-    # in Accelerator._probe_text_dim that can yield a wrong default (e.g. 4096 vs 16).
     text_dim, visual_dim = _infer_dims_from_store(layout, log)
 
     log.info("Building accelerator")
@@ -260,10 +190,6 @@ def main():
         log.info("Loading checkpoint from %s", args.checkpoint_load)
         ckpt = torch.load(args.checkpoint_load, map_location=args.device,
                           weights_only=False)
-        # Two-part {"accelerator", ...} payloads only; bare state_dicts are rejected
-        # for lacking damage_weights. Stage B trains the plugins only, so any LoRA
-        # in the checkpoint is loaded into the backbone but not touched by this
-        # stage's optimiser.
         load_checkpoint(accelerator, ckpt, training_config=config.training)
 
     stage_b_config = StageBConfig(
@@ -287,16 +213,11 @@ def main():
     stage_b = JointTrainingStage(accelerator=accelerator, config=stage_b_config)
     accelerator = stage_b.run()
 
-    # One writer: the ranks hold identical weights (gradients are averaged every step),
-    # so rank 0's copy *is* the model — and eight processes writing one path is a
-    # corrupt file, not a redundant one.
     if dctx.is_main:
         args.checkpoint_save.parent.mkdir(parents=True, exist_ok=True)
         from cocf.training.checkpoint import build_checkpoint
         ckpt = build_checkpoint(accelerator)
         if stage_b.phase_state is not None:
-            # Phased run: carry the completion record so load_checkpoint rejects
-            # this file downstream while the variance calibration is unfinished.
             ckpt["phase_state"] = stage_b.phase_state
         torch.save(ckpt, args.checkpoint_save)
         log.info("Saved checkpoint to %s", args.checkpoint_save)

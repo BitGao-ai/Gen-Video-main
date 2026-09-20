@@ -1,29 +1,11 @@
-"""Video+caption dataset — frame sampling & bucketing (§7.1, user requirement #4).
+"""Video+caption dataset: frame sampling and resolution bucketing.
 
-The reading/sampling logic deliberately follows the conventions of the
-HunyuanVideo and Wan2.1 open-source data pipelines so that latents produced here
-are byte-compatible with what those backbones expect:
-
-    * **frame count ``4k+1``** — the 3D *causal* VAE compresses time by 4× with a
-      leading key-frame, so a clip must have ``F = 4k+1`` frames (49, 81, 121…).
-      (HunyuanVideo ``video_dataset``; Wan2.1 ``T2V`` data spec.)
-    * **uniform temporal sampling** with a stride (``frame_interval``) and a random
-      start, the standard clip sampler in both repos.
-    * **resolution bucketing** — clips are snapped to the nearest configured
-      ``(F, H, W)`` bucket by aspect ratio, so a batch is shape-homogeneous (the
-      bucket sampler used by both pipelines for variable-aspect training data).
-    * **``[-1, 1]`` normalisation** — the pixel convention both VAEs encode from.
-
-Everything heavy (actual decoding) is funnelled through a small
-:class:`VideoReader` protocol, so the dataset is dependency-light and unit-testable
-with the synthetic reader bundled here; a production run injects a ``decord``/
-``torchvision`` reader without touching the sampling logic. This keeps the data
-code decoupled from any particular codec backend (user requirement #3).
-
-This module yields *pixels*. It has one consumer today — Stage A's ``--use-real-video``
-anchor (:meth:`cocf.training.stage_a_data_gen.DataGenerationStage._decode_clip`), which
-reuses this sampler and normalisation verbatim so the frames the teacher encodes match
-what a training loader would read.
+Follows the HunyuanVideo / Wan2.1 data conventions so latents stay byte-compatible:
+``4k+1`` frame counts, uniform temporal sampling with a random start, aspect-ratio
+resolution bucketing, and ``[-1, 1]`` pixel normalisation. Decoding is funnelled
+through a pluggable :class:`VideoReader` protocol, keeping the dataset codec-agnostic
+and unit-testable with the bundled synthetic reader. Yields pixels; consumed by Stage
+A's ``--use-real-video`` anchor path.
 """
 
 from __future__ import annotations
@@ -57,7 +39,7 @@ class VideoSample:
 
     video: Tensor  # [F, 3, H, W] in [-1, 1] (or [0, 1] if normalize off)
     caption: str
-    scene: str = "generic"  # static/dynamic/text/face/multi/occlusion (§7.1.1)
+    scene: str = "generic"  # static/dynamic/text/face/multi/occlusion
     index: int = -1
 
     @property
@@ -110,12 +92,7 @@ class DecordVideoReader(VideoReader):  # pragma: no cover - needs decord + files
 
 
 class TorchvisionVideoReader(VideoReader):  # pragma: no cover - needs torchvision + files
-    """Fallback reader backed by ``torchvision.io.read_video`` (PyAV under the hood).
-
-    Handy where ``decord`` will not build (e.g. Apple Silicon): it ships with the
-    same PyTorch stack the framework already depends on. Reads the whole clip once
-    and indexes in memory — fine for the short OpenVid clips Stage A ingests.
-    """
+    """Fallback reader backed by ``torchvision.io.read_video`` (PyAV under the hood)."""
 
     def __init__(self) -> None:
         from torchvision.io import read_video  # noqa: F401  (import-time availability check)
@@ -137,11 +114,7 @@ class TorchvisionVideoReader(VideoReader):  # pragma: no cover - needs torchvisi
 
 
 class SyntheticVideoReader(VideoReader):
-    """Deterministic procedural clips — makes the pipeline runnable with no files.
-
-    Produces a smoothly drifting gradient so that frame sampling, normalisation
-    and (later) the mock VAE all exercise real, content-dependent tensors on CPU.
-    """
+    """Deterministic procedural clips — makes the pipeline runnable with no files."""
 
     def __init__(self, length: int = 120, height: int = 64, width: int = 64,
                  seed: int = 0) -> None:
@@ -173,11 +146,7 @@ class SyntheticVideoReader(VideoReader):
 
 
 def nearest_frame_count(available: int, target: int, interval: int) -> int:
-    """Largest ``4k+1`` ≤ ``target`` that fits in ``available`` frames at ``interval``.
-
-    Both VAEs need a ``4k+1`` temporal length; we never up-sample, so a short clip
-    falls back to the largest admissible ``4k+1`` it can supply.
-    """
+    """Largest ``4k+1`` ≤ ``target`` that fits in ``available`` frames at ``interval``."""
     span_target = min(target, (available - 1) // max(1, interval) + 1)
     k = max(0, (span_target - 1) // 4)
     return 4 * k + 1
@@ -186,11 +155,7 @@ def nearest_frame_count(available: int, target: int, interval: int) -> int:
 def sample_frame_indices(
     available: int, num_frames: int, interval: int, *, generator: Optional[torch.Generator] = None
 ) -> List[int]:
-    """Uniform clip sampling with a random start (HunyuanVideo/Wan2.1 sampler).
-
-    Picks ``num_frames`` indices spaced by ``interval`` with a random in-range
-    offset; clamps to the clip end so short sources still yield a valid clip.
-    """
+    """Uniform clip sampling with a random start (HunyuanVideo/Wan2.1 sampler)."""
     span = (num_frames - 1) * interval + 1
     max_start = max(0, available - span)
     if generator is not None and max_start > 0:
@@ -219,15 +184,8 @@ def pick_bucket(
 class VideoTextDataset(Dataset):
     """Map-style dataset of (clip, caption) pairs with upstream-compatible sampling.
 
-    Parameters
-    ----------
-    config
-        :class:`DataConfig` slice (frame count, interval, buckets, normalisation).
-    reader
-        Injected :class:`VideoReader`; defaults to the synthetic one so the
-        pipeline runs with no data files (tests/CPU demos).
-    metas
-        Optional explicit manifest; otherwise read from ``config.meta_file``.
+    ``reader`` defaults to the synthetic one so the pipeline runs with no data files;
+    ``metas`` is an optional explicit manifest, otherwise read from ``config.meta_file``.
     """
 
     def __init__(
@@ -315,7 +273,7 @@ def collate_video_samples(batch: Sequence[VideoSample]) -> Dict[str, object]:
     """Collate to ``{video:[B,F,3,H,W], captions:[str], scenes:[str]}``.
 
     Assumes a bucket sampler has made the batch shape-homogeneous; falls back to a
-    list when shapes differ so a misconfigured loader fails loud, not silently.
+    list when shapes differ.
     """
     shapes = {tuple(s.video.shape) for s in batch}
     captions = [s.caption for s in batch]

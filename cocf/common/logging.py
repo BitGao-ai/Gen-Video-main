@@ -15,12 +15,11 @@ _FORMATTER = logging.Formatter(
 
 
 def _is_main_process() -> bool:
-    # Works whether or not torch.distributed is initialised.
     return int(os.environ.get("RANK", "0")) == 0
 
 
 def _ensure_stream_handler() -> logging.Logger:
-    """Attach the stdout handler to the ``cocf`` root logger exactly once."""
+    """Attach the stdout handler to the ``cocf`` root logger once."""
     global _CONFIGURED
     root = logging.getLogger("cocf")
     if not _CONFIGURED:
@@ -44,15 +43,7 @@ def setup_logging(
     level: int = logging.INFO,
     log_file: Optional[Union[str, Path]] = None,
 ) -> logging.Logger:
-    """Configure the framework's root ``cocf`` logger and return it.
-
-    The entry scripts call this once at start-up. It is **idempotent** — the stdout
-    handler is attached only on the first call (shared with :func:`get_logger`), so
-    re-invoking it never duplicates log lines. When ``log_file`` is given a
-    :class:`logging.FileHandler` is added (at most one, keyed by resolved path), so a
-    run can tee its log to disk without losing the console stream. Only rank 0 emits at
-    ``level`` (other ranks stay at WARNING), matching :func:`get_logger`.
-    """
+    """Configure the root ``cocf`` logger (idempotent); optionally tee to ``log_file``."""
     root = _ensure_stream_handler()
     root.setLevel(level if _is_main_process() else logging.WARNING)
     if log_file is not None:

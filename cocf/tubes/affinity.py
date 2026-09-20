@@ -1,21 +1,4 @@
-"""Cross-frame region affinity ``Aff(i, j)`` for tube linking (§4.3.1).
-
-Given regions on frame ``a`` and frame ``b`` (typically consecutive), produces an
-affinity matrix that the matcher (:mod:`cocf.tubes.matching`) feeds to the
-Hungarian algorithm. The score fuses five complementary cues, weighted by
-:class:`~cocf.common.config.AffinityConfig`:
-
-    Aff = w_id·cos(id_i, id_j)              identity (DINOv2)  — robust to motion
-        + w_flow·exp(−‖warp(c_i)−c_j‖/s)    flow agreement     — motion-consistent
-        + w_iou·IoU(warp(M_i), M_j)         warped overlap     — shape/extent
-        + w_txt·cos(txt_i, txt_j)           text alignment     — semantic identity
-        + w_pos·exp(−‖c_i−c_j‖²/2σ²)        proximity          — spatial prior
-
-Everything operates at **latent resolution** so it is cheap and aligns with the
-token grid; the builder is responsible for down-sampling the pixel-space RAFT
-flow to latent coordinates before calling here. The module is pure tensor maths
-with no model dependency, so it is fully deterministic and testable.
-"""
+"""Cross-frame region affinity for tube linking."""
 
 from __future__ import annotations
 
@@ -31,9 +14,10 @@ Tensor = torch.Tensor
 
 
 class AffinityComputer:
-    """Computes the region-to-region affinity matrix between two frames."""
+    """Computes region affinity matrix between two frames."""
 
     def __init__(self, config: AffinityConfig) -> None:
+        """Store affinity config."""
         self.cfg = config
 
     def matrix(
@@ -42,39 +26,30 @@ class AffinityComputer:
         regions_b: List[Region],
         latent_flow: Optional[Tensor] = None,
     ) -> Tensor:
-        """Affinity matrix ``[R_a, R_b]`` in ``[0, 1]``.
-
-        ``latent_flow`` is ``[2, H_l, W_l]`` (dy, dx) mapping frame ``a`` → ``b`` at
-        latent resolution; if ``None`` the flow term degrades gracefully to the
-        positional prior.
-        """
+        """Compute affinity matrix in [0, 1]."""
         ra, rb = len(regions_a), len(regions_b)
         if ra == 0 or rb == 0:
             return torch.zeros(ra, rb)
 
         c = self.cfg
-        # Region masks always carry the working device (CPU for the mock provider, CUDA
-        # for a real SAM/DINO provider). Anchor every fresh allocation below to it so
-        # the centroid/IoU terms never mix a hardcoded-CPU tensor with GPU masks.
         device = regions_a[0].mask.device
         id_a = self._stack_feats(regions_a, "identity_feat")
         id_b = self._stack_feats(regions_b, "identity_feat")
         txt_a = self._stack_feats(regions_a, "text_feat")
         txt_b = self._stack_feats(regions_b, "text_feat")
-        cen_a = torch.tensor([r.center for r in regions_a], device=device)  # [R_a, 2]
-        cen_b = torch.tensor([r.center for r in regions_b], device=device)  # [R_b, 2]
+        cen_a = torch.tensor([r.center for r in regions_a], device=device)
+        cen_b = torch.tensor([r.center for r in regions_b], device=device)
 
-        id_sim = self._cosine_matrix(id_a, id_b, device)  # [R_a, R_b]
+        id_sim = self._cosine_matrix(id_a, id_b, device)
         txt_sim = self._cosine_matrix(txt_a, txt_b, device)
 
-        # flow-warped centroids of A, then distance to each centroid of B
-        warped = self._warp_centroids(cen_a, latent_flow)  # [R_a, 2]
-        dist = torch.cdist(warped, cen_b)  # [R_a, R_b]
+        warped = self._warp_centroids(cen_a, latent_flow)
+        dist = torch.cdist(warped, cen_b)
         flow_sim = torch.exp(-dist / max(c.flow_scale, 1e-6))
         pos_dist = torch.cdist(cen_a, cen_b)
         pos_sim = torch.exp(-(pos_dist ** 2) / (2 * c.sigma_p ** 2))
 
-        iou = self._warped_iou(regions_a, regions_b, latent_flow)  # [R_a, R_b]
+        iou = self._warped_iou(regions_a, regions_b, latent_flow)
 
         aff = (
             c.w_id * id_sim
@@ -85,10 +60,9 @@ class AffinityComputer:
         )
         return aff.clamp(0.0, 1.0)
 
-    # -- pieces ---------------------------------------------------------- #
-
     @staticmethod
     def _stack_feats(regions: List[Region], attr: str) -> Optional[Tensor]:
+        """Stack region features or None."""
         feats = [getattr(r, attr) for r in regions]
         if any(f is None for f in feats):
             return None
@@ -96,15 +70,15 @@ class AffinityComputer:
 
     @staticmethod
     def _cosine_matrix(a: Optional[Tensor], b: Optional[Tensor], device=None) -> Tensor:
+        """Cosine similarity matrix mapped to [0, 1]."""
         if a is None or b is None:
-            # neutral 0.5 when a feature is unavailable (keeps the term unbiased),
-            # placed on the working device so it broadcasts into the on-device sum.
             return torch.full((1, 1), 0.5, device=device)
         a = F.normalize(a.float(), dim=-1)
         b = F.normalize(b.float(), dim=-1)
-        return ((a @ b.T) + 1.0) * 0.5  # map cos∈[-1,1] → [0,1]
+        return ((a @ b.T) + 1.0) * 0.5
 
     def _warp_centroids(self, centroids: Tensor, latent_flow: Optional[Tensor]) -> Tensor:
+        """Warp centroids by latent flow."""
         if latent_flow is None:
             return centroids
         h, w = latent_flow.shape[-2:]
@@ -120,8 +94,7 @@ class AffinityComputer:
     def _warped_iou(
         self, regions_a: List[Region], regions_b: List[Region], latent_flow: Optional[Tensor]
     ) -> Tensor:
-        # Follow the region masks' device (regions_a is non-empty here) so the IoU
-        # matrix accepts the on-device `inter/union` scalars written into it below.
+        """Warped mask IoU matrix."""
         iou = torch.zeros(len(regions_a), len(regions_b), device=regions_a[0].mask.device)
         warped_masks = [self._warp_mask(r.mask, latent_flow) for r in regions_a]
         for i, wma in enumerate(warped_masks):
@@ -133,7 +106,7 @@ class AffinityComputer:
 
     @staticmethod
     def _warp_mask(mask: Tensor, latent_flow: Optional[Tensor]) -> Tensor:
-        """Forward-warp a latent mask by integer-rounded flow (cheap, robust)."""
+        """Forward-warp mask by integer-rounded flow."""
         if latent_flow is None:
             return mask
         h, w = mask.shape

@@ -1,22 +1,4 @@
-"""Core data types shared across all COCF-SS-DCA subsystems.
-
-This module is intentionally dependency-light (only ``torch`` + stdlib) so that
-every other subsystem can import it without creating import cycles. It defines the
-*vocabulary* of the framework: the four compute actions, the latent token grid,
-causal triplets/sub-graphs, semantic tubes and their state vectors, damage
-predictions, error certificates and allocation decisions.
-
-Tensor-shape conventions (kept uniform everywhere to keep coupling low):
-
-    * Latent in **token** form:   ``z`` with shape ``[B, N, d]`` where
-      ``N = T_l * H_l * W_l`` enumerated in (time, height, width) row-major order.
-    * Latent in **grid** form:    ``[B, d, T_l, H_l, W_l]`` (backbone-native).
-    * A *tube* ``g_k`` is a set of flat token indices into the ``N`` axis, grouped
-      by frame so that per-frame masks / actions remain addressable.
-
-The mapping between the two forms is owned exclusively by the backbone adapter
-(see :mod:`cocf.backbones.base`), never duplicated in the algorithm code.
-"""
+"""Core shared data types for COCF-SS-DCA subsystems."""
 
 from __future__ import annotations
 
@@ -28,44 +10,33 @@ import torch
 
 Tensor = torch.Tensor
 
-# --------------------------------------------------------------------------- #
-# Actions and compute tiers (§2.1, §3.3.3)
-# --------------------------------------------------------------------------- #
-
-
 class Action(enum.IntEnum):
-    """The four per-tube compute actions ``a_{k,t} ∈ {FULL, LOWFREQ, INTERP, ANCHOR}``.
+    """Per-tube compute actions ordered by cost."""
 
-    Ordered from most to least expensive. ``IntEnum`` so the value doubles as an
-    index into cost/logit tensors.
-    """
-
-    FULL = 0  # run the full transition Φ_t on the tube's tokens
-    LOWFREQ = 1  # compute only low-frequency components, reuse high-freq from cache
-    INTERP = 2  # temporally interpolate the tube from neighbouring anchored frames
-    ANCHOR = 3  # freeze: reuse the cached latent of the last safe anchor verbatim
+    FULL = 0
+    LOWFREQ = 1
+    INTERP = 2
+    ANCHOR = 3
 
     @property
     def is_skip(self) -> bool:
-        """Whether the action skips (does not freshly compute) the transition."""
+        """Check if action skips compute."""
         return self in (Action.INTERP, Action.ANCHOR)
 
     @classmethod
     def cheapest(cls) -> "Action":
+        """Return cheapest action."""
         return cls.ANCHOR
 
 
 class StrengthLevel(enum.IntEnum):
-    """Stratified causal-effect levels ``s_H ≫ s_M ≫ s_L`` (axiom §3.2.2)."""
+    """Stratified causal-effect levels."""
 
     HIGH = 0
     MID = 1
     LOW = 2
 
 
-# Default prior mapping strength-level -> action (cold-start fallback, §1.3).
-# The learned allocator may override this, but it anchors behaviour before the
-# L-COCF predictor has converged.
 DEFAULT_LEVEL_TO_ACTION: Dict[StrengthLevel, Action] = {
     StrengthLevel.HIGH: Action.FULL,
     StrengthLevel.MID: Action.LOWFREQ,
@@ -73,18 +44,9 @@ DEFAULT_LEVEL_TO_ACTION: Dict[StrengthLevel, Action] = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# Latent token grid (§2.1)
-# --------------------------------------------------------------------------- #
-
-
 @dataclass(frozen=True)
 class TokenGrid:
-    """The (time, height, width) layout of latent tokens for one sample.
-
-    ``N = t * h * w``. A flat token index ``n`` decomposes as
-    ``n = ti * (h*w) + hi * w + wi``.
-    """
+    """Latent token grid layout."""
 
     t: int
     h: int
@@ -99,7 +61,7 @@ class TokenGrid:
         return self.h * self.w
 
     def frame_of(self, flat_index: int) -> int:
-        """Frame (temporal) index that a flat token index belongs to."""
+        """Return frame index for token."""
         return flat_index // self.tokens_per_frame
 
     def unravel(self, flat_index: int) -> Tuple[int, int, int]:
@@ -115,22 +77,15 @@ class TokenGrid:
         return slice(start, start + self.tokens_per_frame)
 
 
-# --------------------------------------------------------------------------- #
-# Causal structures (§3.3.1)
-# --------------------------------------------------------------------------- #
-
-
 @dataclass
 class CausalTriplet:
-    """A causal triplet ``(E_i, A_ij, E_j)`` extracted from the prompt by a VLM."""
+    """Causal triplet extracted from prompt."""
 
     subject: str
     action: str
     obj: str
-    # VLM-assigned importance of the subject entity in [0, 1] (feeds s_E, §3.3.2).
     subject_importance: float = 1.0
     object_importance: float = 1.0
-    # Free-form metadata (e.g. whether this triplet involves text/face/hands).
     tags: Tuple[str, ...] = ()
 
     def entities(self) -> Tuple[str, str]:
@@ -139,49 +94,27 @@ class CausalTriplet:
 
 @dataclass
 class CausalSubgraph:
-    """Local causal sub-graph ``G_s`` built from triplets + spatio-temporal locality.
-
-    We keep this deliberately lightweight (axiom §3.2.1): only the entities that
-    appear in triplets, their per-entity importance, and the adjacency implied by
-    the triplets. There is no global graph and no structure learning.
-    """
+    """Local causal sub-graph built from triplets."""
 
     triplets: List[CausalTriplet] = field(default_factory=list)
-    # entity name -> aggregated importance score in [0, 1]
     entity_importance: Dict[str, float] = field(default_factory=dict)
-    # set of entity names tagged as text/face/hands (quality-critical, §9.3)
     critical_entities: Tuple[str, ...] = ()
 
     def importance_of(self, entity: str) -> float:
         return self.entity_importance.get(entity, 0.0)
 
 
-# --------------------------------------------------------------------------- #
-# Regions and semantic tubes (§4.3.1)
-# --------------------------------------------------------------------------- #
-
-
 @dataclass
 class Region:
-    """A frame-level region produced by SAM and filtered by CLIP (§4.3.1).
-
-    Masks are stored at *latent* resolution (``H_l × W_l``) so they index tokens
-    directly; the builder is responsible for down-sampling pixel masks.
-    """
+    """Frame-level region at latent resolution."""
 
     frame: int
     region_id: int
-    # boolean mask over the latent grid of this frame, shape [H_l, W_l]
     mask: Tensor
-    # flat token indices covered by this region (into the full [N] axis)
     token_indices: Tensor
-    # DINOv2 identity feature of the region crop, shape [d_id]
     identity_feat: Optional[Tensor] = None
-    # CLIP text-alignment feature, shape [d_clip]
     text_feat: Optional[Tensor] = None
-    # (cy, cx) centroid in latent coords
     center: Tuple[float, float] = (0.0, 0.0)
-    # CLIP semantic-match score used for low-semantic filtering
     clip_score: float = 1.0
 
     @property
@@ -189,23 +122,21 @@ class Region:
         return int(self.token_indices.numel())
 
 
-# Order of the tube-state vector (§4.3.1). Keeping the names here makes the
-# 7-dim vector self-documenting wherever it is sliced or logged.
 TUBE_STATE_FIELDS: Tuple[str, ...] = (
-    "identity_confidence",  # I_k   = mean cos identity similarity to previous frame
-    "occlusion",  # O_k   = 1 - IoU(M_t, Warp(M_{t-1}))
-    "interaction",  # I_inter = mean IoU with the other tubes, in [0,1]
-    "boundary_uncertainty",  # geometric uncertainty along the tube boundary
-    "motion_phase",  # normalised motion magnitude / phase
-    "causal_value",  # causal_value_k from L-COCF strength field
-    "anchor_age",  # steps since this tube was last fully anchored
+    "identity_confidence",
+    "occlusion",
+    "interaction",
+    "boundary_uncertainty",
+    "motion_phase",
+    "causal_value",
+    "anchor_age",
 )
 TUBE_STATE_DIM = len(TUBE_STATE_FIELDS)
 
 
 @dataclass
 class TubeState:
-    """The 7-dimensional per-step tube state ``s_{k,t}`` (§4.3.1)."""
+    """Per-step tube state vector."""
 
     identity_confidence: float = 1.0
     occlusion: float = 0.0
@@ -231,33 +162,20 @@ class TubeState:
         )
 
     def is_unstable(self, threshold: float = 0.5) -> bool:
-        """Identity confidence below ``threshold`` ⇒ unstable tube ⇒ force FULL (§4.3.1).
-
-        The default mirrors ``TubeConfig.identity_unstable_threshold``; callers with
-        access to the config must pass it explicitly so the two never drift.
-        """
+        """Check if tube is unstable."""
         return self.identity_confidence < threshold
 
 
 @dataclass
 class SemanticTube:
-    """A cross-frame semantic tube ``g_k`` — the unit of compute allocation (§4)."""
+    """Cross-frame semantic tube for compute allocation."""
 
     tube_id: int
-    # frame index -> flat token indices belonging to this tube on that frame
     tokens_by_frame: Dict[int, Tensor] = field(default_factory=dict)
-    # frame index -> boolean latent mask [H_l, W_l]
     masks_by_frame: Dict[int, Tensor] = field(default_factory=dict)
-    # pooled identity feature (mean of per-frame DINOv2 features, fixed at build)
     identity_feat: Optional[Tensor] = None
-    # frame index -> that frame's own identity feature, kept *alongside* the pooled
-    # ``identity_feat``. Pooling alone destroys the only signal identity confidence
-    # can be computed from: a mean vector compared against itself is trivially
-    # similar, which is how ``identity_confidence`` came to be the constant 1.0 and
-    # the §4.3.1 "unstable tube ⇒ force FULL" rule became unreachable (§P1-2).
     identity_feat_by_frame: Dict[int, Tensor] = field(default_factory=dict)
     state: TubeState = field(default_factory=TubeState)
-    # bookkeeping for RAEC: step index of the last verified-safe anchor
     last_safe_anchor_step: Optional[int] = None
 
     @property
@@ -266,12 +184,12 @@ class SemanticTube:
 
     @property
     def length(self) -> int:
-        """Number of frames the tube spans."""
+        """Return frame span length."""
         return len(self.tokens_by_frame)
 
     @property
     def size(self) -> int:
-        """Total token count ``|g_k|`` (used by the cost model, §2.2)."""
+        """Return total token count."""
         return int(sum(t.numel() for t in self.tokens_by_frame.values()))
 
     def all_token_indices(self) -> Tensor:
@@ -280,22 +198,12 @@ class SemanticTube:
         return torch.cat([self.tokens_by_frame[f] for f in self.frames])
 
 
-# --------------------------------------------------------------------------- #
-# Predictions, certificates, decisions (§3.3.4, §5.3, §2.2)
-# --------------------------------------------------------------------------- #
-
-
 @dataclass
 class DamagePrediction:
-    """L-COCF prediction of the *final-video* counterfactual damage of an action.
+    """Predicted counterfactual damage for actions."""
 
-    ``mu`` and ``sigma`` are the predicted mean and (epistemic) uncertainty of the
-    marginal damage ``y_{k,t,a}`` for applying action ``a`` to tube ``g_k`` at step
-    ``t`` (§3.3.4, used by the certificate §5.3.1 and the budget term §7.3).
-    """
-
-    mu: Tensor  # shape [num_actions]
-    sigma: Tensor  # shape [num_actions]
+    mu: Tensor
+    sigma: Tensor
 
     def of(self, action: Action) -> Tuple[Tensor, Tensor]:
         return self.mu[int(action)], self.sigma[int(action)]
@@ -303,33 +211,31 @@ class DamagePrediction:
 
 @dataclass
 class ErrorCertificate:
-    """Risk certificate ``E_cert(k, t)`` for an anchoring decision (§5.3.1)."""
+    """Risk certificate for anchoring decision."""
 
     value: float
     tube_id: int
     step: int
     action: Action
-    # individual additive contributions, for logging / ablation
     components: Dict[str, float] = field(default_factory=dict)
 
 
 class TriggerLevel(enum.IntEnum):
-    """Outcome of the RAEC risk trigger (§5.3.2)."""
+    """RAEC risk trigger outcome."""
 
-    KEEP = 0  # E_cert <= τ_low : keep current action
-    REPAIR = 1  # τ_low < E_cert <= τ_high : boundary repair + cache refresh
-    ROLLBACK = 2  # E_cert > τ_high : roll back to last safe anchor, force FULL
+    KEEP = 0
+    REPAIR = 1
+    ROLLBACK = 2
 
 
 @dataclass
 class AllocationDecision:
-    """The solved per-tube action assignment for one denoising step (§2.2)."""
+    """Per-tube action assignment for one step."""
 
     step: int
-    actions: Dict[int, Action]  # tube_id -> chosen action
+    actions: Dict[int, Action]
     predicted_cost: float
     budget: float
-    # tube_id -> predicted damage of the chosen action (for the cost/quality log)
     chosen_damage: Dict[int, float] = field(default_factory=dict)
 
     def action_for(self, tube_id: int, default: Action = Action.FULL) -> Action:
